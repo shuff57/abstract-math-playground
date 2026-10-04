@@ -15,6 +15,7 @@ pub const MAX_ROWS: usize = 500;
 pub const MAX_CELL_CHARS: usize = 120;
 pub const MAX_NAME_CHARS: usize = 16;
 
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TableStyle {
@@ -45,6 +46,7 @@ impl TableStyle {
     }
 }
 
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Column {
     /// List variable name, e.g. `x_1`.
@@ -53,6 +55,7 @@ pub struct Column {
     pub cells: Vec<String>,
 }
 
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Table {

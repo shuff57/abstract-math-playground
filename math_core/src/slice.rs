@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 pub const MAX_SLICE_EXPR_CHARS: usize = 200;
 
 /// One slice constant: a number, or an expression string (`"a"`, `"2a+1"`).
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SliceVal {
@@ -52,6 +53,7 @@ impl SliceVal {
 /// for the document format); the dimension actually used is always derived from the current mode
 /// and the number of fixed axes (see [`ResolvedSlice::resolve`]), so a mode switch never leaves
 /// it stale.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SliceCfg {
     #[serde(default = "default_dim")]

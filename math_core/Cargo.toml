@@ -10,5 +10,11 @@ serde_json = "1"
 miniz_oxide = "0.7"
 base64 = "0.22"
 
+# Optional: derive JSON Schema for the document types (used by viSHual's viz_types). Off by default.
+schemars = { version = "1", optional = true }
+
+[features]
+schemars = ["dep:schemars"]
+
 [dev-dependencies]
 naga = { version = "0.19", features = ["wgsl-in"] }
