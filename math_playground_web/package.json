@@ -5,14 +5,17 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "wasm-dev": "cd ../math_playground && wasm-pack build --dev && cd ../math_playground_web && npm run dev",
+    "wasm": "cd ../math_playground && wasm-pack build --target web --dev",
+    "wasm-release": "cd ../math_playground && wasm-pack build --target web --release",
+    "wasm-dev": "npm run wasm && vite",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },
+  "dependencies": {
+    "mathlive": "^0.111.0"
+  },
   "devDependencies": {
     "typescript": "^5.2.2",
-    "vite": "^5.2.0",
-    "vite-plugin-top-level-await": "^1.4.1",
-    "vite-plugin-wasm": "^3.3.0"
+    "vite": "^5.2.0"
   }
 }

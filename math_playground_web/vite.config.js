@@ -1,7 +1,7 @@
-import wasm from "vite-plugin-wasm";
-import topLevelAwait from "vite-plugin-top-level-await";
-
 /** @type {import('vite').UserConfig} */
 export default {
-  plugins: [wasm(), topLevelAwait()],
+  // The wasm package is built with `wasm-pack build --target web` and loaded via an explicit URL,
+  // so no wasm/top-level-await plugins are needed.
+  server: { fs: { allow: [".."] } },
+  build: { target: "es2020" },
 };
