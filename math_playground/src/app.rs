@@ -302,6 +302,8 @@ pub struct App {
     /// The current scene is a preview (coarser surfaces, built so a mode switch starts moving
     /// at once); it is rebuilt at full quality when the switch has finished.
     refine: bool,
+    /// `setReducedMotion`; kept here because loading a document replaces the rig.
+    reduced_motion: bool,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -372,6 +374,7 @@ impl App {
             panel_dirty: false,
             last_panel_ms: 0.0,
             refine: false,
+            reduced_motion: false,
         };
         app.rebuild();
         app
@@ -549,10 +552,14 @@ impl App {
                 None => self.outbox.push(Event::Error { message: format!("unknown mode '{mode}'") }),
             },
             Command::SetOrtho { ortho } => {
+                self.rig.reduced_motion = self.reduced_motion;
                 self.rig.set_ortho3(ortho, self.now_ms);
                 self.touch_input();
             }
-            Command::SetReducedMotion { on } => self.rig.reduced_motion = on,
+            Command::SetReducedMotion { on } => {
+                self.reduced_motion = on;
+                self.rig.reduced_motion = on;
+            }
             Command::SetTheme { dark } => {
                 self.theme = if dark { Theme::dark() } else { Theme::light() };
                 self.outbox.push(Event::Theme { dark });
@@ -998,6 +1005,7 @@ impl App {
         self.prev = self.current.take();
         // The tween's clock starts at the next frame (see `Tween::start_ms`), so the time spent
         // building below is not taken out of the animation.
+        self.rig.reduced_motion = self.reduced_motion;
         self.rig.set_mode(mode, self.now_ms);
         self.dirty = true;
         // A preview build keeps the gap between the command and the first moving frame short;
@@ -1567,8 +1575,14 @@ mod tests {
         assert_eq!(l.len(), 1);
         assert_eq!(l[0].lift, 1.0);
         drop(l);
-        cmd(&mut a, r#"{"t":"setReducedMotion","on":false}"#);
+        // The setting outlives a document load (which replaces the camera rig).
+        let json = doc::to_json(&a.doc);
+        cmd(&mut a, &serde_json::json!({"t":"loadDoc","json":json}).to_string());
+        a.frame(32.0);
         cmd(&mut a, r#"{"t":"setMode","mode":"2d"}"#);
+        assert!(!a.rig.is_animating());
+        cmd(&mut a, r#"{"t":"setReducedMotion","on":false}"#);
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
         assert!(a.rig.is_animating());
     }
 
