@@ -31,7 +31,7 @@ npm run wasm-dev # Builds the wasm/webgpu code from `math_playground` once, then
 
 # Graphing calculator
 
-This branch adds a Desmos-style graphing calculator on top of the playground. You type expressions and they are drawn in 1D, 2D or 3D. Switching between the three modes is animated (the scene cross-fades while the camera moves), and the same expressions are kept across modes. It is written in Rust with [wgpu](https://wgpu.rs/) and [winit](https://github.com/rust-windowing/winit), runs natively and in the browser through WASM, and the web version has a TypeScript shell that uses [MathLive](https://cortexjs.io/mathlive/) for math input.
+This branch adds a Desmos-style graphing calculator on top of the playground. You type expressions and they are drawn in 1D, 2D or 3D. Switching between the three modes is animated (the camera moves while the scene cross-fades, and 3D surfaces rise out of the plane or settle into it), and the same expressions are kept across modes. It is written in Rust with [wgpu](https://wgpu.rs/) and [winit](https://github.com/rust-windowing/winit), runs natively and in the browser through WASM, and the web version has a TypeScript shell that uses [MathLive](https://cortexjs.io/mathlive/) for math input.
 
 What it handles (details and examples in [docs/syntax.md](docs/syntax.md)): equations, inequalities, parametric curves, polar curves, points, lists and statistics, regression, complex-valued functions (domain colouring), derivatives, integrals/sums/products, sliders, actions and a ticker, data tables, vector fields, and slices (a lower-dimensional cross-section of the same items).
 

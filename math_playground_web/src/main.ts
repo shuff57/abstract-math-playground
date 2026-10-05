@@ -125,6 +125,12 @@ async function main(): Promise<void> {
   // ---- theme (single place) -----------------------------------------------------------------
   initTheme(engine);
 
+  // ---- reduced motion: mode switches jump instead of animating -------------------------------
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+  const sendReducedMotion = () => engine.send({ t: "setReducedMotion", on: reduceMotion.matches });
+  sendReducedMotion();
+  reduceMotion.addEventListener("change", sendReducedMotion);
+
   // ---- initial document ---------------------------------------------------------------------
   let loaded = false;
   if (location.hash.startsWith("#v1.")) {

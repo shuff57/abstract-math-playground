@@ -35,8 +35,9 @@ View and theme:
 
 | `t` | Fields | Notes |
 | --- | --- | --- |
-| `setMode` | `mode` | `"1d"`, `"2d"` or `"3d"`. Starts the animated transition. Anything else gives an `error` event. |
+| `setMode` | `mode` | `"1d"`, `"2d"` or `"3d"`. Starts the animated transition (see below). Anything else gives an `error` event. |
 | `setOrtho` | `ortho` | Orthographic camera in 3D. |
+| `setReducedMotion` | `on` | Mode switches and the ortho toggle jump to the end instead of animating. Send it from `prefers-reduced-motion` at start-up and when it changes (the TS shell does). Default off. |
 | `setTheme` | `dark` | |
 | `setAngle` | `angle` | `"deg"`, otherwise radians. |
 | `resize` | `width`, `height` | Physical pixels. |
@@ -170,3 +171,13 @@ requestAnimationFrame(tick);
 ```
 
 The native build does not use `Calculator`; `native.rs` calls `App::dispatch` and `App::frame` directly.
+
+### Mode transitions
+
+`setMode` moves the camera to the new mode over 500 ms (ease-in-out cubic) while the outgoing scene fades out and the incoming one fades in. How it behaves with the frame loop:
+
+- The transition's clock starts at the first `frame` after the command, not at the command. A loop may stop calling `frame` while nothing changes (the native shell does, and so may an embedding that sleeps its `requestAnimationFrame`), and the scene for the new mode is built inside `setMode`; neither eats into the animation. The first frame after the switch shows the starting pose; every later one moves.
+- Switching into 3D builds a preview first: implicit surfaces are meshed at a coarser octree depth (`scene::PREVIEW_SURFACE_DEPTH`), so motion starts within a frame or two even when the full 3D scene takes 100 ms or more. The full-quality scene is rebuilt in the first frame after the switch has finished, and only once the pointer has been still for 100 ms (an orbit straight after the switch is not interrupted). That rebuild costs what the switch itself used to cost, but it happens on a still picture. Leaving 3D needs no preview (1D/2D scenes are cheap).
+- 2D/1D to 3D: the 3D scene is drawn with its height scaled about z = 0 by the camera's lift (`Rig::lift`, 0 in 1D/2D, 1 in 3D, eased with the camera), so surfaces and the 3D box grow out of the plane and a curve's extruded sheet starts as the curve itself. 3D to 2D/1D flattens it back. z tick labels follow the same lift.
+- A switch during a switch starts from the pose on screen, so the camera never jumps.
+- With `setReducedMotion` on there is no animation: the switch is immediate and builds the full scene directly.
