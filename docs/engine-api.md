@@ -23,6 +23,8 @@ Items and the list:
 | `setHidden` | `id`, `hidden` | Hidden items are not drawn and report no errors, but their definitions stay in scope. |
 | `setColor` | `id`, `color` | `color` is a string such as `"#ff0000"`, or `null` for the automatic colour. |
 | `setRegressionResiduals` | `id`, `on` | Regression items: draw ticks from each data point to the fit. |
+| `setStyle` | `id`, `style` | `style` is a partial `ItemStyle` object (camelCase keys as in the document: `lineWidth`, `lineStyle`, `pointStyle`, `pointSize`, `opacity`, `fillOpacity`, `label`, `showLabel`, `residuals`). Given keys are merged into the item's style; a key set to `null` returns to its default. Works for every item kind, tables included. Unknown id, unknown key, wrong type or out-of-range value gives an `error` event and changes nothing. `lineWidth` set here must be in [0.25, 20]. Example: `{"t":"setStyle","id":"a","style":{"lineStyle":"dashed","pointSize":null}}`. |
+| `setFolder` | `id`, `folder` | `folder` is the id of a folder item, or `null` (or absent) for the top level. Error if `id` is unknown, the folder is not a folder item, is the item itself, or the item is itself a folder (no nesting). Items in a hidden folder are not drawn (their definitions stay in scope). |
 
 Sliders:
 
@@ -39,6 +41,7 @@ View and theme:
 | `setOrtho` | `ortho` | Orthographic camera in 3D. |
 | `setReducedMotion` | `on` | Mode switches and the ortho toggle jump to the end instead of animating. Send it from `prefers-reduced-motion` at start-up and when it changes (the TS shell does). Default off. |
 | `setTheme` | `dark` | |
+| `setView` | all optional: `grid`, `axes`, `axisNumbers` (booleans), `window` `{min:[x,y,z], max:[x,y,z]}` | Flags: `grid` false hides the minor/major grid lines, `axes` false hides the axis lines, ticks and tick numbers, `axisNumbers` false hides only the tick numbers (the 3D box edges always stay). `window` sets the window like loading a document with it (fresh camera framing it, current mode kept); items, sliders, ticker and slice are untouched. Each axis must be finite with min < max, else an `error` and no change. Followed by a `view` event. |
 | `setAngle` | `angle` | `"deg"`, otherwise radians. |
 | `resize` | `width`, `height` | Physical pixels. |
 | `reset` | none | Resets the camera. |
@@ -98,8 +101,8 @@ Every event has a `t` field.
 | `diagnostics` | `items`: `[{id, message}]` | Per-item problems (parse errors, unsupported constructs). |
 | `info` | `items`: `[ItemInfo]` | Read-outs: derivative, scalar value, regression fit. The full current list, sent whenever it changes; an empty list clears them. |
 | `colors` | `items`: `[{id, color}]` | Resolved `#rrggbb` colour of each drawn item. Sent only when it changes. |
-| `view` | `mode`, `min` `[x,y,z]`, `max` `[x,y,z]` | Current mode and window. |
-| `labels` | `labels`: `[{pos:[x,y,z], text, axis}]` | Tick labels in world coordinates. |
+| `view` | `mode`, `min` `[x,y,z]`, `max` `[x,y,z]`, `grid`, `axes`, `axisNumbers` | Current mode, window and view flags. |
+| `labels` | `labels`: `[{pos:[x,y,z], text, axis}]` | Tick labels (and item labels, axis 4) in world coordinates. |
 | `doc` | `json` | Document JSON string (reply to `export`). |
 | `hash` | `hash` | Share hash (reply to `export`). |
 | `table` | `id`, `columns`: `[{name, cells}]`, `rows`, `style` | Full table state, after each change and once per table on load. |
@@ -112,7 +115,7 @@ Every event has a `t` field.
 
 `ItemInfo`: `id`, `kind` (`"derivative"`, `"value"` or `"regression"`), and as they apply `latex`, `text`, `value`, `params` (`[{name, value, stdError?}]`), `r2`, `rmse`, `n`. Absent fields are omitted.
 
-`screen_labels_json()` (below) returns the labels already projected to screen: `{text, axis, x, y, visible, inset, clip?}`. `inset` is true for slice-inset labels (their `x`/`y` are already offset into the canvas), `clip` is the `[x,y,w,h]` rectangle the label must stay inside. Axis 0 and 1 are tick labels and axis names; 3 is reserved for a title.
+`screen_labels_json()` (below) returns the labels already projected to screen: `{text, axis, x, y, visible, inset, clip?}`. `inset` is true for slice-inset labels (their `x`/`y` are already offset into the canvas), `clip` is the `[x,y,w,h]` rectangle the label must stay inside. Axis 0 and 1 are tick labels and axis names (and the value labels of 1D dots); 2 is the z tick labels in 3D; 3 is reserved for a title; 4 is an item label (`showLabel`): `pos` is the point itself (the overlay should offset the text so it does not cover the marker), the text is the item's `label` or the coordinates such as `(1, 2)`; at most 100 per item; a curve with `showLabel` and a `label` gets one at its first drawn sample inside the window.
 
 ## Document format
 
@@ -121,7 +124,7 @@ Every event has a `t` field.
 ```json
 {
   "v": 1,
-  "view": { "mode": "2d", "window": { "min": [-10,-10,-10], "max": [10,10,10] }, "angle": "rad" },
+  "view": { "mode": "2d", "window": { "min": [-10,-10,-10], "max": [10,10,10] }, "angle": "rad", "grid": false },
   "items": [ { "id": "a", "kind": "equation", "latex": "y=x^2", "hidden": false, "color": "#ff0000",
                "style": { "lineWidth": 2.0, "lineStyle": "dotted" } } ],
   "sliders": { "k": { "min": 0, "max": 1, "step": 0.5, "value": 0.25 } },
@@ -130,7 +133,9 @@ Every event has a `t` field.
 }
 ```
 
-Optional item fields: `hidden`, `color`, `style` (`lineWidth`, `lineStyle` `solid|dashed|dotted`, `pointStyle` `dot|circle|cross|square`, `opacity`, `label`, `residuals`), `folder`, `table` (for `table` items). `view.theme` is optional. `sliders`, `ticker` and `slice` are optional. Unknown JSON fields are ignored; unknown enum values are errors.
+Optional item fields: `hidden`, `color`, `style` (`lineWidth` (0,100], `lineStyle` `solid|dashed|dotted`, `pointStyle` `dot|circle|cross|square`, `pointSize` [1,40] (marker diameter in pixels, default 9), `opacity` [0,1], `fillOpacity` [0,1] (effective opacity of an inequality's shading, times `opacity`; absent = the built-in 0.22), `label` (text), `showLabel` (bool), `residuals`), `folder`, `table` (for `table` items). Style keys at their default are omitted. `view.theme` is optional; `view.grid`, `view.axes`, `view.axisNumbers` default to true and are written only when false.
+
+Rendering of styles: `dashed`/`dotted` split curves into dashes measured in pixels (explicit, implicit and contour curves, polar, parametric, 3D curves, regression curves and table lines; surfaces, fields, vector fields and statistical plots stay solid). `pointStyle`/`pointSize` apply to point items, point lists, table points and 1D dots; `circle`, `cross` and `square` are open outlines in 1D/2D and fall back to a filled dot in 3D. `sliders`, `ticker` and `slice` are optional. Unknown JSON fields are ignored; unknown enum values are errors.
 
 Input is treated as untrusted (share links come from strangers). Limits: JSON up to 100,000 bytes, share hash up to 200,000 characters, 500 items, 200 sliders, 2000 characters of text per item, ids up to 64 characters. Decompression output is capped.
 

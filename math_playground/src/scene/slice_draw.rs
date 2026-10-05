@@ -81,7 +81,8 @@ impl SliceGeo {
     /// Items whose curve is non-empty, and the total number of marked points.
     pub fn counts(&self, items: &[SliceItem]) -> (usize, usize) {
         let curves = self.curves.iter().filter(|c| !c.is_empty()).count();
-        let pts = self.roots.iter().map(Vec::len).sum::<usize>() + items.iter().map(|i| i.points.len()).sum::<usize>();
+        let pts = self.roots.iter().map(Vec::len).sum::<usize>()
+            + items.iter().map(|i| i.points.len()).sum::<usize>();
         (curves, pts)
     }
 }
@@ -104,8 +105,11 @@ pub fn collect(
 ) -> Vec<SliceItem> {
     let free = rs.free_axes();
     let tol = rs.point_tolerances(win.min, win.max);
-    let consts: Vec<(String, f64)> =
-        rs.fixed_axes().into_iter().map(|a| (math_core::slice::const_var(a), rs.fixed[a].unwrap_or(0.0))).collect();
+    let consts: Vec<(String, f64)> = rs
+        .fixed_axes()
+        .into_iter()
+        .map(|a| (math_core::slice::const_var(a), rs.fixed[a].unwrap_or(0.0)))
+        .collect();
     let renamed_ok = |e: &Expr| -> bool {
         e.free_vars().iter().all(|v| match v.as_str() {
             "x" => !free.is_empty(),
@@ -115,10 +119,12 @@ pub fn collect(
         })
     };
     let spatial_ok = |e: &Expr| -> bool {
-        e.free_vars().iter().all(|v| match math_core::slice::axis_index(v) {
-            Some(i) => free.contains(&i),
-            None => true,
-        })
+        e.free_vars()
+            .iter()
+            .all(|v| match math_core::slice::axis_index(v) {
+                Some(i) => free.contains(&i),
+                None => true,
+            })
     };
     let sub = |a: &str, e: &Expr| Expr::bin(BinOp::Sub, Expr::var(a), e.clone());
     let mut out = Vec::new();
@@ -127,18 +133,42 @@ pub fn collect(
         if matches!(pr.kind, Kind::Definition { .. }) {
             continue;
         }
-        let mut color = pr.item.color.as_deref().and_then(parse_hex_color).unwrap_or_else(|| theme.color(visible_idx));
+        let mut color = pr
+            .item
+            .color
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or_else(|| theme.color(visible_idx));
         visible_idx += 1;
         if let Some(o) = pr.item.style.opacity {
             color[3] *= o.clamp(0.0, 1.0) as f32;
         }
-        let line_w = pr.item.style.line_width.map(|w| w as f32).unwrap_or(SLICE_CURVE_W);
-        let mut it = SliceItem { color, line_w, f: None, points: Vec::new(), field: None, region: None, graph: None };
+        let line_w = pr
+            .item
+            .style
+            .line_width
+            .map(|w| w as f32)
+            .unwrap_or(SLICE_CURVE_W);
+        let mut it = SliceItem {
+            color,
+            line_w,
+            f: None,
+            points: Vec::new(),
+            field: None,
+            region: None,
+            graph: None,
+        };
         if let Some(c) = &pr.complex {
             // A complex item is a function of x + iy (it ignores the sliced axis), so a plane
             // slice through x and y (z = c) shows its domain colouring; other slices skip it.
             if free == [0, 1] {
-                it.field = Some(SliceField { kind: FieldKind::Domain, raw: c.clone(), consts: Vec::new(), folded: None, complex: true });
+                it.field = Some(SliceField {
+                    kind: FieldKind::Domain,
+                    raw: c.clone(),
+                    consts: Vec::new(),
+                    folded: None,
+                    complex: true,
+                });
             }
             out.push(it);
             continue;
@@ -172,8 +202,15 @@ pub fn collect(
             if free.len() == 2 {
                 let virt = math_core::slice::virtualize(raw, rs);
                 if renamed_ok(&virt) {
-                    let folded = res(raw).map(|r| math_core::slice::rename_free(&rs.restrict(&r), rs));
-                    it.field = Some(SliceField { kind, raw: virt, consts: consts.clone(), folded, complex: false });
+                    let folded =
+                        res(raw).map(|r| math_core::slice::rename_free(&rs.restrict(&r), rs));
+                    it.field = Some(SliceField {
+                        kind,
+                        raw: virt,
+                        consts: consts.clone(),
+                        folded,
+                        complex: false,
+                    });
                 }
             } else if matches!(pr.kind, Kind::Field { .. }) {
                 if let Some(rr) = res(raw).map(|r| rs.restrict(&r)) {
@@ -194,8 +231,14 @@ pub fn collect(
             let axis = rs.fixed_axes()[0];
             let c = rs.fixed[axis].unwrap_or(0.0);
             let curve: Option<(Vec<Expr>, &str, f64)> = match &pr.kind {
-                Kind::Parametric { components } if components.len() == 2 || (three && components.len() == 3) => {
-                    components.iter().map(res).collect::<Option<Vec<_>>>().map(|v| (v, "t", turn_of(angle)))
+                Kind::Parametric { components }
+                    if components.len() == 2 || (three && components.len() == 3) =>
+                {
+                    components
+                        .iter()
+                        .map(res)
+                        .collect::<Option<Vec<_>>>()
+                        .map(|v| (v, "t", turn_of(angle)))
                 }
                 Kind::Polar { rhs } if !three => res(rhs).map(|r| {
                     let k = if theta_outside_trig(&r) { 3.0 } else { 2.0 };
@@ -207,7 +250,10 @@ pub fn collect(
                 _ => None,
             };
             if let Some((comps, var, t1)) = curve {
-                let progs: Vec<Program> = comps.iter().filter_map(|c| compile(c, &[var], angle).ok()).collect();
+                let progs: Vec<Program> = comps
+                    .iter()
+                    .filter_map(|c| compile(c, &[var], angle).ok())
+                    .collect();
                 if progs.len() == comps.len() && axis < progs.len() {
                     let g = Expr::bin(BinOp::Sub, comps[axis].clone(), Expr::num(c));
                     if let Ok(gp) = compile(&g, &[var], angle) {
@@ -233,10 +279,15 @@ pub fn collect(
 /// Ambient positions of a point item or the members of a list of points / tuples (2-tuples get
 /// `z = 0`; in 2D only 2-tuples count, as in the main scene). Anything else gives nothing.
 fn point_values(pr: &Prepared, defs: &Defs, angle: Angle, three: bool) -> Vec<[f64; 3]> {
-    if !matches!(pr.kind, Kind::List { .. } | Kind::Point { .. } | Kind::Value { .. }) {
+    if !matches!(
+        pr.kind,
+        Kind::List { .. } | Kind::Point { .. } | Kind::Value { .. }
+    ) {
         return Vec::new();
     }
-    let Ok(r) = defs.resolve(&pr.expr) else { return Vec::new() };
+    let Ok(r) = defs.resolve(&pr.expr) else {
+        return Vec::new();
+    };
     if ["x", "y", "z"].iter().any(|v| r.contains_var(v)) {
         return Vec::new();
     }
@@ -261,7 +312,13 @@ fn point_values(pr: &Prepared, defs: &Defs, angle: Angle, three: bool) -> Vec<[f
     };
     tuples
         .into_iter()
-        .filter(|t| if three { matches!(t.len(), 2 | 3) } else { t.len() == 2 })
+        .filter(|t| {
+            if three {
+                matches!(t.len(), 2 | 3)
+            } else {
+                t.len() == 2
+            }
+        })
         .map(|t| [t[0], t[1], t.get(2).copied().unwrap_or(0.0)])
         .collect()
 }
@@ -270,7 +327,11 @@ fn point_values(pr: &Prepared, defs: &Defs, angle: Angle, three: bool) -> Vec<[f
 /// between consecutive roots, so each piece is decided by its midpoint).
 fn region_intervals(p: &Program, roots: &[f64], lo: f64, hi: f64, greater: bool) -> Vec<[f64; 2]> {
     let mut cuts = vec![lo];
-    let mut rs: Vec<f64> = roots.iter().copied().filter(|r| *r > lo && *r < hi).collect();
+    let mut rs: Vec<f64> = roots
+        .iter()
+        .copied()
+        .filter(|r| *r > lo && *r < hi)
+        .collect();
     rs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     cuts.extend(rs);
     cuts.push(hi);
@@ -305,7 +366,13 @@ fn contour_opts(su: f64, sv: f64, px: (f64, f64)) -> (f64, u32) {
 /// `|f|`, and a cell whose minimum is (relatively) zero is "touched" at that point. Touched points
 /// of neighbouring cells are joined into segments. A single isolated touch (a tangent point)
 /// gives no segment. Bounded work: at most `budget` interval evaluations.
-fn touching_zero_set(p: &Program, u: (f64, f64), v: (f64, f64), min_cell: f64, budget: usize) -> Vec<[[f64; 2]; 2]> {
+fn touching_zero_set(
+    p: &Program,
+    u: (f64, f64),
+    v: (f64, f64),
+    min_cell: f64,
+    budget: usize,
+) -> Vec<[[f64; 2]; 2]> {
     use std::collections::HashMap;
     let (su, sv) = (u.1 - u.0, v.1 - v.0);
     if !(su.is_finite() && sv.is_finite() && su > 0.0 && sv > 0.0) {
@@ -342,7 +409,10 @@ fn touching_zero_set(p: &Program, u: (f64, f64), v: (f64, f64), min_cell: f64, b
         let mut worst = 0.0f64;
         for i in 0..5 {
             for j in 0..5 {
-                let (x, y) = (ax + (bx - ax) * i as f64 / 4.0, ay + (by - ay) * j as f64 / 4.0);
+                let (x, y) = (
+                    ax + (bx - ax) * i as f64 / 4.0,
+                    ay + (by - ay) * j as f64 / 4.0,
+                );
                 let val = f(x, y);
                 if !val.is_finite() {
                     continue;
@@ -361,8 +431,20 @@ fn touching_zero_set(p: &Program, u: (f64, f64), v: (f64, f64), min_cell: f64, b
         while step > min_step {
             let [bx0, by0] = best.1;
             let mut improved = false;
-            for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0), (1.0, 1.0), (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0)] {
-                let (x, y) = ((bx0 + dx * step).clamp(ax, bx), (by0 + dy * step).clamp(ay, by));
+            for (dx, dy) in [
+                (1.0, 0.0),
+                (-1.0, 0.0),
+                (0.0, 1.0),
+                (0.0, -1.0),
+                (1.0, 1.0),
+                (-1.0, -1.0),
+                (1.0, -1.0),
+                (-1.0, 1.0),
+            ] {
+                let (x, y) = (
+                    (bx0 + dx * step).clamp(ax, bx),
+                    (by0 + dy * step).clamp(ay, by),
+                );
                 let val = f(x, y);
                 if val.is_finite() && val < best.0 {
                     best = (val, [x, y]);
@@ -374,7 +456,10 @@ fn touching_zero_set(p: &Program, u: (f64, f64), v: (f64, f64), min_cell: f64, b
             }
         }
         if best.0 <= 1e-6 * worst.max(f64::MIN_POSITIVE) || best.0 == 0.0 {
-            let key = (((ax - u.0) / cw).round() as i64, ((ay - v.0) / ch).round() as i64);
+            let key = (
+                ((ax - u.0) / cw).round() as i64,
+                ((ay - v.0) / ch).round() as i64,
+            );
             touched.insert(key, best.1);
         }
     }
@@ -398,7 +483,13 @@ fn touching_zero_set(p: &Program, u: (f64, f64), v: (f64, f64), min_cell: f64, b
 
 /// Contours / roots of every item over the free-axis ranges of `win`; `px` is the pixel size of
 /// the free axes (for the contour resolution).
-pub fn compute(rs: &ResolvedSlice, items: &[SliceItem], win: &Window3, px: (f64, f64), angle: Angle) -> SliceGeo {
+pub fn compute(
+    rs: &ResolvedSlice,
+    items: &[SliceItem],
+    win: &Window3,
+    px: (f64, f64),
+    angle: Angle,
+) -> SliceGeo {
     let free = rs.free_axes();
     let names: Vec<&str> = free.iter().map(|a| axis_name(*a)).collect();
     let mut geo = SliceGeo::default();
@@ -409,11 +500,25 @@ pub fn compute(rs: &ResolvedSlice, items: &[SliceItem], win: &Window3, px: (f64,
         if let Some(Ok(p)) = it.f.as_ref().map(|f| compile(f, &names, angle)) {
             if free.len() == 2 {
                 let (u, v) = (free[0], free[1]);
-                let (mc, depth) = contour_opts(win.max[u] - win.min[u], win.max[v] - win.min[v], px);
-                curve = mesh::contour_2d(&p, (win.min[u], win.max[u]), (win.min[v], win.max[v]), mc, depth, 400_000);
+                let (mc, depth) =
+                    contour_opts(win.max[u] - win.min[u], win.max[v] - win.min[v], px);
+                curve = mesh::contour_2d(
+                    &p,
+                    (win.min[u], win.max[u]),
+                    (win.min[v], win.max[v]),
+                    mc,
+                    depth,
+                    400_000,
+                );
                 if curve.is_empty() {
                     // No sign change anywhere: the zero set may still exist (tangent / double root).
-                    curve = touching_zero_set(&p, (win.min[u], win.max[u]), (win.min[v], win.max[v]), mc, 60_000);
+                    curve = touching_zero_set(
+                        &p,
+                        (win.min[u], win.max[u]),
+                        (win.min[v], win.max[v]),
+                        mc,
+                        60_000,
+                    );
                 }
             } else if free.len() == 1 {
                 let (lo, hi) = (win.min[free[0]], win.max[free[0]]);
@@ -441,7 +546,9 @@ impl<'a> Builder<'a> {
         for p in c {
             self.out.vertices.push(MeshVertex::new(p, [0.0; 3], color));
         }
-        self.out.flat_indices.extend([0, 1, 2, 0, 2, 3].map(|i| i + base));
+        self.out
+            .flat_indices
+            .extend([0, 1, 2, 0, 2, 3].map(|i| i + base));
     }
 
     /// A dot with a contrasting halo so it reads on top of a surface of the same colour.
@@ -459,7 +566,9 @@ impl<'a> Builder<'a> {
     fn biased_seg(&mut self, a: [f64; 3], b: [f64; 3], w: f32, color: [f32; 4], bias: f32) {
         let (p0, p1) = (self.rb(a), self.rb(b));
         if p0.iter().chain(p1.iter()).all(|v| v.is_finite()) {
-            self.out.overlay_segments.push(SegmentInstance::new(p0, p1, w, color).with_depth_bias(bias));
+            self.out
+                .overlay_segments
+                .push(SegmentInstance::new(p0, p1, w, color).with_depth_bias(bias));
         }
     }
 
@@ -477,7 +586,13 @@ impl<'a> Builder<'a> {
         if free.len() == 2 {
             let (u, v) = (free[0], free[1]);
             if in_window {
-                let corners = [[lo[u], lo[v]], [hi[u], lo[v]], [hi[u], hi[v]], [lo[u], hi[v]]].map(|c| rs.lift(&c));
+                let corners = [
+                    [lo[u], lo[v]],
+                    [hi[u], lo[v]],
+                    [hi[u], hi[v]],
+                    [lo[u], hi[v]],
+                ]
+                .map(|c| rs.lift(&c));
                 let mut fill = SLICE_COLOR;
                 fill[3] = PLANE_ALPHA;
                 self.quad4(corners, fill);
@@ -571,7 +686,9 @@ pub struct PanelCtx<'a> {
 pub fn inset_rect(size: (u32, u32)) -> [u32; 4] {
     let (cw, ch) = (size.0.max(1) as f64, size.1.max(1) as f64);
     let m = (0.015 * cw.min(ch)).clamp(6.0, 18.0);
-    let mut w = (0.34 * cw).clamp(180.0, 440.0).min((cw - 2.0 * m).max(40.0));
+    let mut w = (0.34 * cw)
+        .clamp(180.0, 440.0)
+        .min((cw - 2.0 * m).max(40.0));
     let mut h = w * 0.75;
     if h > ch * 0.6 {
         h = (ch * 0.6).max(30.0);
@@ -630,10 +747,15 @@ pub fn build_panel(
     let two_d = free.len() == 2;
     let u = free[0];
     let names: Vec<&str> = free.iter().map(|a| axis_name(*a)).collect();
-    let req = ctx.view.filter(|r| r.free == free && math_core::slice::view_valid(&r.view)).map(|r| r.view);
+    let req = ctx
+        .view
+        .filter(|r| r.free == free && math_core::slice::view_valid(&r.view))
+        .map(|r| r.view);
     let follow = req.is_none();
     // Horizontal range: the free axis; for a 2D slice widen so both ranges fit the aspect.
-    let (mut u0, mut u1) = req.map(|v| (v[0], v[1])).unwrap_or((win.min[u], win.max[u]));
+    let (mut u0, mut u1) = req
+        .map(|v| (v[0], v[1]))
+        .unwrap_or((win.min[u], win.max[u]));
     let (vc, k, v_lo_s, v_hi_s);
     let view;
     if two_d {
@@ -701,6 +823,7 @@ pub fn build_panel(
         angle,
         pdefs: ctx.pdefs.clone(),
         sliders,
+        ext: Default::default(),
     };
     // y of a free-axis value `v` in panel coordinates.
     let ys = |v: f64| if two_d { v } else { (v - vc) * k };
@@ -723,11 +846,22 @@ pub fn build_panel(
     }
     let tick_boxes = panel_axes(&mut b, two_d, (u0, u1), (v_lo_s, v_hi_s), vc, k, pw, ph);
 
-    let geo = compute(rs, items, &win_for_panel(&win, &free, (u0, u1), (v_lo_s, v_hi_s), two_d), (pw, ph), angle);
+    let geo = compute(
+        rs,
+        items,
+        &win_for_panel(&win, &free, (u0, u1), (v_lo_s, v_hi_s), two_d),
+        (pw, ph),
+        angle,
+    );
     if two_d {
         for (it, segs) in items.iter().zip(&geo.curves) {
             for s in segs {
-                b.seg([s[0][0], s[0][1], 0.0], [s[1][0], s[1][1], 0.0], INSET_CURVE_W, it.color);
+                b.seg(
+                    [s[0][0], s[0][1], 0.0],
+                    [s[1][0], s[1][1], 0.0],
+                    INSET_CURVE_W,
+                    it.color,
+                );
             }
         }
         for it in items {
@@ -747,14 +881,18 @@ pub fn build_panel(
             if let Some(Ok(_)) = it.line_fn().map(|f| compile(f, &names, angle)) {
                 let scaled = Expr::bin(
                     BinOp::Mul,
-                    Expr::bin(BinOp::Sub, it.line_fn().cloned().unwrap_or(Expr::num(0.0)), Expr::num(vc)),
+                    Expr::bin(
+                        BinOp::Sub,
+                        it.line_fn().cloned().unwrap_or(Expr::num(0.0)),
+                        Expr::num(vc),
+                    ),
                     Expr::num(k),
                 );
                 if let Ok(p) = compile(&scaled, &names, angle) {
                     let lines = mesh::sample_explicit(&p, u0, u1, pw as usize, (v_lo_s, v_hi_s));
                     for l in &lines {
                         let pts: Vec<[f64; 3]> = l.iter().map(|q| [q[0], q[1], 0.0]).collect();
-                        b.polyline(&pts, Style { color: it.color, line_w: INSET_CURVE_W });
+                        b.polyline(&pts, Style::new(it.color, INSET_CURVE_W));
                     }
                 }
             }
@@ -778,19 +916,56 @@ pub fn build_panel(
         let (a, c) = (corners[i], corners[(i + 1) % 4]);
         b.seg([a[0], a[1], 0.0], [c[0], c[1], 0.0], 2.0, frame);
     }
-    let vname = if two_d { axis_name(free[1]).to_string() } else { "f".to_string() };
+    let vname = if two_d {
+        axis_name(free[1]).to_string()
+    } else {
+        "f".to_string()
+    };
     let (wu, wv) = ((u1 - u0) / pw, (v_hi_s - v_lo_s) / ph);
     // Axis names go at the far end of their axis; if a tick label is there, slide along the edge
     // (x name leftwards, y name downwards) until clear of every tick box.
-    let xn = place_name(0, names[0], (pw - NAME_INSET_X, ph - NAME_INSET_Y), (-1.0, 0.0), &tick_boxes, &[], pw, ph);
+    let xn = place_name(
+        0,
+        names[0],
+        (pw - NAME_INSET_X, ph - NAME_INSET_Y),
+        (-1.0, 0.0),
+        &tick_boxes,
+        &[],
+        pw,
+        ph,
+    );
     let xbox = label_box(0, names[0], xn.0, xn.1);
-    let yn = place_name(1, &vname, (NAME_INSET_X, 0.5 * LABEL_H + 3.0), (0.0, 1.0), &tick_boxes, &[xbox], pw, ph);
-    b.label([u0 + xn.0 * wu, v_hi_s - xn.1 * wv, 0.0], names[0].to_string(), 0);
+    let yn = place_name(
+        1,
+        &vname,
+        (NAME_INSET_X, 0.5 * LABEL_H + 3.0),
+        (0.0, 1.0),
+        &tick_boxes,
+        &[xbox],
+        pw,
+        ph,
+    );
+    b.label(
+        [u0 + xn.0 * wu, v_hi_s - xn.1 * wv, 0.0],
+        names[0].to_string(),
+        0,
+    );
     b.label([u0 + yn.0 * wu, v_hi_s - yn.1 * wv, 0.0], vname.clone(), 1);
     let (curves, points) = geo.counts(items);
     let mut g = b.out;
     g.diagnostics.clear();
-    SlicePanel { geometry: g, rig, origin, rect, axes: [names[0].to_string(), vname], curves, points, view, free, follow }
+    SlicePanel {
+        geometry: g,
+        rig,
+        origin,
+        rect,
+        axes: [names[0].to_string(), vname],
+        curves,
+        points,
+        view,
+        free,
+        follow,
+    }
 }
 
 /// Approximate label box used to keep inset labels inside the rectangle (CSS pixels): width per
@@ -828,7 +1003,7 @@ impl Builder<'_> {
     /// One raster of a plane slice over the panel window. A failure (for example a shader that
     /// cannot be expressed) is dropped: the inset just shows less.
     fn slice_field(&mut self, f: &SliceField, color: [f32; 4], defs: &Defs) {
-        let st = Style { color, line_w: INSET_CURVE_W };
+        let st = Style::new(color, INSET_CURVE_W);
         if f.complex {
             let _ = self.draw_complex(&f.raw, defs, Mode::D2, st);
             return;
@@ -845,7 +1020,13 @@ impl Builder<'_> {
 
 /// Window handed to `compute` for the panel: free-axis ranges in WORLD (unscaled) values (for a
 /// 1D slice only the horizontal range matters).
-fn win_for_panel(win: &Window3, free: &[usize], (u0, u1): (f64, f64), (v0, v1): (f64, f64), two_d: bool) -> Window3 {
+fn win_for_panel(
+    win: &Window3,
+    free: &[usize],
+    (u0, u1): (f64, f64),
+    (v0, v1): (f64, f64),
+    two_d: bool,
+) -> Window3 {
     let mut w = *win;
     w.min[free[0]] = u0;
     w.max[free[0]] = u1;
@@ -874,7 +1055,11 @@ fn panel_axes(
     let mut boxes: Vec<[f64; 4]> = Vec::new();
     let (minor_c, major_c, axis_c) = (b.theme.grid_minor, b.theme.grid_major, b.theme.axis);
     // Value range shown vertically.
-    let (v0, v1) = if two_d { (y0, y1) } else { (vc + y0 / k, vc + y1 / k) };
+    let (v0, v1) = if two_d {
+        (y0, y1)
+    } else {
+        (vc + y0 / k, vc + y1 / k)
+    };
     let sy = |v: f64| if two_d { v } else { (v - vc) * k };
     let su = nice_step(u1 - u0, pw, 60.0);
     let sv = nice_step(v1 - v0, ph, 40.0);
@@ -887,7 +1072,11 @@ fn panel_axes(
                 if is_major != pass_major {
                     continue;
                 }
-                let (w, c) = if is_major { (MAJOR_W, major_c) } else { (MINOR_W, minor_c) };
+                let (w, c) = if is_major {
+                    (MAJOR_W, major_c)
+                } else {
+                    (MINOR_W, minor_c)
+                };
                 if axis == 0 {
                     b.seg([val, y0, 0.0], [val, y1, 0.0], w, c);
                 } else {
@@ -909,8 +1098,16 @@ fn panel_axes(
     let row_hi = v1 - 3.0 * wv;
     let col_lo = u0 + (LABEL_CHAR_W * 4.0 + LABEL_GAP_Y + 3.0) * wu;
     let col_hi = u1 - 3.0 * wu;
-    let zy = if row_lo <= row_hi { 0f64.max(row_lo).min(row_hi) } else { 0.5 * (v0 + v1) };
-    let zx = if col_lo <= col_hi { 0f64.max(col_lo).min(col_hi) } else { 0.5 * (u0 + u1) };
+    let zy = if row_lo <= row_hi {
+        0f64.max(row_lo).min(row_hi)
+    } else {
+        0.5 * (v0 + v1)
+    };
+    let zx = if col_lo <= col_hi {
+        0f64.max(col_lo).min(col_hi)
+    } else {
+        0.5 * (u0 + u1)
+    };
     // Pixel position of a label anchor inside the panel (from the top-left), for the box test.
     let fits = |axis: u8, text: &str, u: f64, v: f64| -> bool {
         let (ax, ay) = ((u - u0) / wu, (v1 - v) / wv);
@@ -955,7 +1152,16 @@ fn boxes_overlap(a: &[f64; 4], b: &[f64; 4], pad: f64) -> bool {
 /// panel and clear of every tick box (and of `taken`), else the nearest clear spot on a sweep
 /// along the axis' far end, else the preferred spot (nothing better exists).
 #[allow(clippy::too_many_arguments)]
-fn place_name(axis: u8, text: &str, pref: (f64, f64), sweep: (f64, f64), ticks: &[[f64; 4]], taken: &[[f64; 4]], pw: f64, ph: f64) -> (f64, f64) {
+fn place_name(
+    axis: u8,
+    text: &str,
+    pref: (f64, f64),
+    sweep: (f64, f64),
+    ticks: &[[f64; 4]],
+    taken: &[[f64; 4]],
+    pw: f64,
+    ph: f64,
+) -> (f64, f64) {
     for i in 0..=60 {
         let t = i as f64 * 6.0;
         for sign in [1.0, -1.0] {
@@ -964,7 +1170,11 @@ fn place_name(axis: u8, text: &str, pref: (f64, f64), sweep: (f64, f64), ticks: 
                 continue;
             }
             let bx = label_box(axis, text, x, y);
-            if ticks.iter().chain(taken).all(|o| !boxes_overlap(&bx, o, 2.0)) {
+            if ticks
+                .iter()
+                .chain(taken)
+                .all(|o| !boxes_overlap(&bx, o, 2.0))
+            {
                 return (x, y);
             }
         }
@@ -989,14 +1199,23 @@ mod tests {
     fn doc_with(items: &[&str], slice: &str, mode: Mode) -> Doc {
         let mut d = Doc::new_default();
         for (i, l) in items.iter().enumerate() {
-            d.add_item(Item::new(&format!("e{i}"), ItemKind::Equation, l)).unwrap();
+            d.add_item(Item::new(&format!("e{i}"), ItemKind::Equation, l))
+                .unwrap();
         }
         d.slice = Some(SliceCfg::new(None, parse_fixed_text(slice).unwrap(), mode).unwrap());
         d
     }
 
     fn slider(d: &mut Doc, name: &str, v: f64) {
-        d.sliders.insert(name.into(), SliderCfg { min: -10.0, max: 10.0, step: None, value: v });
+        d.sliders.insert(
+            name.into(),
+            SliderCfg {
+                min: -10.0,
+                max: 10.0,
+                step: None,
+                value: v,
+            },
+        );
     }
 
     fn win() -> Window3 {
@@ -1007,8 +1226,13 @@ mod tests {
     fn geo_of(d: &Doc, mode: Mode) -> (ResolvedSlice, Vec<SliceItem>, SliceGeo) {
         let mut diags = Vec::new();
         let (items, defs, _, _) = prepare(d, &mut diags);
-        let rs = ResolvedSlice::resolve(d.slice.as_ref().unwrap(), mode, &defs, Angle::Rad).unwrap();
-        let w = if mode == Mode::D3 { win() } else { Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 1.0]) };
+        let rs =
+            ResolvedSlice::resolve(d.slice.as_ref().unwrap(), mode, &defs, Angle::Rad).unwrap();
+        let w = if mode == Mode::D3 {
+            win()
+        } else {
+            Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 1.0])
+        };
         let si = collect(&items, &defs, &Theme::light(), Angle::Rad, &rs, &w);
         let geo = compute(&rs, &si, &w, (532.0, 532.0), Angle::Rad);
         (rs, si, geo)
@@ -1024,7 +1248,10 @@ mod tests {
         let r = 3f64.sqrt();
         for s in segs {
             for p in s {
-                assert!((p[0].hypot(p[1]) - r).abs() < 1e-5, "point off the circle: {p:?}");
+                assert!(
+                    (p[0].hypot(p[1]) - r).abs() < 1e-5,
+                    "point off the circle: {p:?}"
+                );
             }
         }
     }
@@ -1045,7 +1272,10 @@ mod tests {
         slider(&mut d, "a", 2.0);
         let g = build_scene(&d, Mode::D3, win(), [0.0; 3], (900, 600), &Theme::light());
         let zs: Vec<f32> = g.vertices.iter().rev().take(4).map(|v| v.pos[2]).collect();
-        assert!(zs.iter().all(|z| (z - 2.0).abs() < 1e-6), "plane quad at z=2: {zs:?}");
+        assert!(
+            zs.iter().all(|z| (z - 2.0).abs() < 1e-6),
+            "plane quad at z=2: {zs:?}"
+        );
         assert!(!g.overlay_segments.is_empty());
     }
 
@@ -1055,7 +1285,9 @@ mod tests {
         let d = doc_with(&["x^2+y^2+z^2=4"], "y=1", Mode::D3);
         let (rs, _, geo) = geo_of(&d, Mode::D3);
         assert_eq!(rs.free_axes(), vec![0, 2]);
-        assert!(geo.curves[0].iter().all(|s| (s[0][0].hypot(s[0][1]) - 3f64.sqrt()).abs() < 1e-5));
+        assert!(geo.curves[0]
+            .iter()
+            .all(|s| (s[0][0].hypot(s[0][1]) - 3f64.sqrt()).abs() < 1e-5));
         // x = 3 misses the radius-2 sphere entirely: no curve, no panic.
         let d = doc_with(&["x^2+y^2+z^2=4"], "x=3", Mode::D3);
         assert!(geo_of(&d, Mode::D3).2.curves[0].is_empty());
@@ -1070,12 +1302,26 @@ mod tests {
         let mut r = geo.roots[0].clone();
         r.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(r.len(), 2);
-        assert!((r[0] + 2.0).abs() < 1e-9 && (r[1] - 2.0).abs() < 1e-9, "{r:?}");
+        assert!(
+            (r[0] + 2.0).abs() < 1e-9 && (r[1] - 2.0).abs() < 1e-9,
+            "{r:?}"
+        );
         // The main scene draws the cut line and two dots (each dot is several overlay passes).
-        let g = build_scene(&d, Mode::D2, Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 1.0]), [0.0; 3], (900, 600), &Theme::light());
+        let g = build_scene(
+            &d,
+            Mode::D2,
+            Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 1.0]),
+            [0.0; 3],
+            (900, 600),
+            &Theme::light(),
+        );
         let dots = g.overlay_segments.iter().filter(|s| s.p0 == s.p1).count();
         assert_eq!(dots, 2 * 3, "two roots, three passes each");
-        let line = g.segments.iter().filter(|s| s.p0[1] == 4.0 && s.p1[1] == 4.0 && s.width == 3.0).count();
+        let line = g
+            .segments
+            .iter()
+            .filter(|s| s.p0[1] == 4.0 && s.p1[1] == 4.0 && s.width == 3.0)
+            .count();
         assert_eq!(line, 1, "the cut line at y=4");
         // Slider below the vertex: no intersection.
         slider(&mut d, "a", -1.0);
@@ -1110,8 +1356,14 @@ mod tests {
         let d = doc_with(&["y=x^2"], "z=1", Mode::D3);
         let mut diags = Vec::new();
         let (_, defs, _, _) = prepare(&d, &mut diags);
-        assert!(ResolvedSlice::resolve(d.slice.as_ref().unwrap(), Mode::D2, &defs, Angle::Rad).is_err());
-        assert!(build_slice_panel(&d, Mode::D2, win(), (900, 600), &Theme::light()).unwrap().is_err());
+        assert!(
+            ResolvedSlice::resolve(d.slice.as_ref().unwrap(), Mode::D2, &defs, Angle::Rad).is_err()
+        );
+        assert!(
+            build_slice_panel(&d, Mode::D2, win(), (900, 600), &Theme::light())
+                .unwrap()
+                .is_err()
+        );
         // And the main scene just ignores it.
         let g = build_scene(&d, Mode::D2, win(), [0.0; 3], (900, 600), &Theme::light());
         assert!(g.overlay_segments.is_empty());
@@ -1120,7 +1372,8 @@ mod tests {
     #[test]
     fn no_slice_means_no_overlay_and_no_panel() {
         let mut d = Doc::new_default();
-        d.add_item(Item::new("a", ItemKind::Equation, "y=x^2")).unwrap();
+        d.add_item(Item::new("a", ItemKind::Equation, "y=x^2"))
+            .unwrap();
         assert!(build_slice_panel(&d, Mode::D2, win(), (900, 600), &Theme::light()).is_none());
         let g = build_scene(&d, Mode::D2, win(), [0.0; 3], (900, 600), &Theme::light());
         assert!(g.overlay_segments.is_empty());
@@ -1141,12 +1394,19 @@ mod tests {
         let segs = &geo.curves[0];
         assert!(segs.len() >= 20);
         for s in segs {
-            assert!(s[0][0].abs() < 1e-3 && s[1][0].abs() < 1e-3, "on x = 0: {s:?}");
+            assert!(
+                s[0][0].abs() < 1e-3 && s[1][0].abs() < 1e-3,
+                "on x = 0: {s:?}"
+            );
         }
-        let (lo, hi) = segs.iter().fold((f64::MAX, f64::MIN), |(l, h), s| (l.min(s[0][1].min(s[1][1])), h.max(s[0][1].max(s[1][1]))));
+        let (lo, hi) = segs.iter().fold((f64::MAX, f64::MIN), |(l, h), s| {
+            (l.min(s[0][1].min(s[1][1])), h.max(s[0][1].max(s[1][1])))
+        });
         assert!(lo < -2.5 && hi > 2.5, "spans the window along z: {lo} {hi}");
         // The inset reports the curve too.
-        let out = build_slice_panel(&d, Mode::D3, win(), (900, 600), &Theme::light()).unwrap().unwrap();
+        let out = build_slice_panel(&d, Mode::D3, win(), (900, 600), &Theme::light())
+            .unwrap()
+            .unwrap();
         assert_eq!(out.panel.curves, 1);
         // (x^2+y^2-1)^2 = 0 never changes sign: still the unit circle.
         let d = doc_with(&["(x^2+y^2-1)^2+z=0"], "z=0", Mode::D3);
@@ -1177,22 +1437,37 @@ mod tests {
     #[test]
     fn panel_shows_the_circle_of_radius_sqrt3() {
         let d = doc_with(&["x^2+y^2+z^2=4"], "z=1", Mode::D3);
-        let out = build_slice_panel(&d, Mode::D3, win(), (900, 600), &Theme::light()).unwrap().unwrap();
+        let out = build_slice_panel(&d, Mode::D3, win(), (900, 600), &Theme::light())
+            .unwrap()
+            .unwrap();
         let p = &out.panel;
         assert_eq!(p.axes, ["x".to_string(), "y".to_string()]);
         assert_eq!((p.curves, p.points), (1, 0));
         // Inside the canvas, bottom-right, 4:3.
         assert!(p.rect[0] + p.rect[2] <= 900 && p.rect[1] + p.rect[3] <= 600);
         assert!(p.rect[0] > 450 && p.rect[1] > 300);
-        let ring: Vec<_> = p.geometry.segments.iter().filter(|s| s.width == INSET_CURVE_W).collect();
+        let ring: Vec<_> = p
+            .geometry
+            .segments
+            .iter()
+            .filter(|s| s.width == INSET_CURVE_W)
+            .collect();
         assert!(ring.len() > 200);
         for s in ring {
             let a = abs(p, s.p0);
             assert!((a[0].hypot(a[1]) - 3f64.sqrt()).abs() < 1e-4, "{a:?}");
         }
         // Axis names and tick labels exist.
-        assert!(p.geometry.labels.iter().any(|l| l.text == "x" && l.axis == 0));
-        assert!(p.geometry.labels.iter().any(|l| l.text == "y" && l.axis == 1));
+        assert!(p
+            .geometry
+            .labels
+            .iter()
+            .any(|l| l.text == "x" && l.axis == 0));
+        assert!(p
+            .geometry
+            .labels
+            .iter()
+            .any(|l| l.text == "y" && l.axis == 1));
         assert!(p.geometry.labels.iter().any(|l| l.text == "1"));
         // An opaque background quad so it reads over the 3D scene.
         assert_eq!(p.geometry.flat_indices.len(), 6);
@@ -1202,14 +1477,26 @@ mod tests {
     fn panel_for_a_line_slice_plots_the_value_along_the_line() {
         let mut d = doc_with(&["y=x^2"], "y=a", Mode::D2);
         slider(&mut d, "a", 4.0);
-        let out = build_slice_panel(&d, Mode::D2, Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 1.0]), (900, 600), &Theme::light())
-            .unwrap()
-            .unwrap();
+        let out = build_slice_panel(
+            &d,
+            Mode::D2,
+            Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 1.0]),
+            (900, 600),
+            &Theme::light(),
+        )
+        .unwrap()
+        .unwrap();
         let p = &out.panel;
         assert_eq!(p.axes, ["x".to_string(), "f".to_string()]);
         assert_eq!((p.curves, p.points), (0, 2));
         // The graph is F(x) = a - x^2 scaled in y; its roots sit on the zero line (two dots).
-        let xs: Vec<f64> = p.geometry.overlay_segments.iter().filter(|s| s.p0 == s.p1).map(|s| abs(p, s.p0)[0]).collect();
+        let xs: Vec<f64> = p
+            .geometry
+            .overlay_segments
+            .iter()
+            .filter(|s| s.p0 == s.p1)
+            .map(|s| abs(p, s.p0)[0])
+            .collect();
         assert_eq!(xs.len(), 2 * 3, "two root dots, three passes each");
         assert!(xs.iter().all(|x| (x.abs() - 2.0).abs() < 1e-4), "{xs:?}");
         assert!(p.geometry.labels.iter().any(|l| l.text == "f"));
@@ -1217,12 +1504,22 @@ mod tests {
 
     #[test]
     fn inset_rect_fits_any_canvas() {
-        for size in [(900, 600), (300, 200), (100, 100), (1, 1), (2000, 300), (390, 800)] {
+        for size in [
+            (900, 600),
+            (300, 200),
+            (100, 100),
+            (1, 1),
+            (2000, 300),
+            (390, 800),
+        ] {
             let r = inset_rect(size);
             assert!(r[2] >= 1 && r[3] >= 1);
             assert!(r[0] + r[2] <= size.0.max(r[0] + r[2]).max(1));
             if size.0 >= 100 && size.1 >= 100 {
-                assert!(r[0] + r[2] <= size.0 && r[1] + r[3] <= size.1, "{size:?} {r:?}");
+                assert!(
+                    r[0] + r[2] <= size.0 && r[1] + r[3] <= size.1,
+                    "{size:?} {r:?}"
+                );
             }
         }
     }
@@ -1235,12 +1532,17 @@ mod tests {
         d.items[2].kind = ItemKind::Complex;
         let g = build_scene(&d, Mode::D3, win(), [0.0; 3], (200, 150), &Theme::light());
         assert!(!g.overlay_segments.is_empty());
-        let out = build_slice_panel(&d, Mode::D3, win(), (200, 150), &Theme::dark()).unwrap().unwrap();
+        let out = build_slice_panel(&d, Mode::D3, win(), (200, 150), &Theme::dark())
+            .unwrap()
+            .unwrap();
         assert!(out.panel.rect[2] >= 1);
     }
 
     fn panel_of(d: &Doc, mode: Mode, w: Window3, view: Option<&ViewReq>) -> SlicePanel {
-        build_slice_panel_view(d, mode, w, (900, 600), &Theme::light(), view).unwrap().unwrap().panel
+        build_slice_panel_view(d, mode, w, (900, 600), &Theme::light(), view)
+            .unwrap()
+            .unwrap()
+            .panel
     }
 
     #[test]
@@ -1252,20 +1554,30 @@ mod tests {
         assert_eq!(p.geometry.fields[1].kind, FieldKind::Hue);
         assert!(p.geometry.flat_indices.is_empty());
         let w = &p.geometry.fields[1].wgsl;
-        assert!(w.contains("field_core") && w.contains("fp.params"), "constants are uniforms: {w}");
+        assert!(
+            w.contains("field_core") && w.contains("fp.params"),
+            "constants are uniforms: {w}"
+        );
         // Sweeping the slice constant changes the uniform, not the shader (no recompile).
         d.slice = Some(SliceCfg::new(None, parse_fixed_text("z=a").unwrap(), Mode::D3).unwrap());
         slider(&mut d, "a", 1.0);
-        let f1 = panel_of(&d, Mode::D3, win(), None).geometry.fields.remove(1);
+        let f1 = panel_of(&d, Mode::D3, win(), None)
+            .geometry
+            .fields
+            .remove(1);
         slider(&mut d, "a", 2.5);
-        let f2 = panel_of(&d, Mode::D3, win(), None).geometry.fields.remove(1);
+        let f2 = panel_of(&d, Mode::D3, win(), None)
+            .geometry
+            .fields
+            .remove(1);
         assert_eq!(f1.wgsl, f2.wgsl);
         assert_ne!(f1.params, f2.params);
         assert!(f2.params.contains(&2.5));
         // The field is NOT clutter in the main scene's slice overlay (no zero contour for it).
         let mut diags = Vec::new();
         let (items, defs, _, _) = prepare(&d, &mut diags);
-        let rs = ResolvedSlice::resolve(d.slice.as_ref().unwrap(), Mode::D3, &defs, Angle::Rad).unwrap();
+        let rs =
+            ResolvedSlice::resolve(d.slice.as_ref().unwrap(), Mode::D3, &defs, Angle::Rad).unwrap();
         let si = collect(&items, &defs, &Theme::light(), Angle::Rad, &rs, &win());
         assert!(si[0].f.is_none() && si[0].field.is_some());
     }
@@ -1285,14 +1597,24 @@ mod tests {
         let p = panel_of(&d, Mode::D3, win(), None);
         assert_eq!(p.axes[1], "f");
         assert!(p.geometry.fields.is_empty());
-        let curve = p.geometry.segments.iter().filter(|s| s.width == INSET_CURVE_W).count();
+        let curve = p
+            .geometry
+            .segments
+            .iter()
+            .filter(|s| s.width == INSET_CURVE_W)
+            .count();
         assert!(curve > 50, "value graph drawn: {curve}");
         // sin(x)+1.5 lies in [0.5, 2.5]; the auto range includes it (and zero).
         assert!(p.view[2] <= 0.5 && p.view[3] >= 2.5, "{:?}", p.view);
         // 2D, line y = a: field x*y -> value a*x.
         let mut d = doc_with(&["x*y"], "y=a", Mode::D2);
         slider(&mut d, "a", 2.0);
-        let p = panel_of(&d, Mode::D2, Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 1.0]), None);
+        let p = panel_of(
+            &d,
+            Mode::D2,
+            Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 1.0]),
+            None,
+        );
         assert!(p.geometry.segments.iter().any(|s| s.width == INSET_CURVE_W));
     }
 
@@ -1301,7 +1623,10 @@ mod tests {
         let d = doc_with(&["x^2+y^2<4"], "z=1", Mode::D3);
         let p = panel_of(&d, Mode::D3, win(), None);
         assert_eq!(p.geometry.fields.len(), 2);
-        assert_eq!(p.geometry.fields[1].kind, FieldKind::Fill { greater: false });
+        assert_eq!(
+            p.geometry.fields[1].kind,
+            FieldKind::Fill { greater: false }
+        );
         assert_eq!(p.curves, 1, "the boundary outline is cut too");
         let (_, _, geo) = geo_of(&d, Mode::D3);
         for s in &geo.curves[0] {
@@ -1309,7 +1634,10 @@ mod tests {
         }
         // `>` fills the outside.
         let d = doc_with(&["x^2+y^2>4"], "z=1", Mode::D3);
-        assert_eq!(panel_of(&d, Mode::D3, win(), None).geometry.fields[1].kind, FieldKind::Fill { greater: true });
+        assert_eq!(
+            panel_of(&d, Mode::D3, win(), None).geometry.fields[1].kind,
+            FieldKind::Fill { greater: true }
+        );
         // The main scene still draws the outline on the plane and no fill field of its own.
         let g = build_scene(&d, Mode::D3, win(), [0.0; 3], (900, 600), &Theme::light());
         assert!(!g.overlay_segments.is_empty());
@@ -1322,7 +1650,10 @@ mod tests {
         let (_, _, geo) = geo_of(&d, Mode::D3);
         assert_eq!(geo.intervals[0].len(), 1);
         let iv = geo.intervals[0][0];
-        assert!((iv[0] + 2.0).abs() < 1e-6 && (iv[1] - 2.0).abs() < 1e-6, "{iv:?}");
+        assert!(
+            (iv[0] + 2.0).abs() < 1e-6 && (iv[1] - 2.0).abs() < 1e-6,
+            "{iv:?}"
+        );
         // `>` gives the two outer pieces within the window [-3, 3].
         let d = doc_with(&["x^2+y^2+z^2>4"], "y=0, z=0", Mode::D3);
         let (_, _, geo) = geo_of(&d, Mode::D3);
@@ -1332,29 +1663,65 @@ mod tests {
         let (_, _, geo) = geo_of(&d, Mode::D2);
         assert_eq!(geo.intervals[0].len(), 2);
         // Main scene: the highlight segments are on the line; the inset has them on the zero line.
-        let g = build_scene(&d, Mode::D2, Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 1.0]), [0.0; 3], (900, 600), &Theme::light());
-        assert_eq!(g.segments.iter().filter(|s| s.width == INTERVAL_W).count(), 2);
-        let p = panel_of(&d, Mode::D2, Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 1.0]), None);
-        assert_eq!(p.geometry.segments.iter().filter(|s| s.width == INTERVAL_W).count(), 2);
+        let g = build_scene(
+            &d,
+            Mode::D2,
+            Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 1.0]),
+            [0.0; 3],
+            (900, 600),
+            &Theme::light(),
+        );
+        assert_eq!(
+            g.segments.iter().filter(|s| s.width == INTERVAL_W).count(),
+            2
+        );
+        let p = panel_of(
+            &d,
+            Mode::D2,
+            Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 1.0]),
+            None,
+        );
+        assert_eq!(
+            p.geometry
+                .segments
+                .iter()
+                .filter(|s| s.width == INTERVAL_W)
+                .count(),
+            2
+        );
     }
 
     #[test]
     fn points_near_the_plane_show_with_a_span_proportional_tolerance() {
-        let d = doc_with(&["(1,2,1.05)", "(1,2,1.5)", "[(0,0,1),(1,1,3),(2,-1,0.97)]"], "z=1", Mode::D3);
+        let d = doc_with(
+            &["(1,2,1.05)", "(1,2,1.5)", "[(0,0,1),(1,1,3),(2,-1,0.97)]"],
+            "z=1",
+            Mode::D3,
+        );
         let (_, items, _) = geo_of(&d, Mode::D3);
         // Window span 6 -> tolerance 0.06.
-        assert_eq!(items[0].points, vec![[1.0, 2.0, 1.0]], "snapped onto the plane");
+        assert_eq!(
+            items[0].points,
+            vec![[1.0, 2.0, 1.0]],
+            "snapped onto the plane"
+        );
         assert!(items[1].points.is_empty());
         assert_eq!(items[2].points.len(), 2);
         let p = panel_of(&d, Mode::D3, win(), None);
         assert_eq!(p.points, 3);
-        let dots = p.geometry.overlay_segments.iter().filter(|s| s.p0 == s.p1).count();
+        let dots = p
+            .geometry
+            .overlay_segments
+            .iter()
+            .filter(|s| s.p0 == s.p1)
+            .count();
         assert_eq!(dots, 3 * 3, "three dots, three passes each");
         // Zooming the main window in tightens the tolerance: 0.05 off no longer counts.
         let tight = Window3::new([-0.5; 3], [0.5; 3]);
         let mut diags = Vec::new();
         let (its, defs, _, _) = prepare(&d, &mut diags);
-        let rs = ResolvedSlice::resolve(d.slice.as_ref().unwrap(), Mode::D3, &defs, Angle::Rad).unwrap();
+        let rs =
+            ResolvedSlice::resolve(d.slice.as_ref().unwrap(), Mode::D3, &defs, Angle::Rad).unwrap();
         let si = collect(&its, &defs, &Theme::light(), Angle::Rad, &rs, &tight);
         assert!(si[0].points.is_empty(), "|1.05 - 1| > 0.01 * 1");
         assert_eq!(si[2].points.len(), 1, "(0,0,1) is exactly on it");
@@ -1362,7 +1729,11 @@ mod tests {
 
     #[test]
     fn points_near_a_line_slice_and_in_2d() {
-        let d = doc_with(&["(1,1,0.5)", "(1,1.5,0.5)", "[(2,1.01,0.5),(3,1,0.5)]"], "y=1, z=0.5", Mode::D3);
+        let d = doc_with(
+            &["(1,1,0.5)", "(1,1.5,0.5)", "[(2,1.01,0.5),(3,1,0.5)]"],
+            "y=1, z=0.5",
+            Mode::D3,
+        );
         let (_, items, _) = geo_of(&d, Mode::D3);
         assert_eq!(items[0].points, vec![[1.0, 1.0, 0.5]]);
         assert!(items[1].points.is_empty());
@@ -1397,26 +1768,51 @@ mod tests {
         let auto = panel_of(&d, Mode::D3, win(), None);
         assert!(auto.follow);
         // Zoomed onto a small part of the ring: still on the circle, more detail per unit.
-        let req = ViewReq { free: vec![0, 1], view: [1.0, 1.5, 0.8, 1.2] };
+        let req = ViewReq {
+            free: vec![0, 1],
+            view: [1.0, 1.5, 0.8, 1.2],
+        };
         let p = panel_of(&d, Mode::D3, win(), Some(&req));
         assert!(!p.follow);
         assert_eq!(p.view[0], 1.0);
         assert_eq!(p.view[1], 1.5);
-        for s in p.geometry.segments.iter().filter(|s| s.width == INSET_CURVE_W) {
+        for s in p
+            .geometry
+            .segments
+            .iter()
+            .filter(|s| s.width == INSET_CURVE_W)
+        {
             let a = abs(&p, s.p0);
             assert!((a[0].hypot(a[1]) - 3f64.sqrt()).abs() < 1e-4);
-            assert!(a[0] > 0.9 && a[0] < 1.6, "only the visible part is sampled: {a:?}");
+            assert!(
+                a[0] > 0.9 && a[0] < 1.6,
+                "only the visible part is sampled: {a:?}"
+            );
         }
         // A request for other free axes is ignored (back to following).
-        let other = ViewReq { free: vec![0, 2], view: [1.0, 1.5, 0.8, 1.2] };
+        let other = ViewReq {
+            free: vec![0, 2],
+            view: [1.0, 1.5, 0.8, 1.2],
+        };
         assert!(panel_of(&d, Mode::D3, win(), Some(&other)).follow);
         // An invalid one too.
-        let bad = ViewReq { free: vec![0, 1], view: [1.0, 1.0, 0.0, 1.0] };
+        let bad = ViewReq {
+            free: vec![0, 1],
+            view: [1.0, 1.0, 0.0, 1.0],
+        };
         assert!(panel_of(&d, Mode::D3, win(), Some(&bad)).follow);
         // 1D slice: the vertical range is the view's.
         let d1 = doc_with(&["y=x^2"], "y=1", Mode::D2);
-        let req = ViewReq { free: vec![0], view: [-1.0, 1.0, -5.0, 5.0] };
-        let p = panel_of(&d1, Mode::D2, Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 1.0]), Some(&req));
+        let req = ViewReq {
+            free: vec![0],
+            view: [-1.0, 1.0, -5.0, 5.0],
+        };
+        let p = panel_of(
+            &d1,
+            Mode::D2,
+            Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 1.0]),
+            Some(&req),
+        );
         assert_eq!(p.view, [-1.0, 1.0, -5.0, 5.0]);
     }
 }

@@ -5,7 +5,10 @@
 
 use crate::geometry::{ItemInfo, SceneGeometry, Theme};
 use crate::render::{crossfade, layer_lift, Inset, Layer};
-use crate::scene::{build_scene, build_scene_preview, build_slice_panel_view, label_box_inside, point_handles, CoordSrc, PointHandle, SlicePanel, ViewReq};
+use crate::scene::{
+    build_scene, build_scene_preview, build_slice_panel_view, label_box_inside, point_handles,
+    CoordSrc, PointHandle, SlicePanel, ViewReq,
+};
 use math_core::actions;
 use math_core::doc::{self, AngleMode, Doc, Item, ItemKind, SliderCfg, TickerCfg};
 use math_core::table::{Column, Table, TableStyle};
@@ -37,29 +40,112 @@ where
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "t", rename_all = "camelCase")]
 pub enum Command {
-    SetExpr { id: String, latex: String },
-    AddItem { id: String, kind: ItemKind, latex: String },
-    RemoveItem { id: String },
-    MoveItem { id: String, to: usize },
-    SetHidden { id: String, hidden: bool },
-    SetColor { id: String, color: Option<String> },
+    SetExpr {
+        id: String,
+        latex: String,
+    },
+    AddItem {
+        id: String,
+        kind: ItemKind,
+        latex: String,
+    },
+    RemoveItem {
+        id: String,
+    },
+    MoveItem {
+        id: String,
+        to: usize,
+    },
+    SetHidden {
+        id: String,
+        hidden: bool,
+    },
+    SetColor {
+        id: String,
+        color: Option<String>,
+    },
     /// Regression items: draw (or stop drawing) a tick from each data point to the fitted curve.
-    SetRegressionResiduals { id: String, on: bool },
-    SetSlider { name: String, value: f64, min: Option<f64>, max: Option<f64>, step: Option<f64> },
-    RemoveSlider { name: String },
-    SetMode { mode: String },
-    SetOrtho { ortho: bool },
+    SetRegressionResiduals {
+        id: String,
+        on: bool,
+    },
+    /// Merges `style` (an object of `ItemStyle` keys in camelCase) into item `id`'s style; a key
+    /// set to `null` goes back to its default. Validated as a whole: on any problem nothing
+    /// changes and an `error` event is sent.
+    SetStyle {
+        id: String,
+        style: serde_json::Map<String, serde_json::Value>,
+    },
+    /// Files item `id` in folder item `folder` (`null` or absent: top level).
+    SetFolder {
+        id: String,
+        #[serde(default)]
+        folder: Option<String>,
+    },
+    /// View settings; every field optional. `window` replaces the window like loading a
+    /// document with it (the camera is reset to frame it) without touching anything else.
+    SetView {
+        #[serde(default)]
+        grid: Option<bool>,
+        #[serde(default)]
+        axes: Option<bool>,
+        #[serde(default, rename = "axisNumbers", alias = "axis_numbers")]
+        axis_numbers: Option<bool>,
+        #[serde(default)]
+        window: Option<doc::WindowBox>,
+    },
+    SetSlider {
+        name: String,
+        value: f64,
+        min: Option<f64>,
+        max: Option<f64>,
+        step: Option<f64>,
+    },
+    RemoveSlider {
+        name: String,
+    },
+    SetMode {
+        mode: String,
+    },
+    SetOrtho {
+        ortho: bool,
+    },
     /// Reduced motion (the user's `prefers-reduced-motion`): mode switches and the ortho toggle
     /// jump straight to the end instead of animating.
-    SetReducedMotion { on: bool },
-    SetTheme { dark: bool },
-    SetAngle { angle: String },
-    Resize { width: u32, height: u32 },
-    Pointer { phase: String, x: f64, y: f64, #[serde(default)] button: i32, #[serde(default)] shift: bool },
-    Wheel { x: f64, y: f64, dy: f64 },
+    SetReducedMotion {
+        on: bool,
+    },
+    SetTheme {
+        dark: bool,
+    },
+    SetAngle {
+        angle: String,
+    },
+    Resize {
+        width: u32,
+        height: u32,
+    },
+    Pointer {
+        phase: String,
+        x: f64,
+        y: f64,
+        #[serde(default)]
+        button: i32,
+        #[serde(default)]
+        shift: bool,
+    },
+    Wheel {
+        x: f64,
+        y: f64,
+        dy: f64,
+    },
     Reset,
-    LoadDoc { json: String },
-    LoadHash { hash: String },
+    LoadDoc {
+        json: String,
+    },
+    LoadHash {
+        hash: String,
+    },
     /// Ask for the current document / share hash.
     Export,
     /// New data table. `columns` are header names (default `x_1`, `y_1`); `data` is row-major
@@ -74,17 +160,43 @@ pub enum Command {
         rows: Option<usize>,
     },
     /// Sets one cell (`value` is a string or number); a row past the end grows the table.
-    SetCell { id: String, row: usize, col: usize, value: serde_json::Value },
-    AddRow { id: String, at: Option<usize> },
-    RemoveRow { id: String, row: usize },
+    SetCell {
+        id: String,
+        row: usize,
+        col: usize,
+        value: serde_json::Value,
+    },
+    AddRow {
+        id: String,
+        at: Option<usize>,
+    },
+    RemoveRow {
+        id: String,
+        row: usize,
+    },
     /// Appends a column; `name` defaults to the next free `x_n`/`y_n`-style header.
-    AddColumn { id: String, name: Option<String> },
-    RemoveColumn { id: String, col: usize },
-    RenameColumn { id: String, col: usize, name: String },
+    AddColumn {
+        id: String,
+        name: Option<String>,
+    },
+    RemoveColumn {
+        id: String,
+        col: usize,
+    },
+    RenameColumn {
+        id: String,
+        col: usize,
+        name: String,
+    },
     /// `style` is `points`, `line` or `hidden`.
-    SetTableStyle { id: String, style: String },
+    SetTableStyle {
+        id: String,
+        style: String,
+    },
     /// Evaluates action item `id` once (`a -> a+1, b -> 2b`) and applies the result.
-    RunAction { id: String },
+    RunAction {
+        id: String,
+    },
     /// Configures the ticker. Every field is optional; `action: null` clears the action (and
     /// stops), a missing `action` leaves it alone. `rate_ms` is the interval (default 50, never
     /// faster than `min_step_ms`, default 10). `running` starts or stops it.
@@ -173,27 +285,60 @@ pub struct ScreenLabel {
 #[serde(tag = "t", rename_all = "camelCase")]
 pub enum Event {
     /// Per-item problems, shown inline in the expression list (never logged per frame).
-    Diagnostics { items: Vec<DiagItem> },
+    Diagnostics {
+        items: Vec<DiagItem>,
+    },
     /// Per-item read-outs (symbolic derivative, scalar value, regression fit), the full current
     /// list, sent whenever it changes (an empty list clears them). See `ItemInfo`.
-    Info { items: Vec<ItemInfo> },
+    Info {
+        items: Vec<ItemInfo>,
+    },
     /// Resolved colour of every drawn item (`#rrggbb`), so list badges match the canvas. Sent
     /// only when it changes.
-    Colors { items: Vec<ItemColor> },
-    /// Current mode and window, so a UI can show/edit them.
-    View { mode: String, min: [f64; 3], max: [f64; 3] },
+    Colors {
+        items: Vec<ItemColor>,
+    },
+    /// Current mode and window, so a UI can show/edit them, and the view flags.
+    View {
+        mode: String,
+        min: [f64; 3],
+        max: [f64; 3],
+        grid: bool,
+        axes: bool,
+        #[serde(rename = "axisNumbers")]
+        axis_numbers: bool,
+    },
     /// Tick labels for the current scene in world coordinates, for a text overlay to project.
-    Labels { labels: Vec<LabelOut> },
-    Doc { json: String },
-    Hash { hash: String },
+    Labels {
+        labels: Vec<LabelOut>,
+    },
+    Doc {
+        json: String,
+    },
+    Hash {
+        hash: String,
+    },
     /// Full state of a table, sent after every table change and for each table on load.
-    Table { id: String, columns: Vec<Column>, rows: usize, style: String },
+    Table {
+        id: String,
+        columns: Vec<Column>,
+        rows: usize,
+        style: String,
+    },
     /// A drag rewrote an item's text (a point `(a, b)` or a definition `a=3`): the shell should
     /// put `latex` into that item's input.
-    ItemEdited { id: String, latex: String },
+    ItemEdited {
+        id: String,
+        latex: String,
+    },
     /// A drag moved a slider.
-    SliderValue { name: String, value: f64 },
-    Theme { dark: bool },
+    SliderValue {
+        name: String,
+        value: f64,
+    },
+    Theme {
+        dark: bool,
+    },
     /// State of the slice, sent whenever it changes (also while a slider sweeps it). `active` is
     /// false when there is no slice or it does not fit the current mode (`error` says why).
     /// `fixed` holds the resolved constants, `free` the axes of the slice, `rect` the inset
@@ -215,8 +360,13 @@ pub enum Event {
         follow: bool,
     },
     /// The ticker started, stopped (also automatically, e.g. after an error) or was reconfigured.
-    TickerState { running: bool, action: Option<String> },
-    Error { message: String },
+    TickerState {
+        running: bool,
+        action: Option<String>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 struct Built {
@@ -245,7 +395,11 @@ const GRAB_PX: f64 = 14.0;
 /// Formats `v` with `decimals` places, trailing zeros trimmed.
 fn fmt_coord(v: f64, decimals: usize) -> String {
     let s = format!("{:.*}", decimals, v);
-    let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s };
+    let s = if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
+    };
     if s == "-0" {
         "0".into()
     } else {
@@ -408,7 +562,9 @@ impl App {
     pub fn dispatch(&mut self, json: &str) -> String {
         match serde_json::from_str::<Command>(json) {
             Ok(cmd) => self.run(cmd),
-            Err(e) => self.outbox.push(Event::Error { message: format!("bad command: {e}") }),
+            Err(e) => self.outbox.push(Event::Error {
+                message: format!("bad command: {e}"),
+            }),
         }
         let events = self.take_events();
         serde_json::to_string(&events).unwrap_or_else(|_| "[]".into())
@@ -416,13 +572,19 @@ impl App {
 
     /// Inset rectangle `[x, y, w, h]` if a slice inset is showing.
     fn inset_rect(&self) -> Option<[u32; 4]> {
-        self.panel.as_ref().filter(|_| !self.rig.is_animating()).map(|p| p.rect)
+        self.panel
+            .as_ref()
+            .filter(|_| !self.rig.is_animating())
+            .map(|p| p.rect)
     }
 
     /// The inset's current view with its free axes: the explicit request, else what is shown.
     fn current_inset_view(&self) -> Option<ViewReq> {
         let p = self.panel.as_ref()?;
-        Some(self.slice_view.clone().unwrap_or(ViewReq { free: p.free.clone(), view: p.view }))
+        Some(self.slice_view.clone().unwrap_or(ViewReq {
+            free: p.free.clone(),
+            view: p.view,
+        }))
     }
 
     /// Stores an explicit inset view and schedules the (throttled) re-sample.
@@ -440,7 +602,10 @@ impl App {
 
     fn in_inset(&self, x: f64, y: f64) -> bool {
         self.inset_rect().is_some_and(|r| {
-            x >= r[0] as f64 && x <= (r[0] + r[2]) as f64 && y >= r[1] as f64 && y <= (r[1] + r[3]) as f64
+            x >= r[0] as f64
+                && x <= (r[0] + r[2]) as f64
+                && y >= r[1] as f64
+                && y <= (r[1] + r[3]) as f64
         })
     }
 
@@ -465,7 +630,9 @@ impl App {
                     None => {
                         let item = Item::new(&id, ItemKind::Equation, &latex);
                         if let Err(e) = self.doc.add_item(item) {
-                            self.outbox.push(Event::Error { message: e.to_string() });
+                            self.outbox.push(Event::Error {
+                                message: e.to_string(),
+                            });
                             return;
                         }
                     }
@@ -478,7 +645,9 @@ impl App {
                     item.table = Some(Table::new(&[], 3));
                 }
                 if let Err(e) = self.doc.add_item(item) {
-                    self.outbox.push(Event::Error { message: e.to_string() });
+                    self.outbox.push(Event::Error {
+                        message: e.to_string(),
+                    });
                     return;
                 }
                 self.mark_doc_changed();
@@ -486,10 +655,17 @@ impl App {
             }
             Command::RemoveItem { id } => {
                 if let Err(e) = self.doc.remove_item(&id) {
-                    self.outbox.push(Event::Error { message: e.to_string() });
+                    self.outbox.push(Event::Error {
+                        message: e.to_string(),
+                    });
                     return;
                 }
-                if self.doc.ticker.as_ref().is_some_and(|t| t.action.as_deref() == Some(id.as_str())) {
+                if self
+                    .doc
+                    .ticker
+                    .as_ref()
+                    .is_some_and(|t| t.action.as_deref() == Some(id.as_str()))
+                {
                     self.configure_ticker(|t| t.action = None);
                     self.ticker_running = false;
                     self.emit_ticker_state();
@@ -498,7 +674,9 @@ impl App {
             }
             Command::MoveItem { id, to } => {
                 if let Err(e) = self.doc.move_item(&id, to) {
-                    self.outbox.push(Event::Error { message: e.to_string() });
+                    self.outbox.push(Event::Error {
+                        message: e.to_string(),
+                    });
                     return;
                 }
                 self.mark_doc_changed();
@@ -514,8 +692,46 @@ impl App {
                     i.style.residuals = on;
                     self.mark_doc_changed();
                 } else {
-                    self.outbox.push(Event::Error { message: format!("no item with id '{id}'") });
+                    self.outbox.push(Event::Error {
+                        message: format!("no item with id '{id}'"),
+                    });
                 }
+            }
+            Command::SetStyle { id, style } => match self.merge_style(&id, style) {
+                Ok(()) => self.mark_doc_changed(),
+                Err(message) => self.outbox.push(Event::Error { message }),
+            },
+            Command::SetFolder { id, folder } => match self.set_folder(&id, folder) {
+                Ok(()) => self.mark_doc_changed(),
+                Err(message) => self.outbox.push(Event::Error { message }),
+            },
+            Command::SetView {
+                grid,
+                axes,
+                axis_numbers,
+                window,
+            } => {
+                if let Some(w) = &window {
+                    if let Err(m) = w.validate() {
+                        self.outbox.push(Event::Error {
+                            message: format!("setView: {m}"),
+                        });
+                        return;
+                    }
+                }
+                let v = &mut self.doc.view;
+                v.grid = grid.unwrap_or(v.grid);
+                v.axes = axes.unwrap_or(v.axes);
+                v.axis_numbers = axis_numbers.unwrap_or(v.axis_numbers);
+                if let Some(w) = window {
+                    // As `load` does: a fresh rig framing the window in the current mode.
+                    self.rig = Rig::new(Window3::new(w.min, w.max), self.rig.mode());
+                    self.rig
+                        .set_aspect(self.size.0 as f64 / self.size.1.max(1) as f64);
+                    self.prev = None;
+                    self.doc.view.window = w;
+                }
+                self.mark_doc_changed();
             }
             Command::SetColor { id, color } => {
                 if let Some(i) = self.doc.items.iter_mut().find(|i| i.id == id) {
@@ -523,7 +739,13 @@ impl App {
                     self.mark_doc_changed();
                 }
             }
-            Command::SetSlider { name, value, min, max, step } => {
+            Command::SetSlider {
+                name,
+                value,
+                min,
+                max,
+                step,
+            } => {
                 let cfg = self.doc.sliders.entry(name).or_insert(SliderCfg {
                     min: -10.0,
                     max: 10.0,
@@ -549,7 +771,9 @@ impl App {
             }
             Command::SetMode { mode } => match parse_mode(&mode) {
                 Some(m) => self.set_mode(m),
-                None => self.outbox.push(Event::Error { message: format!("unknown mode '{mode}'") }),
+                None => self.outbox.push(Event::Error {
+                    message: format!("unknown mode '{mode}'"),
+                }),
             },
             Command::SetOrtho { ortho } => {
                 self.rig.reduced_motion = self.reduced_motion;
@@ -566,7 +790,11 @@ impl App {
                 self.mark_doc_changed();
             }
             Command::SetAngle { angle } => {
-                self.doc.view.angle = if angle == "deg" { AngleMode::Deg } else { AngleMode::Rad };
+                self.doc.view.angle = if angle == "deg" {
+                    AngleMode::Deg
+                } else {
+                    AngleMode::Rad
+                };
                 self.mark_doc_changed();
             }
             Command::Resize { width, height } => {
@@ -576,15 +804,30 @@ impl App {
                 self.touch_input();
                 self.rebuild();
             }
-            Command::Pointer { phase, x, y, button, shift } => {
-                self.pointer(&phase, x, y, button.clamp(0, 255) as u8, shift, vp)
-            }
+            Command::Pointer {
+                phase,
+                x,
+                y,
+                button,
+                shift,
+            } => self.pointer(&phase, x, y, button.clamp(0, 255) as u8, shift, vp),
             Command::Wheel { x, y, dy } if self.in_inset(x, y) => {
                 if let (Some(r), Some(base)) = (self.inset_rect(), self.current_inset_view()) {
                     let factor = (-dy * 0.0015).exp();
-                    let (fx, fy) = ((x - r[0] as f64) / r[2] as f64, 1.0 - (y - r[1] as f64) / r[3] as f64);
-                    let v = math_core::slice::zoom_view(base.view, fx.clamp(0.0, 1.0), fy.clamp(0.0, 1.0), factor);
-                    self.set_inset_view(ViewReq { free: base.free, view: v });
+                    let (fx, fy) = (
+                        (x - r[0] as f64) / r[2] as f64,
+                        1.0 - (y - r[1] as f64) / r[3] as f64,
+                    );
+                    let v = math_core::slice::zoom_view(
+                        base.view,
+                        fx.clamp(0.0, 1.0),
+                        fy.clamp(0.0, 1.0),
+                        factor,
+                    );
+                    self.set_inset_view(ViewReq {
+                        free: base.free,
+                        view: v,
+                    });
                     self.touch_input();
                 }
             }
@@ -643,17 +886,32 @@ impl App {
             }
             Command::LoadDoc { json } => match doc::from_json(&json) {
                 Ok(d) => self.load(d),
-                Err(e) => self.outbox.push(Event::Error { message: e.to_string() }),
+                Err(e) => self.outbox.push(Event::Error {
+                    message: e.to_string(),
+                }),
             },
             Command::LoadHash { hash } => match doc::decode_hash(&hash) {
                 Ok(d) => self.load(d),
-                Err(e) => self.outbox.push(Event::Error { message: e.to_string() }),
+                Err(e) => self.outbox.push(Event::Error {
+                    message: e.to_string(),
+                }),
             },
-            Command::AddTable { id, columns, data, rows } => {
-                let mut t = Table::new(&columns, rows.unwrap_or(if data.is_empty() { 3 } else { 0 }).min(math_core::table::MAX_ROWS));
+            Command::AddTable {
+                id,
+                columns,
+                data,
+                rows,
+            } => {
+                let mut t = Table::new(
+                    &columns,
+                    rows.unwrap_or(if data.is_empty() { 3 } else { 0 })
+                        .min(math_core::table::MAX_ROWS),
+                );
                 for n in &columns {
                     if !math_core::table::valid_column_name(n) {
-                        self.outbox.push(Event::Error { message: format!("'{n}' is not a valid column name") });
+                        self.outbox.push(Event::Error {
+                            message: format!("'{n}' is not a valid column name"),
+                        });
                         return;
                     }
                 }
@@ -668,35 +926,52 @@ impl App {
                 let mut item = Item::new(&id, ItemKind::Table, "");
                 item.table = Some(t);
                 if let Err(e) = self.doc.add_item(item) {
-                    self.outbox.push(Event::Error { message: e.to_string() });
+                    self.outbox.push(Event::Error {
+                        message: e.to_string(),
+                    });
                     return;
                 }
                 self.mark_doc_changed();
                 self.emit_table(&id);
             }
-            Command::SetCell { id, row, col, value } => {
+            Command::SetCell {
+                id,
+                row,
+                col,
+                value,
+            } => {
                 let v = cell_text(&value);
                 self.edit_table(&id, |t| t.set_cell(row, col, &v));
             }
             Command::AddRow { id, at } => self.edit_table(&id, |t| t.add_row(at)),
             Command::RemoveRow { id, row } => self.edit_table(&id, |t| t.remove_row(row)),
-            Command::AddColumn { id, name } => self.edit_table(&id, |t| t.add_column(name.as_deref())),
+            Command::AddColumn { id, name } => {
+                self.edit_table(&id, |t| t.add_column(name.as_deref()))
+            }
             Command::RemoveColumn { id, col } => self.edit_table(&id, |t| t.remove_column(col)),
-            Command::RenameColumn { id, col, name } => self.edit_table(&id, |t| t.rename_column(col, &name)),
+            Command::RenameColumn { id, col, name } => {
+                self.edit_table(&id, |t| t.rename_column(col, &name))
+            }
             Command::SetTableStyle { id, style } => match TableStyle::parse(&style) {
                 Some(st) => self.edit_table(&id, |t| {
                     t.style = st;
                     Ok(())
                 }),
-                None => self.outbox.push(Event::Error { message: format!("unknown table style '{style}'") }),
+                None => self.outbox.push(Event::Error {
+                    message: format!("unknown table style '{style}'"),
+                }),
             },
             Command::RunAction { id } => match self.step_action(&id) {
                 Ok(()) => self.mark_doc_changed(),
                 Err(message) => self.outbox.push(Event::Error { message }),
             },
-            Command::SetTicker { action, rate_ms, min_step_ms, pause_on_error, running } => {
-                self.set_ticker(action, rate_ms, min_step_ms, pause_on_error, running)
-            }
+            Command::SetTicker {
+                action,
+                rate_ms,
+                min_step_ms,
+                pause_on_error,
+                running,
+            } => self.set_ticker(action, rate_ms, min_step_ms, pause_on_error, running),
             Command::TickerStep => match self.ticker_action_id() {
                 Ok(id) => match self.step_action(&id) {
                     Ok(()) => self.mark_doc_changed(),
@@ -712,10 +987,101 @@ impl App {
             }
             Command::Export => {
                 self.sync_view_into_doc();
-                self.outbox.push(Event::Doc { json: doc::to_json(&self.doc) });
-                self.outbox.push(Event::Hash { hash: doc::encode_hash(&self.doc) });
+                self.outbox.push(Event::Doc {
+                    json: doc::to_json(&self.doc),
+                });
+                self.outbox.push(Event::Hash {
+                    hash: doc::encode_hash(&self.doc),
+                });
             }
         }
+    }
+
+    /// `setStyle`: the item's style with `patch` merged in (`null` resets a key), validated.
+    fn merge_style(
+        &mut self,
+        id: &str,
+        patch: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        const KEYS: [&str; 9] = [
+            "lineWidth",
+            "lineStyle",
+            "pointStyle",
+            "opacity",
+            "label",
+            "residuals",
+            "pointSize",
+            "fillOpacity",
+            "showLabel",
+        ];
+        let Some(item) = self.doc.items.iter_mut().find(|i| i.id == id) else {
+            return Err(format!("no item with id '{id}'"));
+        };
+        if let Some(k) = patch.keys().find(|k| !KEYS.contains(&k.as_str())) {
+            return Err(format!(
+                "setStyle: unknown style key '{k}' (expected one of {})",
+                KEYS.join(", ")
+            ));
+        }
+        let mut merged = match serde_json::to_value(&item.style) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        for (k, v) in &patch {
+            if v.is_null() {
+                merged.remove(k);
+            } else {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+        let style: doc::ItemStyle = serde_json::from_value(serde_json::Value::Object(merged))
+            .map_err(|e| format!("setStyle: {e}"))?;
+        style.validate().map_err(|m| format!("setStyle: {m}"))?;
+        if let Some(w) = patch.get("lineWidth").and(style.line_width) {
+            if !(0.25..=20.0).contains(&w) {
+                return Err("setStyle: lineWidth must be in [0.25,20]".into());
+            }
+        }
+        if style
+            .label
+            .as_ref()
+            .is_some_and(|l| l.chars().count() > doc::MAX_LATEX_CHARS)
+        {
+            return Err(format!(
+                "setStyle: label longer than {} chars",
+                doc::MAX_LATEX_CHARS
+            ));
+        }
+        item.style = style;
+        Ok(())
+    }
+
+    /// `setFolder`: files `id` in an existing folder item (not itself, not another folder), or
+    /// un-files it with `None`.
+    fn set_folder(&mut self, id: &str, folder: Option<String>) -> Result<(), String> {
+        let Some(kind) = self.doc.items.iter().find(|i| i.id == id).map(|i| i.kind) else {
+            return Err(format!("no item with id '{id}'"));
+        };
+        if let Some(f) = &folder {
+            if f == id {
+                return Err("setFolder: an item cannot be in itself".into());
+            }
+            if !self
+                .doc
+                .items
+                .iter()
+                .any(|i| i.id == *f && i.kind == ItemKind::Folder)
+            {
+                return Err(format!("setFolder: '{f}' is not a folder item"));
+            }
+            if kind == ItemKind::Folder {
+                return Err("setFolder: folders cannot be nested".into());
+            }
+        }
+        if let Some(i) = self.doc.items.iter_mut().find(|i| i.id == id) {
+            i.folder = folder;
+        }
+        Ok(())
     }
 
     fn load(&mut self, d: Doc) {
@@ -728,8 +1094,13 @@ impl App {
         self.ticker_err = None;
         self.mark_doc_changed();
         self.emit_ticker_state();
-        let ids: Vec<String> =
-            self.doc.items.iter().filter(|i| i.table.is_some()).map(|i| i.id.clone()).collect();
+        let ids: Vec<String> = self
+            .doc
+            .items
+            .iter()
+            .filter(|i| i.table.is_some())
+            .map(|i| i.id.clone())
+            .collect();
         for id in ids {
             self.emit_table(&id);
         }
@@ -737,7 +1108,10 @@ impl App {
 
     fn emit_ticker_state(&mut self) {
         let action = self.doc.ticker.as_ref().and_then(|t| t.action.clone());
-        self.outbox.push(Event::TickerState { running: self.ticker_running, action });
+        self.outbox.push(Event::TickerState {
+            running: self.ticker_running,
+            action,
+        });
     }
 
     /// Edits the ticker config in place, dropping it from the document when it is all defaults.
@@ -767,7 +1141,9 @@ impl App {
         for (name, v) in [("rate_ms", rate_ms), ("min_step_ms", min_step_ms)] {
             if let Some(v) = v {
                 if !v.is_finite() || v < 0.0 || (name == "rate_ms" && v == 0.0) {
-                    self.outbox.push(Event::Error { message: format!("ticker {name} must be a positive number") });
+                    self.outbox.push(Event::Error {
+                        message: format!("ticker {name} must be a positive number"),
+                    });
                     return;
                 }
             }
@@ -776,7 +1152,8 @@ impl App {
             if let Err(message) = actions::parse_item(&self.doc, id) {
                 // A malformed action text still reports precisely why on first run; only an
                 // unknown or non-action item is refused here.
-                if !self.doc.items.iter().any(|i| i.id == *id) || message.contains("not an action") {
+                if !self.doc.items.iter().any(|i| i.id == *id) || message.contains("not an action")
+                {
                     self.outbox.push(Event::Error { message });
                     return;
                 }
@@ -799,7 +1176,9 @@ impl App {
         let mut want = running.unwrap_or(self.ticker_running);
         if self.ticker_action_id().is_err() {
             if want && running == Some(true) {
-                self.outbox.push(Event::Error { message: "the ticker has no action to run".into() });
+                self.outbox.push(Event::Error {
+                    message: "the ticker has no action to run".into(),
+                });
             }
             want = false;
         }
@@ -825,7 +1204,10 @@ impl App {
                     if let Some(cfg) = self.doc.sliders.get_mut(&c.name) {
                         if cfg.value != c.value {
                             cfg.value = c.value;
-                            self.outbox.push(Event::SliderValue { name: c.name, value: c.value });
+                            self.outbox.push(Event::SliderValue {
+                                name: c.name,
+                                value: c.value,
+                            });
                         }
                     }
                 }
@@ -874,7 +1256,9 @@ impl App {
                 }
                 Err(message) => {
                     if self.ticker_err.as_deref() != Some(message.as_str()) {
-                        self.outbox.push(Event::Error { message: format!("ticker: {message}") });
+                        self.outbox.push(Event::Error {
+                            message: format!("ticker: {message}"),
+                        });
                         self.ticker_err = Some(message);
                     }
                     if cfg.pause_on_error {
@@ -894,8 +1278,16 @@ impl App {
     /// Applies `f` to the table of item `id`, then rebuilds and reports the new table state.
     /// Errors (unknown id, bad name, limits) become an `error` event and change nothing.
     fn edit_table(&mut self, id: &str, f: impl FnOnce(&mut Table) -> Result<(), String>) {
-        let Some(t) = self.doc.items.iter_mut().find(|i| i.id == id).and_then(|i| i.table.as_mut()) else {
-            self.outbox.push(Event::Error { message: format!("no table with id '{id}'") });
+        let Some(t) = self
+            .doc
+            .items
+            .iter_mut()
+            .find(|i| i.id == id)
+            .and_then(|i| i.table.as_mut())
+        else {
+            self.outbox.push(Event::Error {
+                message: format!("no table with id '{id}'"),
+            });
             return;
         };
         let mut edited = t.clone();
@@ -911,7 +1303,13 @@ impl App {
     }
 
     fn emit_table(&mut self, id: &str) {
-        if let Some(t) = self.doc.items.iter().find(|i| i.id == id).and_then(|i| i.table.as_ref()) {
+        if let Some(t) = self
+            .doc
+            .items
+            .iter()
+            .find(|i| i.id == id)
+            .and_then(|i| i.table.as_ref())
+        {
             self.outbox.push(Event::Table {
                 id: id.to_string(),
                 columns: t.columns.clone(),
@@ -944,7 +1342,10 @@ impl App {
                         }
                         if cfg.value != v {
                             cfg.value = v;
-                            self.outbox.push(Event::SliderValue { name: name.clone(), value: v });
+                            self.outbox.push(Event::SliderValue {
+                                name: name.clone(),
+                                value: v,
+                            });
                         }
                     }
                 }
@@ -953,7 +1354,10 @@ impl App {
                     if let Some(it) = self.doc.items.iter_mut().find(|i| i.id == *item) {
                         if it.latex != latex {
                             it.latex = latex.clone();
-                            self.outbox.push(Event::ItemEdited { id: item.clone(), latex });
+                            self.outbox.push(Event::ItemEdited {
+                                id: item.clone(),
+                                latex,
+                            });
                         }
                     }
                 }
@@ -965,7 +1369,10 @@ impl App {
             if let Some(it) = self.doc.items.iter_mut().find(|i| i.id == h.id) {
                 if it.latex != latex {
                     it.latex = latex.clone();
-                    self.outbox.push(Event::ItemEdited { id: h.id.clone(), latex });
+                    self.outbox.push(Event::ItemEdited {
+                        id: h.id.clone(),
+                        latex,
+                    });
                 }
             }
         }
@@ -986,7 +1393,10 @@ impl App {
                 (d <= GRAB_PX).then_some((d, h))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, h)| PointGrab { offset: [h.pos[0] - here[0], h.pos[1] - here[1]], handle: h })
+            .map(|(_, h)| PointGrab {
+                offset: [h.pos[0] - here[0], h.pos[1] - here[1]],
+                handle: h,
+            })
     }
 
     fn sync_view_into_doc(&mut self) {
@@ -1020,9 +1430,9 @@ impl App {
             // The slice inset is a read-only panel: a press on it does not orbit/pan the scene.
             "down" if self.in_inset(x, y) => {
                 self.drag = None;
-                let double = self
-                    .last_inset_press
-                    .is_some_and(|(t, px, py)| self.now_ms - t <= DOUBLE_CLICK_MS && (x - px).hypot(y - py) <= DOUBLE_CLICK_PX);
+                let double = self.last_inset_press.is_some_and(|(t, px, py)| {
+                    self.now_ms - t <= DOUBLE_CLICK_MS && (x - px).hypot(y - py) <= DOUBLE_CLICK_PX
+                });
                 if double {
                     self.last_inset_press = None;
                     self.inset_drag = None;
@@ -1037,18 +1447,36 @@ impl App {
                 self.reset_inset_view();
             }
             "move" if self.inset_drag.is_some() => {
-                let Some((lx, ly)) = self.inset_drag else { return };
+                let Some((lx, ly)) = self.inset_drag else {
+                    return;
+                };
                 self.inset_drag = Some((x, y));
                 if let (Some(r), Some(base)) = (self.inset_rect(), self.current_inset_view()) {
-                    let v = math_core::slice::pan_view(base.view, (x - lx) / r[2] as f64, -(y - ly) / r[3] as f64);
-                    self.set_inset_view(ViewReq { free: base.free, view: v });
+                    let v = math_core::slice::pan_view(
+                        base.view,
+                        (x - lx) / r[2] as f64,
+                        -(y - ly) / r[3] as f64,
+                    );
+                    self.set_inset_view(ViewReq {
+                        free: base.free,
+                        view: v,
+                    });
                     self.touch_input();
                 }
             }
             "down" => {
                 self.inset_drag = None;
-                let point = if button == 0 && !shift { self.grab_point(x, y, vp) } else { None };
-                self.drag = Some(Drag { button, shift, last: (x, y), point });
+                let point = if button == 0 && !shift {
+                    self.grab_point(x, y, vp)
+                } else {
+                    None
+                };
+                self.drag = Some(Drag {
+                    button,
+                    shift,
+                    last: (x, y),
+                    point,
+                });
             }
             "up" | "cancel" => {
                 self.drag = None;
@@ -1060,7 +1488,10 @@ impl App {
                 d.last = (x, y);
                 if let Some(g) = &d.point {
                     let here = self.rig.pixel_to_world((x, y), vp);
-                    let (handle, to) = (g.handle.clone(), [here[0] + g.offset[0], here[1] + g.offset[1]]);
+                    let (handle, to) = (
+                        g.handle.clone(),
+                        [here[0] + g.offset[0], here[1] + g.offset[1]],
+                    );
                     self.drag_point(&handle, to);
                     self.touch_input();
                     return;
@@ -1144,7 +1575,8 @@ impl App {
         let origin = self.rig.render_origin();
         let window = self.scene_window();
         let geometry = if preview {
-            let (g, coarse) = build_scene_preview(&self.doc, mode, window, origin, self.size, &self.theme);
+            let (g, coarse) =
+                build_scene_preview(&self.doc, mode, window, origin, self.size, &self.theme);
             self.refine = coarse;
             g
         } else {
@@ -1158,13 +1590,23 @@ impl App {
         let diags: Vec<DiagItem> = geometry
             .diagnostics
             .iter()
-            .map(|(id, m)| DiagItem { id: id.clone(), message: m.clone() })
+            .map(|(id, m)| DiagItem {
+                id: id.clone(),
+                message: m.clone(),
+            })
             .collect();
         let mut diags = diags;
-        for it in self.doc.items.iter().filter(|i| (i.kind == ItemKind::Action || actions::looks_like_action(&i.latex)) && !i.latex.trim().is_empty()) {
-            let res = actions::parse_item(&self.doc, &it.id).and_then(|a| actions::plan(&self.doc, &a));
+        for it in self.doc.items.iter().filter(|i| {
+            (i.kind == ItemKind::Action || actions::looks_like_action(&i.latex))
+                && !i.latex.trim().is_empty()
+        }) {
+            let res =
+                actions::parse_item(&self.doc, &it.id).and_then(|a| actions::plan(&self.doc, &a));
             if let (Err(message), false) = (res, it.hidden) {
-                diags.push(DiagItem { id: it.id.clone(), message });
+                diags.push(DiagItem {
+                    id: it.id.clone(),
+                    message,
+                });
             }
         }
         if diags != self.diagnostics {
@@ -1176,7 +1618,10 @@ impl App {
             .iter()
             .map(|(id, c)| {
                 let h = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-                ItemColor { id: id.clone(), color: format!("#{:02x}{:02x}{:02x}", h(c[0]), h(c[1]), h(c[2])) }
+                ItemColor {
+                    id: id.clone(),
+                    color: format!("#{:02x}{:02x}{:02x}", h(c[0]), h(c[1]), h(c[2])),
+                }
             })
             .collect();
         if colors != self.colors {
@@ -1185,19 +1630,36 @@ impl App {
         }
         if geometry.infos != self.infos {
             self.infos = geometry.infos.clone();
-            self.outbox.push(Event::Info { items: geometry.infos.clone() });
+            self.outbox.push(Event::Info {
+                items: geometry.infos.clone(),
+            });
         }
         let w = self.rig.window();
-        self.outbox.push(Event::View { mode: mode_name(mode).into(), min: w.min, max: w.max });
+        self.outbox.push(Event::View {
+            mode: mode_name(mode).into(),
+            min: w.min,
+            max: w.max,
+            grid: self.doc.view.grid,
+            axes: self.doc.view.axes,
+            axis_numbers: self.doc.view.axis_numbers,
+        });
         self.outbox.push(Event::Labels {
             labels: geometry
                 .labels
                 .iter()
-                .map(|l| LabelOut { pos: l.pos, text: l.text.clone(), axis: l.axis })
+                .map(|l| LabelOut {
+                    pos: l.pos,
+                    text: l.text.clone(),
+                    axis: l.axis,
+                })
                 .collect(),
         });
         self.rebuild_panel(mode);
-        self.current = Some(Built { geometry, origin, mode });
+        self.current = Some(Built {
+            geometry,
+            origin,
+            mode,
+        });
         self.dirty = false;
         self.redraw = true;
     }
@@ -1207,7 +1669,14 @@ impl App {
         let t0 = instant::Instant::now();
         self.panel_dirty = false;
         let window = self.scene_window();
-        let ev = match build_slice_panel_view(&self.doc, mode, window, self.size, &self.theme, self.slice_view.as_ref()) {
+        let ev = match build_slice_panel_view(
+            &self.doc,
+            mode,
+            window,
+            self.size,
+            &self.theme,
+            self.slice_view.as_ref(),
+        ) {
             None => {
                 self.panel = None;
                 Event::Slice {
@@ -1250,9 +1719,19 @@ impl App {
                     .rs
                     .fixed_axes()
                     .into_iter()
-                    .map(|a| (math_core::slice::axis_name(a).to_string(), out.rs.fixed[a].unwrap_or(0.0)))
+                    .map(|a| {
+                        (
+                            math_core::slice::axis_name(a).to_string(),
+                            out.rs.fixed[a].unwrap_or(0.0),
+                        )
+                    })
                     .collect();
-                let free = out.rs.free_axes().into_iter().map(|a| math_core::slice::axis_name(a).to_string()).collect();
+                let free = out
+                    .rs
+                    .free_axes()
+                    .into_iter()
+                    .map(|a| math_core::slice::axis_name(a).to_string())
+                    .collect();
                 let ev = Event::Slice {
                     active: true,
                     dim: out.rs.dim,
@@ -1282,7 +1761,14 @@ impl App {
         self.last_panel_ms = t0.elapsed().as_secs_f64() * 1000.0;
         if self.last_slice.as_ref() != Some(&ev) {
             // Do not announce "no slice" at startup, only when a slice goes away.
-            let quiet = matches!(&ev, Event::Slice { active: false, error: None, .. }) && self.last_slice.is_none();
+            let quiet = matches!(
+                &ev,
+                Event::Slice {
+                    active: false,
+                    error: None,
+                    ..
+                }
+            ) && self.last_slice.is_none();
             self.last_slice = Some(ev.clone());
             if !quiet {
                 // An undelivered slice report (raised in frame(), not yet drained) describes an
@@ -1301,7 +1787,12 @@ impl App {
         Some(Inset {
             rect: p.rect,
             rig: &p.rig,
-            layers: vec![Layer { geometry: &p.geometry, fade: 1.0, origin: p.origin, lift: 1.0 }],
+            layers: vec![Layer {
+                geometry: &p.geometry,
+                fade: 1.0,
+                origin: p.origin,
+                lift: 1.0,
+            }],
         })
     }
 
@@ -1312,12 +1803,27 @@ impl App {
             (Some(p), Some(c)) if self.rig.is_animating() => {
                 let (fa, fb) = crossfade(self.rig.progress() as f32);
                 let lift = self.rig.lift();
-                out.push(Layer { geometry: &p.geometry, fade: fa, origin: p.origin, lift: layer_lift(p.mode, lift) });
-                out.push(Layer { geometry: &c.geometry, fade: fb, origin: c.origin, lift: layer_lift(c.mode, lift) });
+                out.push(Layer {
+                    geometry: &p.geometry,
+                    fade: fa,
+                    origin: p.origin,
+                    lift: layer_lift(p.mode, lift),
+                });
+                out.push(Layer {
+                    geometry: &c.geometry,
+                    fade: fb,
+                    origin: c.origin,
+                    lift: layer_lift(c.mode, lift),
+                });
             }
             (_, Some(c)) => {
                 let lift = layer_lift(c.mode, self.rig.lift());
-                out.push(Layer { geometry: &c.geometry, fade: 1.0, origin: c.origin, lift })
+                out.push(Layer {
+                    geometry: &c.geometry,
+                    fade: 1.0,
+                    origin: c.origin,
+                    lift,
+                })
             }
             _ => {}
         }
@@ -1328,7 +1834,9 @@ impl App {
     /// tween), in CSS pixels for a viewport of `size`. `visible` is false when the label falls
     /// outside the view or behind the camera. Cheap enough to call every frame.
     pub fn screen_labels(&self) -> Vec<ScreenLabel> {
-        let Some(c) = &self.current else { return Vec::new() };
+        let Some(c) = &self.current else {
+            return Vec::new();
+        };
         let aspect = self.size.0 as f64 / self.size.1.max(1) as f64;
         let (w, h) = (self.size.0 as f64, self.size.1 as f64);
         let rect = self.inset_rect();
@@ -1339,16 +1847,31 @@ impl App {
             .labels
             .iter()
             .map(|l| {
-                let ndc = self.rig.project_ndc([l.pos[0], l.pos[1], l.pos[2] * lift], aspect);
+                let ndc = self
+                    .rig
+                    .project_ndc([l.pos[0], l.pos[1], l.pos[2] * lift], aspect);
                 let (x, y) = ((ndc[0] * 0.5 + 0.5) * w, (1.0 - (ndc[1] * 0.5 + 0.5)) * h);
-                let mut visible = ndc[0].abs() <= 1.0 && ndc[1].abs() <= 1.0 && (0.0..=1.0).contains(&ndc[2]);
+                let mut visible =
+                    ndc[0].abs() <= 1.0 && ndc[1].abs() <= 1.0 && (0.0..=1.0).contains(&ndc[2]);
                 // Labels under the inset would show through it.
                 if let Some(r) = rect {
-                    if x >= r[0] as f64 && x <= (r[0] + r[2]) as f64 && y >= r[1] as f64 && y <= (r[1] + r[3]) as f64 {
+                    if x >= r[0] as f64
+                        && x <= (r[0] + r[2]) as f64
+                        && y >= r[1] as f64
+                        && y <= (r[1] + r[3]) as f64
+                    {
                         visible = false;
                     }
                 }
-                ScreenLabel { text: l.text.clone(), axis: l.axis, x, y, visible, inset: false, clip: None }
+                ScreenLabel {
+                    text: l.text.clone(),
+                    axis: l.axis,
+                    x,
+                    y,
+                    visible,
+                    inset: false,
+                    clip: None,
+                }
             })
             .collect();
         out.extend(self.inset_screen_labels());
@@ -1357,7 +1880,9 @@ impl App {
 
     /// Tick labels and axis names of the slice inset, in canvas pixels (empty without one).
     pub fn inset_screen_labels(&self) -> Vec<ScreenLabel> {
-        let Some(p) = self.panel.as_ref().filter(|_| !self.rig.is_animating()) else { return Vec::new() };
+        let Some(p) = self.panel.as_ref().filter(|_| !self.rig.is_animating()) else {
+            return Vec::new();
+        };
         let r = p.rect;
         let aspect = r[2] as f64 / r[3].max(1) as f64;
         let (pw, ph) = (r[2] as f64, r[3] as f64);
@@ -1369,7 +1894,9 @@ impl App {
                 // Position inside the panel, from its top-left corner; the whole text box (not
                 // just the anchor) must lie inside the rectangle or the label is hidden.
                 let (lx, ly) = ((ndc[0] * 0.5 + 0.5) * pw, (1.0 - (ndc[1] * 0.5 + 0.5)) * ph);
-                let visible = ndc[0].abs() <= 1.0 && ndc[1].abs() <= 1.0 && label_box_inside(l.axis, &l.text, lx, ly, pw, ph);
+                let visible = ndc[0].abs() <= 1.0
+                    && ndc[1].abs() <= 1.0
+                    && label_box_inside(l.axis, &l.text, lx, ly, pw, ph);
                 ScreenLabel {
                     text: l.text.clone(),
                     axis: l.axis,
@@ -1432,7 +1959,10 @@ mod tests {
     fn bad_expressions_report_diagnostics_not_panics() {
         let mut a = app();
         let ev = cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y="}"#);
-        let diag = ev.iter().find(|e| e["t"] == "diagnostics").expect("diagnostics event");
+        let diag = ev
+            .iter()
+            .find(|e| e["t"] == "diagnostics")
+            .expect("diagnostics event");
         assert_eq!(diag["items"][0]["id"], "a");
         // Fixing it clears the diagnostics.
         let ev = cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=x"}"#);
@@ -1446,7 +1976,10 @@ mod tests {
         assert!(has(&cmd(&mut a, "not json"), "error"));
         assert!(has(&cmd(&mut a, r#"{"t":"nope"}"#), "error"));
         assert!(has(&cmd(&mut a, r#"{"t":"setMode","mode":"9d"}"#), "error"));
-        assert!(has(&cmd(&mut a, r#"{"t":"removeItem","id":"missing"}"#), "error"));
+        assert!(has(
+            &cmd(&mut a, r#"{"t":"removeItem","id":"missing"}"#),
+            "error"
+        ));
     }
 
     #[test]
@@ -1470,7 +2003,10 @@ mod tests {
     #[test]
     fn switching_mid_tween_keeps_working() {
         let mut a = app();
-        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"x^2+y^2+z^2=25"}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setExpr","id":"a","latex":"x^2+y^2+z^2=25"}"#,
+        );
         for (i, m) in ["3d", "2d", "1d", "3d", "2d"].iter().enumerate() {
             cmd(&mut a, &format!(r#"{{"t":"setMode","mode":"{m}"}}"#));
             a.frame(i as f64 * 50.0);
@@ -1507,13 +2043,27 @@ mod tests {
     #[test]
     fn switch_to_3d_previews_then_refines_at_full_quality() {
         let mut a = app();
-        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"z=\\sin(x)\\cos(y)"}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setExpr","id":"a","latex":"z=\\sin(x)\\cos(y)"}"#,
+        );
         a.frame(0.0);
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
-        let full = build_scene(&a.doc, Mode::D3, a.scene_window(), a.rig.render_origin(), a.size, &a.theme);
+        let full = build_scene(
+            &a.doc,
+            Mode::D3,
+            a.scene_window(),
+            a.rig.render_origin(),
+            a.size,
+            &a.theme,
+        );
         let preview = a.layers()[1].geometry.vertices.len();
         assert!(a.refine);
-        assert!(preview > 0 && preview < full.vertices.len(), "{preview} vs {}", full.vertices.len());
+        assert!(
+            preview > 0 && preview < full.vertices.len(),
+            "{preview} vs {}",
+            full.vertices.len()
+        );
         // Mid-switch: the 3D scene is partly lifted, the outgoing 2D one is untouched.
         a.frame(16.0);
         a.frame(266.0);
@@ -1540,7 +2090,10 @@ mod tests {
     #[test]
     fn refine_waits_for_a_pause_in_the_input() {
         let mut a = app();
-        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"z=\\sin(x)\\cos(y)"}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setExpr","id":"a","latex":"z=\\sin(x)\\cos(y)"}"#,
+        );
         a.frame(0.0);
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
         a.frame(10.0);
@@ -1549,7 +2102,13 @@ mod tests {
         while t < 800.0 {
             t += 16.0;
             a.now_ms = t;
-            cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"move","x":{},"y":300}}"#, 400.0 + t / 10.0));
+            cmd(
+                &mut a,
+                &format!(
+                    r#"{{"t":"pointer","phase":"move","x":{},"y":300}}"#,
+                    400.0 + t / 10.0
+                ),
+            );
             a.frame(t);
         }
         assert!(!a.rig.is_animating());
@@ -1564,7 +2123,10 @@ mod tests {
     #[test]
     fn reduced_motion_switches_at_once_at_full_quality() {
         let mut a = app();
-        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"z=\\sin(x)\\cos(y)"}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setExpr","id":"a","latex":"z=\\sin(x)\\cos(y)"}"#,
+        );
         cmd(&mut a, r#"{"t":"setReducedMotion","on":true}"#);
         a.frame(0.0);
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
@@ -1577,7 +2139,10 @@ mod tests {
         drop(l);
         // The setting outlives a document load (which replaces the camera rig).
         let json = doc::to_json(&a.doc);
-        cmd(&mut a, &serde_json::json!({"t":"loadDoc","json":json}).to_string());
+        cmd(
+            &mut a,
+            &serde_json::json!({"t":"loadDoc","json":json}).to_string(),
+        );
         a.frame(32.0);
         cmd(&mut a, r#"{"t":"setMode","mode":"2d"}"#);
         assert!(!a.rig.is_animating());
@@ -1610,7 +2175,10 @@ mod tests {
         let w0 = a.rig.window();
         cmd(&mut a, r#"{"t":"wheel","x":400,"y":300,"dy":-300}"#);
         let w1 = a.rig.window();
-        assert!(w1.max[0] - w1.min[0] < w0.max[0] - w0.min[0], "negative dy zooms in");
+        assert!(
+            w1.max[0] - w1.min[0] < w0.max[0] - w0.min[0],
+            "negative dy zooms in"
+        );
     }
 
     #[test]
@@ -1631,8 +2199,14 @@ mod tests {
         cmd(&mut a, r#"{"t":"setExpr","id":"e","latex":"y=a*x"}"#);
         let ev = cmd(&mut a, r#"{"t":"setSlider","name":"a","value":2}"#);
         let diag = ev.iter().find(|e| e["t"] == "diagnostics").unwrap();
-        assert!(diag["items"].as_array().unwrap().is_empty(), "slider supplies a");
-        cmd(&mut a, r#"{"t":"addItem","id":"d","kind":"expression","latex":"f(x)=x^2"}"#);
+        assert!(
+            diag["items"].as_array().unwrap().is_empty(),
+            "slider supplies a"
+        );
+        cmd(
+            &mut a,
+            r#"{"t":"addItem","id":"d","kind":"expression","latex":"f(x)=x^2"}"#,
+        );
         cmd(&mut a, r#"{"t":"setExpr","id":"g","latex":"y=f(x)"}"#);
         assert!(a.diagnostics.is_empty());
     }
@@ -1644,16 +2218,28 @@ mod tests {
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
         a.frame(10_000.0);
         let ev = cmd(&mut a, r#"{"t":"export"}"#);
-        let hash = ev.iter().find(|e| e["t"] == "hash").unwrap()["hash"].as_str().unwrap().to_string();
+        let hash = ev.iter().find(|e| e["t"] == "hash").unwrap()["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(hash.starts_with("v1."));
         let mut b = app();
-        let ev = cmd(&mut b, &serde_json::json!({"t":"loadHash","hash":hash}).to_string());
+        let ev = cmd(
+            &mut b,
+            &serde_json::json!({"t":"loadHash","hash":hash}).to_string(),
+        );
         assert!(!has(&ev, "error"));
         assert_eq!(b.doc.items.len(), 1);
         assert_eq!(b.mode(), Mode::D3);
         // Hostile hashes are rejected, not trusted.
-        assert!(has(&cmd(&mut b, r#"{"t":"loadHash","hash":"v1.AAAA"}"#), "error"));
-        assert!(has(&cmd(&mut b, r#"{"t":"loadDoc","json":"{\"v\":99}"}"#), "error"));
+        assert!(has(
+            &cmd(&mut b, r#"{"t":"loadHash","hash":"v1.AAAA"}"#),
+            "error"
+        ));
+        assert!(has(
+            &cmd(&mut b, r#"{"t":"loadDoc","json":"{\"v\":99}"}"#),
+            "error"
+        ));
     }
 
     #[test]
@@ -1668,24 +2254,36 @@ mod tests {
             .fold(0.0f32, f32::max);
         // 20 units across 390 px means ~21.6 units of half-height... the visible y half-range
         // is 10 * 844 / 390 = 21.6, far beyond the stored +-10.
-        assert!(max_y > 20.0, "grid should reach the top and bottom of a tall canvas, got {max_y}");
+        assert!(
+            max_y > 20.0,
+            "grid should reach the top and bottom of a tall canvas, got {max_y}"
+        );
     }
 
     #[test]
     fn slider_step_and_removal() {
         let mut a = app();
-        cmd(&mut a, r#"{"t":"setSlider","name":"a","value":1,"step":0.25}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setSlider","name":"a","value":1,"step":0.25}"#,
+        );
         assert_eq!(a.doc.sliders["a"].step, Some(0.25));
         cmd(&mut a, r#"{"t":"removeSlider","name":"a"}"#);
         assert!(a.doc.sliders.is_empty());
         // Removing a slider that does not exist is a quiet no-op.
-        assert!(!has(&cmd(&mut a, r#"{"t":"removeSlider","name":"zzz"}"#), "error"));
+        assert!(!has(
+            &cmd(&mut a, r#"{"t":"removeSlider","name":"zzz"}"#),
+            "error"
+        ));
     }
 
     #[test]
     fn pointer_hover_with_no_button_is_accepted() {
         let mut a = app();
-        let ev = cmd(&mut a, r#"{"t":"pointer","phase":"move","x":10,"y":10,"button":-1}"#);
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"pointer","phase":"move","x":10,"y":10,"button":-1}"#,
+        );
         assert!(!has(&ev, "error"));
     }
 
@@ -1693,11 +2291,18 @@ mod tests {
     fn screen_labels_track_the_camera() {
         let mut a = app();
         let labels = a.screen_labels();
-        assert!(labels.iter().any(|l| l.visible && l.axis == 0), "x tick labels on screen");
+        assert!(
+            labels.iter().any(|l| l.visible && l.axis == 0),
+            "x tick labels on screen"
+        );
         // The label for x=0 sits where the world origin projects: the screen centre column.
         let zero = labels.iter().find(|l| l.text == "0" && l.axis == 0);
         if let Some(z) = zero {
-            assert!((z.x - 400.0).abs() < 2.0, "x=0 is at the horizontal centre, got {}", z.x);
+            assert!(
+                (z.x - 400.0).abs() < 2.0,
+                "x=0 is at the horizontal centre, got {}",
+                z.x
+            );
         }
         // Panning right moves labels left (same labels, new positions).
         let before = labels.iter().find(|l| l.visible).unwrap().x;
@@ -1732,7 +2337,10 @@ mod tests {
         assert_eq!(a.size(), (1, 1));
     }
     fn ptr(a: &mut App, phase: &str, x: f64, y: f64) -> Vec<serde_json::Value> {
-        cmd(a, &format!(r#"{{"t":"pointer","phase":"{phase}","x":{x},"y":{y}}}"#))
+        cmd(
+            a,
+            &format!(r#"{{"t":"pointer","phase":"{phase}","x":{x},"y":{y}}}"#),
+        )
     }
 
     #[test]
@@ -1743,7 +2351,10 @@ mod tests {
         // (2, 3) is at pixel (480, 180) with 40 px per unit.
         ptr(&mut a, "down", 480.0, 180.0);
         let ev = ptr(&mut a, "move", 520.0, 140.0);
-        let edit = ev.iter().find(|e| e["t"] == "itemEdited").expect("itemEdited event");
+        let edit = ev
+            .iter()
+            .find(|e| e["t"] == "itemEdited")
+            .expect("itemEdited event");
         assert_eq!(edit["id"], "p");
         assert_eq!(edit["latex"], "(3, 4)");
         assert_eq!(a.doc.items[0].latex, "(3, 4)");
@@ -1758,17 +2369,32 @@ mod tests {
     #[test]
     fn dragging_a_point_built_from_a_slider_and_a_definition() {
         let mut a = app();
-        cmd(&mut a, r#"{"t":"setSlider","name":"a","value":1,"min":-5,"max":5}"#);
-        cmd(&mut a, r#"{"t":"addItem","id":"d","kind":"expression","latex":"b=2"}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setSlider","name":"a","value":1,"min":-5,"max":5}"#,
+        );
+        cmd(
+            &mut a,
+            r#"{"t":"addItem","id":"d","kind":"expression","latex":"b=2"}"#,
+        );
         cmd(&mut a, r#"{"t":"setExpr","id":"p","latex":"(a,b)"}"#);
         // (1, 2): pixel (440, 220).
         ptr(&mut a, "down", 440.0, 220.0);
         let ev = ptr(&mut a, "move", 640.0, 160.0);
-        let slider = ev.iter().find(|e| e["t"] == "sliderValue").expect("slider event");
+        let slider = ev
+            .iter()
+            .find(|e| e["t"] == "sliderValue")
+            .expect("slider event");
         assert_eq!(slider["name"], "a");
         assert_eq!(slider["value"], 5.0, "clamped to the slider range");
-        let edit = ev.iter().find(|e| e["t"] == "itemEdited").expect("definition edit");
-        assert_eq!((edit["id"].as_str(), edit["latex"].as_str()), (Some("d"), Some("b=3.5")));
+        let edit = ev
+            .iter()
+            .find(|e| e["t"] == "itemEdited")
+            .expect("definition edit");
+        assert_eq!(
+            (edit["id"].as_str(), edit["latex"].as_str()),
+            (Some("d"), Some("b=3.5"))
+        );
         assert_eq!(a.doc.items[0].latex, "b=3.5");
         assert_eq!(a.doc.sliders["a"].value, 5.0);
         assert_eq!(a.doc.items[1].latex, "(a,b)", "the tuple text is unchanged");
@@ -1799,29 +2425,63 @@ mod tests {
     #[test]
     fn table_commands_round_trip_with_events() {
         let mut a = app();
-        let ev = cmd(&mut a, r#"{"t":"addTable","id":"t","data":[[1,2],[2,"4"]]}"#);
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"addTable","id":"t","data":[[1,2],[2,"4"]]}"#,
+        );
         let t = ev.iter().find(|e| e["t"] == "table").expect("table event");
         assert_eq!(t["columns"][0]["name"], "x_1");
         assert_eq!(t["columns"][1]["cells"], serde_json::json!(["2", "4"]));
-        assert_eq!((t["rows"].as_u64(), t["style"].as_str()), (Some(2), Some("points")));
-        assert_eq!(a.layers()[0].geometry.segments.iter().filter(|s| s.p0 == s.p1 && s.width == 9.0).count(), 2);
-        let ev = cmd(&mut a, r#"{"t":"setCell","id":"t","row":2,"col":0,"value":3}"#);
+        assert_eq!(
+            (t["rows"].as_u64(), t["style"].as_str()),
+            (Some(2), Some("points"))
+        );
+        assert_eq!(
+            a.layers()[0]
+                .geometry
+                .segments
+                .iter()
+                .filter(|s| s.p0 == s.p1 && s.width == 9.0)
+                .count(),
+            2
+        );
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"setCell","id":"t","row":2,"col":0,"value":3}"#,
+        );
         assert_eq!(ev.iter().find(|e| e["t"] == "table").unwrap()["rows"], 3);
-        cmd(&mut a, r#"{"t":"setCell","id":"t","row":2,"col":1,"value":"a"}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setCell","id":"t","row":2,"col":1,"value":"a"}"#,
+        );
         // `a` is undefined: the table reports a diagnostic, until a slider supplies it.
         assert!(a.diagnostics.iter().any(|d| d.id == "t"));
         cmd(&mut a, r#"{"t":"setSlider","name":"a","value":9}"#);
         assert!(a.diagnostics.is_empty(), "{:?}", a.diagnostics);
         cmd(&mut a, r#"{"t":"addColumn","id":"t"}"#);
-        cmd(&mut a, r#"{"t":"renameColumn","id":"t","col":2,"name":"w_1"}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"renameColumn","id":"t","col":2,"name":"w_1"}"#,
+        );
         cmd(&mut a, r#"{"t":"addRow","id":"t","at":0}"#);
         assert_eq!(a.doc.items[0].table.as_ref().unwrap().rows(), 4);
         cmd(&mut a, r#"{"t":"removeRow","id":"t","row":0}"#);
         cmd(&mut a, r#"{"t":"removeColumn","id":"t","col":2}"#);
         let ev = cmd(&mut a, r#"{"t":"setTableStyle","id":"t","style":"line"}"#);
-        assert_eq!(ev.iter().find(|e| e["t"] == "table").unwrap()["style"], "line");
+        assert_eq!(
+            ev.iter().find(|e| e["t"] == "table").unwrap()["style"],
+            "line"
+        );
         cmd(&mut a, r#"{"t":"setTableStyle","id":"t","style":"hidden"}"#);
-        assert_eq!(a.layers()[0].geometry.segments.iter().filter(|s| s.width == 9.0).count(), 0);
+        assert_eq!(
+            a.layers()[0]
+                .geometry
+                .segments
+                .iter()
+                .filter(|s| s.width == 9.0)
+                .count(),
+            0
+        );
         // Errors leave the table untouched.
         let before = a.doc.clone();
         for bad in [
@@ -1842,12 +2502,24 @@ mod tests {
     #[test]
     fn tables_survive_export_and_reload_and_feed_lists() {
         let mut a = app();
-        cmd(&mut a, r#"{"t":"addTable","id":"t","columns":["x_1","y_1"],"data":[[1,1],[2,2],[2,3]]}"#);
-        cmd(&mut a, r#"{"t":"setExpr","id":"h","latex":"histogram(x_1)"}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"addTable","id":"t","columns":["x_1","y_1"],"data":[[1,1],[2,2],[2,3]]}"#,
+        );
+        cmd(
+            &mut a,
+            r#"{"t":"setExpr","id":"h","latex":"histogram(x_1)"}"#,
+        );
         assert!(a.diagnostics.is_empty(), "{:?}", a.diagnostics);
         let ev = cmd(&mut a, r#"{"t":"export"}"#);
-        let json = ev.iter().find(|e| e["t"] == "doc").unwrap()["json"].as_str().unwrap().to_string();
-        let hash = ev.iter().find(|e| e["t"] == "hash").unwrap()["hash"].as_str().unwrap().to_string();
+        let json = ev.iter().find(|e| e["t"] == "doc").unwrap()["json"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let hash = ev.iter().find(|e| e["t"] == "hash").unwrap()["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
         for load in [
             serde_json::json!({"t":"loadDoc","json":json}),
             serde_json::json!({"t":"loadHash","hash":hash}),
@@ -1855,10 +2527,16 @@ mod tests {
             let mut b = app();
             let ev = cmd(&mut b, &load.to_string());
             assert!(!has(&ev, "error"));
-            let t = ev.iter().find(|e| e["t"] == "table").expect("table event on load");
+            let t = ev
+                .iter()
+                .find(|e| e["t"] == "table")
+                .expect("table event on load");
             assert_eq!(t["columns"][0]["cells"], serde_json::json!(["1", "2", "2"]));
             assert!(b.diagnostics.is_empty());
-            assert!(!b.layers()[0].geometry.vertices.is_empty(), "histogram from the table column");
+            assert!(
+                !b.layers()[0].geometry.vertices.is_empty(),
+                "histogram from the table column"
+            );
         }
     }
 
@@ -1874,8 +2552,14 @@ mod tests {
 
     fn ticker_app(action: &str) -> App {
         let mut a = app();
-        cmd(&mut a, r#"{"t":"addItem","id":"d","kind":"equation","latex":"k=3"}"#);
-        cmd(&mut a, r#"{"t":"setSlider","name":"a","value":0,"min":-100,"max":100}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"addItem","id":"d","kind":"equation","latex":"k=3"}"#,
+        );
+        cmd(
+            &mut a,
+            r#"{"t":"setSlider","name":"a","value":0,"min":-100,"max":100}"#,
+        );
         cmd(&mut a, r#"{"t":"setSlider","name":"b","value":10}"#);
         let j = serde_json::json!({"t":"addItem","id":"act","kind":"action","latex":action});
         cmd(&mut a, &j.to_string());
@@ -1895,7 +2579,10 @@ mod tests {
         let sv: Vec<_> = ev.iter().filter(|e| e["t"] == "sliderValue").collect();
         assert_eq!(sv.len(), 2);
         let edit = ev.iter().find(|e| e["t"] == "itemEdited").unwrap();
-        assert_eq!((edit["id"].as_str(), edit["latex"].as_str()), (Some("d"), Some("k=4")));
+        assert_eq!(
+            (edit["id"].as_str(), edit["latex"].as_str()),
+            (Some("d"), Some("k=4"))
+        );
         assert_eq!(a.doc.items[0].latex, "k=4");
     }
 
@@ -1905,7 +2592,10 @@ mod tests {
         let ev = cmd(&mut a, r#"{"t":"runAction","id":"act"}"#);
         assert!(has(&ev, "error"));
         assert_eq!(slider(&a, "a"), 0.0, "atomic");
-        assert!(has(&cmd(&mut a, r#"{"t":"runAction","id":"zzz"}"#), "error"));
+        assert!(has(
+            &cmd(&mut a, r#"{"t":"runAction","id":"zzz"}"#),
+            "error"
+        ));
         // The bad action also shows as an inline diagnostic.
         assert!(a.diagnostics.iter().any(|d| d.id == "act"));
     }
@@ -1925,13 +2615,19 @@ mod tests {
         let mut a = ticker_app("a -> a+0.5");
         let ev = cmd(&mut a, r#"{"t":"setTicker","action":"act","rate_ms":100}"#);
         let st = ev.iter().find(|e| e["t"] == "tickerState").unwrap();
-        assert_eq!((st["running"].as_bool(), st["action"].as_str()), (Some(false), Some("act")));
+        assert_eq!(
+            (st["running"].as_bool(), st["action"].as_str()),
+            (Some(false), Some("act"))
+        );
         for t in [0.0, 100.0, 200.0] {
             a.frame(t);
         }
         assert_eq!(slider(&a, "a"), 0.0, "not running");
         let ev = cmd(&mut a, r#"{"t":"startTicker"}"#);
-        assert_eq!(ev.iter().find(|e| e["t"] == "tickerState").unwrap()["running"], true);
+        assert_eq!(
+            ev.iter().find(|e| e["t"] == "tickerState").unwrap()["running"],
+            true
+        );
         a.frame(300.0); // anchors
         a.frame(350.0); // 50 ms: not due
         assert_eq!(slider(&a, "a"), 0.0);
@@ -1942,7 +2638,10 @@ mod tests {
         a.frame(600.0); // carried 20 + 80 = 100 -> 1 step
         assert_eq!(slider(&a, "a"), 1.5);
         let ev = cmd(&mut a, r#"{"t":"toggleTicker"}"#);
-        assert_eq!(ev.iter().find(|e| e["t"] == "tickerState").unwrap()["running"], false);
+        assert_eq!(
+            ev.iter().find(|e| e["t"] == "tickerState").unwrap()["running"],
+            false
+        );
         a.frame(900.0);
         assert_eq!(slider(&a, "a"), 1.5);
         // one manual step works while stopped
@@ -1958,13 +2657,18 @@ mod tests {
         a.take_events();
         assert!(a.frame(50.0));
         let ev = a.take_events();
-        assert!(ev.iter().any(|e| matches!(e, Event::SliderValue { name, value } if name == "a" && *value == 1.0)));
+        assert!(ev.iter().any(
+            |e| matches!(e, Event::SliderValue { name, value } if name == "a" && *value == 1.0)
+        ));
     }
 
     #[test]
     fn ticker_caps_steps_per_frame_and_drops_backlog() {
         let mut a = ticker_app("a -> a+1");
-        cmd(&mut a, r#"{"t":"setTicker","action":"act","rate_ms":50,"running":true}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setTicker","action":"act","rate_ms":50,"running":true}"#,
+        );
         a.frame(0.0);
         a.frame(10_000.0); // 200 steps due, only 4 fire
         assert_eq!(slider(&a, "a"), MAX_TICKER_STEPS_PER_FRAME as f64);
@@ -1980,13 +2684,19 @@ mod tests {
     #[test]
     fn ticker_min_step_floors_the_rate() {
         let mut a = ticker_app("a -> a+1");
-        cmd(&mut a, r#"{"t":"setTicker","action":"act","rate_ms":1,"running":true}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setTicker","action":"act","rate_ms":1,"running":true}"#,
+        );
         a.frame(0.0);
         a.frame(5.0);
         assert_eq!(slider(&a, "a"), 0.0, "default floor is 10 ms");
         a.frame(10.0);
         assert_eq!(slider(&a, "a"), 1.0);
-        cmd(&mut a, r#"{"t":"setTicker","rate_ms":10,"min_step_ms":200}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setTicker","rate_ms":10,"min_step_ms":200}"#,
+        );
         a.frame(100.0);
         a.frame(200.0);
         assert_eq!(slider(&a, "a"), 1.0);
@@ -2005,29 +2715,56 @@ mod tests {
         a.frame(50.0);
         let ev = a.take_events();
         assert!(ev.iter().any(|e| matches!(e, Event::Error { .. })));
-        assert!(ev.iter().any(|e| matches!(e, Event::TickerState { running: false, .. })));
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e, Event::TickerState { running: false, .. })));
         assert_eq!(slider(&a, "a"), 0.0, "failed step changes nothing");
         // Keep running, report the error once.
-        let ev = cmd(&mut a, r#"{"t":"setTicker","pause_on_error":false,"running":true}"#);
-        assert!(ev.iter().any(|e| e["t"] == "tickerState" && e["running"] == true));
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"setTicker","pause_on_error":false,"running":true}"#,
+        );
+        assert!(ev
+            .iter()
+            .any(|e| e["t"] == "tickerState" && e["running"] == true));
         a.frame(100.0);
         a.take_events();
         a.frame(150.0);
-        assert!(a.take_events().iter().any(|e| matches!(e, Event::Error { .. })), "reported once");
+        assert!(
+            a.take_events()
+                .iter()
+                .any(|e| matches!(e, Event::Error { .. })),
+            "reported once"
+        );
         a.frame(200.0);
         a.frame(250.0);
         let ev = a.take_events();
-        assert!(!ev.iter().any(|e| matches!(e, Event::Error { .. })), "error not repeated");
+        assert!(
+            !ev.iter().any(|e| matches!(e, Event::Error { .. })),
+            "error not repeated"
+        );
         assert!(a.ticker_running);
     }
 
     #[test]
     fn ticker_config_validation_and_cleanup() {
         let mut a = ticker_app("a -> a+1");
-        assert!(has(&cmd(&mut a, r#"{"t":"setTicker","action":"nope"}"#), "error"));
-        assert!(has(&cmd(&mut a, r#"{"t":"setTicker","action":"d"}"#), "error"), "not an action");
-        assert!(has(&cmd(&mut a, r#"{"t":"setTicker","rate_ms":-5}"#), "error"));
-        assert!(has(&cmd(&mut a, r#"{"t":"startTicker"}"#), "error"), "no action yet");
+        assert!(has(
+            &cmd(&mut a, r#"{"t":"setTicker","action":"nope"}"#),
+            "error"
+        ));
+        assert!(
+            has(&cmd(&mut a, r#"{"t":"setTicker","action":"d"}"#), "error"),
+            "not an action"
+        );
+        assert!(has(
+            &cmd(&mut a, r#"{"t":"setTicker","rate_ms":-5}"#),
+            "error"
+        ));
+        assert!(
+            has(&cmd(&mut a, r#"{"t":"startTicker"}"#), "error"),
+            "no action yet"
+        );
         cmd(&mut a, r#"{"t":"setTicker","action":"act","running":true}"#);
         assert!(a.ticker_running);
         // missing action leaves it; explicit null clears and stops
@@ -2035,29 +2772,46 @@ mod tests {
         assert!(a.ticker_running);
         let ev = cmd(&mut a, r#"{"t":"setTicker","action":null}"#);
         assert!(!a.ticker_running);
-        assert_eq!(ev.iter().find(|e| e["t"] == "tickerState").unwrap()["action"], serde_json::Value::Null);
+        assert_eq!(
+            ev.iter().find(|e| e["t"] == "tickerState").unwrap()["action"],
+            serde_json::Value::Null
+        );
         // removing the action item stops the ticker
         cmd(&mut a, r#"{"t":"setTicker","action":"act","running":true}"#);
         let ev = cmd(&mut a, r#"{"t":"removeItem","id":"act"}"#);
         assert!(!a.ticker_running);
-        assert!(ev.iter().any(|e| e["t"] == "tickerState" && e["running"] == false));
+        assert!(ev
+            .iter()
+            .any(|e| e["t"] == "tickerState" && e["running"] == false));
     }
 
     #[test]
     fn ticker_config_is_saved_but_not_running_state() {
         let mut a = ticker_app("a -> a+1");
-        cmd(&mut a, r#"{"t":"setTicker","action":"act","rate_ms":75,"min_step_ms":20,"pause_on_error":false,"running":true}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setTicker","action":"act","rate_ms":75,"min_step_ms":20,"pause_on_error":false,"running":true}"#,
+        );
         let ev = cmd(&mut a, r#"{"t":"export"}"#);
-        let json = ev.iter().find(|e| e["t"] == "doc").unwrap()["json"].as_str().unwrap().to_string();
+        let json = ev.iter().find(|e| e["t"] == "doc").unwrap()["json"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(json.contains("\"ticker\""));
         let mut b = app();
         let load = serde_json::json!({"t":"loadDoc","json":json});
         let ev = cmd(&mut b, &load.to_string());
         assert!(!has(&ev, "error"));
         let st = ev.iter().find(|e| e["t"] == "tickerState").unwrap();
-        assert_eq!((st["running"].as_bool(), st["action"].as_str()), (Some(false), Some("act")));
+        assert_eq!(
+            (st["running"].as_bool(), st["action"].as_str()),
+            (Some(false), Some("act"))
+        );
         let t = b.doc.ticker.clone().unwrap();
-        assert_eq!((t.rate_ms, t.min_step_ms, t.pause_on_error), (75.0, 20.0, false));
+        assert_eq!(
+            (t.rate_ms, t.min_step_ms, t.pause_on_error),
+            (75.0, 20.0, false)
+        );
         // Starting the loaded ticker works.
         cmd(&mut b, r#"{"t":"startTicker"}"#);
         b.frame(0.0);
@@ -2075,7 +2829,10 @@ mod tests {
     fn set_slice_3d_plane_reports_state_and_shows_inset() {
         let mut a = app();
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
-        cmd(&mut a, r#"{"t":"setExpr","id":"s","latex":"x^2+y^2+z^2=4"}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setExpr","id":"s","latex":"x^2+y^2+z^2=4"}"#,
+        );
         assert!(a.inset().is_none());
         let ev = cmd(&mut a, r#"{"t":"setSlice","dim":2,"fixed":{"z":1}}"#);
         let s = slice_ev(&ev).expect("slice event");
@@ -2098,7 +2855,13 @@ mod tests {
         assert!(labels.iter().any(|l| l.inset && l.text == "x"));
         assert!(labels.iter().any(|l| !l.inset));
         // The main scene carries the overlay.
-        assert!(!a.layers().last().unwrap().geometry.overlay_segments.is_empty());
+        assert!(!a
+            .layers()
+            .last()
+            .unwrap()
+            .geometry
+            .overlay_segments
+            .is_empty());
     }
 
     #[test]
@@ -2108,7 +2871,10 @@ mod tests {
         cmd(&mut a, r#"{"t":"setSlider","name":"a","value":1}"#);
         let ev = cmd(&mut a, r#"{"t":"setSlice","fixed":"y=a"}"#);
         let s = slice_ev(&ev).unwrap();
-        assert_eq!((s["dim"].as_u64(), s["points"].as_u64()), (Some(1), Some(2)));
+        assert_eq!(
+            (s["dim"].as_u64(), s["points"].as_u64()),
+            (Some(1), Some(2))
+        );
         assert_eq!(s["fixed"]["y"], 1.0);
         let ev = cmd(&mut a, r#"{"t":"setSlider","name":"a","value":-3}"#);
         let s = slice_ev(&ev).expect("slice event follows the slider");
@@ -2137,9 +2903,9 @@ mod tests {
         for bad in [
             r#"{"t":"setSlice","fixed":{"w":1}}"#,
             r#"{"t":"setSlice","fixed":{}}"#,
-            r#"{"t":"setSlice","fixed":{"z":1}}"#,          // z does not exist in 2D
-            r#"{"t":"setSlice","fixed":{"x":1,"y":2}}"#,     // would leave 0 dims
-            r#"{"t":"setSlice","dim":2,"fixed":{"y":1}}"#,   // dim disagrees (2D + 1 fixed = 1D)
+            r#"{"t":"setSlice","fixed":{"z":1}}"#, // z does not exist in 2D
+            r#"{"t":"setSlice","fixed":{"x":1,"y":2}}"#, // would leave 0 dims
+            r#"{"t":"setSlice","dim":2,"fixed":{"y":1}}"#, // dim disagrees (2D + 1 fixed = 1D)
             r#"{"t":"setSlice","fixed":3}"#,
             r#"{"t":"setSlice"}"#,
         ] {
@@ -2170,22 +2936,46 @@ mod tests {
     fn slice_follows_mode_round_trips_with_one_report_each() {
         let mut a = app();
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
-        cmd(&mut a, r#"{"t":"setExpr","id":"s","latex":"x^2+y^2+z^2=4"}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setExpr","id":"s","latex":"x^2+y^2+z^2=4"}"#,
+        );
         cmd(&mut a, r#"{"t":"setSlice","fixed":"y=1,z=0.5"}"#);
         settle(&mut a);
-        assert_eq!(a.panel.as_ref().map(|p| p.axes[1].clone()), Some("f".into()), "line slice in 3D");
-        let seq = [("2d", false), ("3d", true), ("1d", false), ("2d", false), ("3d", true)];
+        assert_eq!(
+            a.panel.as_ref().map(|p| p.axes[1].clone()),
+            Some("f".into()),
+            "line slice in 3D"
+        );
+        let seq = [
+            ("2d", false),
+            ("3d", true),
+            ("1d", false),
+            ("2d", false),
+            ("3d", true),
+        ];
         for (m, active) in seq {
             let mut ev = cmd(&mut a, &format!(r#"{{"t":"setMode","mode":"{m}"}}"#));
             settle(&mut a);
-            ev.extend(a.take_events().into_iter().map(|e| serde_json::to_value(e).unwrap()));
+            ev.extend(
+                a.take_events()
+                    .into_iter()
+                    .map(|e| serde_json::to_value(e).unwrap()),
+            );
             let slices: Vec<_> = ev.iter().filter(|e| e["t"] == "slice").collect();
-            assert_eq!(slices.len(), 1, "{m}: exactly one slice report, got {slices:?}");
+            assert_eq!(
+                slices.len(),
+                1,
+                "{m}: exactly one slice report, got {slices:?}"
+            );
             assert_eq!(slices[0]["active"], active, "{m}");
             assert!(!ev.iter().any(|e| e["t"] == "error"), "{m}: no error event");
             if !active {
                 let msg = slices[0]["error"].as_str().unwrap();
-                assert!(msg.starts_with("Slice paused") && !msg.contains("does not fit"), "{msg}");
+                assert!(
+                    msg.starts_with("Slice paused") && !msg.contains("does not fit"),
+                    "{msg}"
+                );
                 assert!(a.doc.slice.is_some(), "config kept while paused");
                 assert!(a.inset().is_none());
             } else {
@@ -2200,7 +2990,12 @@ mod tests {
             settle(&mut a);
             let a_ev = a.last_slice.clone().unwrap();
             match a_ev {
-                Event::Slice { active, dim: d, error, .. } => assert!(active && d == dim && error.is_none(), "{m}"),
+                Event::Slice {
+                    active,
+                    dim: d,
+                    error,
+                    ..
+                } => assert!(active && d == dim && error.is_none(), "{m}"),
                 _ => unreachable!(),
             }
         }
@@ -2208,7 +3003,10 @@ mod tests {
 
     /// Every slice event in `evs` must describe `fixed` (the config just set) when it is active.
     fn assert_slices_match(evs: &[serde_json::Value], fixed: &[(&str, f64)], ctx: &str) {
-        for e in evs.iter().filter(|e| e["t"] == "slice" && e["active"] == true) {
+        for e in evs
+            .iter()
+            .filter(|e| e["t"] == "slice" && e["active"] == true)
+        {
             let got: Vec<(String, f64)> = e["fixed"]
                 .as_object()
                 .unwrap()
@@ -2231,7 +3029,11 @@ mod tests {
             ev
         };
         step(&mut a, r#"{"t":"setMode","mode":"3d"}"#, &mut all);
-        step(&mut a, r#"{"t":"setExpr","id":"s","latex":"x^2+y^2+z^2=4"}"#, &mut all);
+        step(
+            &mut a,
+            r#"{"t":"setExpr","id":"s","latex":"x^2+y^2+z^2=4"}"#,
+            &mut all,
+        );
         step(&mut a, r#"{"t":"setSlice","fixed":"z=1"}"#, &mut all);
         step(&mut a, r#"{"t":"setMode","mode":"2d"}"#, &mut all);
         let ev = step(&mut a, r#"{"t":"setSlice","fixed":"x=2"}"#, &mut all);
@@ -2254,11 +3056,23 @@ mod tests {
         assert!(all.len() > mark);
         // A pending (undrained) frame()-raised report must not survive a later config change.
         let (x, y) = inset_center(&a);
-        cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"down","x":{x},"y":{y}}}"#));
-        cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"move","x":{},"y":{y}}}"#, x + 15.0));
+        cmd(
+            &mut a,
+            &format!(r#"{{"t":"pointer","phase":"down","x":{x},"y":{y}}}"#),
+        );
+        cmd(
+            &mut a,
+            &format!(
+                r#"{{"t":"pointer","phase":"move","x":{},"y":{y}}}"#,
+                x + 15.0
+            ),
+        );
         let n = a.now_ms;
         a.frame(n + 400_000.0);
-        assert!(a.outbox.iter().any(|e| matches!(e, Event::Slice { .. })), "pending frame report");
+        assert!(
+            a.outbox.iter().any(|e| matches!(e, Event::Slice { .. })),
+            "pending frame report"
+        );
         let ev = cmd(&mut a, r#"{"t":"setSlice","fixed":"x=2"}"#);
         assert_eq!(ev.iter().filter(|e| e["t"] == "slice").count(), 1, "{ev:?}");
         assert_slices_match(&ev, &[("x", 2.0)], "x=2 after pending");
@@ -2268,7 +3082,9 @@ mod tests {
         assert_eq!(last["active"], true, "{last}");
         assert_eq!(last["fixed"], serde_json::json!({"z": 1.0}), "{last}");
         match a.last_slice.clone().unwrap() {
-            Event::Slice { fixed, active, .. } => assert!(active && fixed.keys().collect::<Vec<_>>() == ["z"]),
+            Event::Slice { fixed, active, .. } => {
+                assert!(active && fixed.keys().collect::<Vec<_>>() == ["z"])
+            }
             _ => unreachable!(),
         }
     }
@@ -2277,14 +3093,26 @@ mod tests {
     fn drain_returns_events_raised_in_frame_and_dispatch_still_includes_them() {
         let mut a = app();
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
-        cmd(&mut a, r#"{"t":"setExpr","id":"s","latex":"x^2+y^2+z^2=4"}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setExpr","id":"s","latex":"x^2+y^2+z^2=4"}"#,
+        );
         cmd(&mut a, r#"{"t":"setSlice","fixed":"z=1"}"#);
         settle(&mut a);
         a.take_events();
         // A throttled inset re-sample runs inside frame(): its slice event is only pending.
         let (x, y) = inset_center(&a);
-        cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"down","x":{x},"y":{y}}}"#));
-        let ev = cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"move","x":{},"y":{y}}}"#, x - 60.0));
+        cmd(
+            &mut a,
+            &format!(r#"{{"t":"pointer","phase":"down","x":{x},"y":{y}}}"#),
+        );
+        let ev = cmd(
+            &mut a,
+            &format!(
+                r#"{{"t":"pointer","phase":"move","x":{},"y":{y}}}"#,
+                x - 60.0
+            ),
+        );
         assert!(ev.iter().all(|e| e["t"] != "slice"));
         settle(&mut a);
         // Frame-time events are pending, and a drain returns them once.
@@ -2292,10 +3120,19 @@ mod tests {
         assert!(v.iter().any(|e| e["t"] == "slice"), "{v:?}");
         assert_eq!(a.drain_json(), "[]");
         // Without a drain, dispatch carries them.
-        cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"move","x":{},"y":{y}}}"#, x - 120.0));
+        cmd(
+            &mut a,
+            &format!(
+                r#"{{"t":"pointer","phase":"move","x":{},"y":{y}}}"#,
+                x - 120.0
+            ),
+        );
         settle(&mut a);
         let ev = cmd(&mut a, r#"{"t":"setSlider","name":"q","value":1}"#);
-        assert!(ev.iter().any(|e| e["t"] == "slice"), "pending frame events ride along on dispatch");
+        assert!(
+            ev.iter().any(|e| e["t"] == "slice"),
+            "pending frame events ride along on dispatch"
+        );
     }
 
     #[test]
@@ -2303,20 +3140,35 @@ mod tests {
         use crate::scene::label_box;
         let check = |a: &App, what: &str| {
             let r = a.inset().expect(what).rect;
-            let labs: Vec<_> = a.inset_screen_labels().into_iter().filter(|l| l.visible).collect();
+            let labs: Vec<_> = a
+                .inset_screen_labels()
+                .into_iter()
+                .filter(|l| l.visible)
+                .collect();
             let boxes: Vec<(String, [f64; 4])> = labs
                 .iter()
-                .map(|l| (l.text.clone(), label_box(l.axis, &l.text, l.x - r[0] as f64, l.y - r[1] as f64)))
+                .map(|l| {
+                    (
+                        l.text.clone(),
+                        label_box(l.axis, &l.text, l.x - r[0] as f64, l.y - r[1] as f64),
+                    )
+                })
                 .collect();
             let names = ["x", "y", "z", "f"];
-            assert!(boxes.iter().any(|(t, _)| names.contains(&t.as_str())), "{what}: axis names present");
+            assert!(
+                boxes.iter().any(|(t, _)| names.contains(&t.as_str())),
+                "{what}: axis names present"
+            );
             for (i, (ta, ba)) in boxes.iter().enumerate() {
                 for (tb, bb) in boxes.iter().skip(i + 1) {
                     if !names.contains(&ta.as_str()) && !names.contains(&tb.as_str()) {
                         continue; // tick vs tick is not what this checks
                     }
                     let overlap = ba[0] < bb[2] && bb[0] < ba[2] && ba[1] < bb[3] && bb[1] < ba[3];
-                    assert!(!overlap, "{what}: labels {ta:?} {ba:?} and {tb:?} {bb:?} overlap");
+                    assert!(
+                        !overlap,
+                        "{what}: labels {ta:?} {ba:?} and {tb:?} {bb:?} overlap"
+                    );
                 }
             }
         };
@@ -2331,7 +3183,13 @@ mod tests {
             settle(&mut a);
             check(&a, what);
             // Panned and zoomed insets, including the value axis of the line slice sitting at an edge.
-            for view in ["[-2,6,-1,3]", "[0.5,4.5,-3,0.2]", "[-9,-1,2,6]", "[-0.5,0.5,-0.2,0.2]", "[-4,4,-40,0.1]"] {
+            for view in [
+                "[-2,6,-1,3]",
+                "[0.5,4.5,-3,0.2]",
+                "[-9,-1,2,6]",
+                "[-0.5,0.5,-0.2,0.2]",
+                "[-4,4,-40,0.1]",
+            ] {
                 cmd(&mut a, &format!(r#"{{"t":"setSliceView","view":{view}}}"#));
                 settle(&mut a);
                 check(&a, &format!("{what} panned {view}"));
@@ -2354,15 +3212,24 @@ mod tests {
         cmd(&mut a, r#"{"t":"setExpr","id":"p","latex":"y=x^2"}"#);
         cmd(&mut a, r#"{"t":"setSlice","fixed":"y=1"}"#);
         let ev = cmd(&mut a, r#"{"t":"export"}"#);
-        let json = ev.iter().find(|e| e["t"] == "doc").unwrap()["json"].as_str().unwrap().to_string();
+        let json = ev.iter().find(|e| e["t"] == "doc").unwrap()["json"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(json.contains("\"slice\""));
         let mut b = app();
-        cmd(&mut b, &serde_json::json!({"t":"loadDoc","json":json}).to_string());
+        cmd(
+            &mut b,
+            &serde_json::json!({"t":"loadDoc","json":json}).to_string(),
+        );
         assert_eq!(b.doc.slice, a.doc.slice);
         assert!(b.inset().is_some());
         // A v1 document written before slices existed has no `slice` key.
         let old = r#"{"v":1,"view":{"mode":"2d","window":{"min":[-10,-10,-10],"max":[10,10,10]},"angle":"rad"},"items":[]}"#;
-        let ev = cmd(&mut b, &serde_json::json!({"t":"loadDoc","json":old}).to_string());
+        let ev = cmd(
+            &mut b,
+            &serde_json::json!({"t":"loadDoc","json":old}).to_string(),
+        );
         assert!(!has(&ev, "error"), "{ev:?}");
         assert!(b.doc.slice.is_none() && b.inset().is_none());
     }
@@ -2375,9 +3242,21 @@ mod tests {
         let r = a.inset().unwrap().rect;
         let (x, y) = ((r[0] + r[2] / 2) as f64, (r[1] + r[3] / 2) as f64);
         let before = a.rig.window();
-        cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"down","x":{x},"y":{y}}}"#));
-        cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"move","x":{},"y":{y}}}"#, x - 40.0));
-        cmd(&mut a, &format!(r#"{{"t":"wheel","x":{x},"y":{y},"dy":-300}}"#));
+        cmd(
+            &mut a,
+            &format!(r#"{{"t":"pointer","phase":"down","x":{x},"y":{y}}}"#),
+        );
+        cmd(
+            &mut a,
+            &format!(
+                r#"{{"t":"pointer","phase":"move","x":{},"y":{y}}}"#,
+                x - 40.0
+            ),
+        );
+        cmd(
+            &mut a,
+            &format!(r#"{{"t":"wheel","x":{x},"y":{y},"dy":-300}}"#),
+        );
         assert_eq!(a.rig.window(), before);
         // Elsewhere it still pans.
         cmd(&mut a, r#"{"t":"pointer","phase":"down","x":100,"y":100}"#);
@@ -2405,9 +3284,21 @@ mod tests {
         assert!(a.panel.as_ref().unwrap().follow);
         // Drag the inset left by 60 px: the view window moves right (content follows the pointer).
         a.frame(1000.0);
-        cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"down","x":{x},"y":{y}}}"#));
-        let ev = cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"move","x":{},"y":{y}}}"#, x - 60.0));
-        assert!(ev.iter().all(|e| e["t"] != "slice"), "re-sample is throttled to frame()");
+        cmd(
+            &mut a,
+            &format!(r#"{{"t":"pointer","phase":"down","x":{x},"y":{y}}}"#),
+        );
+        let ev = cmd(
+            &mut a,
+            &format!(
+                r#"{{"t":"pointer","phase":"move","x":{},"y":{y}}}"#,
+                x - 60.0
+            ),
+        );
+        assert!(
+            ev.iter().all(|e| e["t"] != "slice"),
+            "re-sample is throttled to frame()"
+        );
         a.frame(1200.0);
         let ev = a.take_events();
         let s = ev.iter().rev().find_map(|e| match e {
@@ -2417,11 +3308,17 @@ mod tests {
         let (view, follow) = s.expect("slice event after the drag");
         assert!(!follow);
         let v1 = view.unwrap();
-        assert!(v1[0] > v0[0] + 0.1 && (v1[1] - v1[0] - (v0[1] - v0[0])).abs() < 1e-9, "{v0:?} -> {v1:?}");
+        assert!(
+            v1[0] > v0[0] + 0.1 && (v1[1] - v1[0] - (v0[1] - v0[0])).abs() < 1e-9,
+            "{v0:?} -> {v1:?}"
+        );
         cmd(&mut a, r#"{"t":"pointer","phase":"up","x":0,"y":0}"#);
         assert_eq!(a.rig.window(), main, "the main scene did not move");
         // Wheel zoom in at the centre halves-ish the horizontal span.
-        cmd(&mut a, &format!(r#"{{"t":"wheel","x":{x},"y":{y},"dy":-400}}"#));
+        cmd(
+            &mut a,
+            &format!(r#"{{"t":"wheel","x":{x},"y":{y},"dy":-400}}"#),
+        );
         a.frame(2000.0);
         let v2 = a.panel.as_ref().unwrap().view;
         assert!(v2[1] - v2[0] < 0.6 * (v1[1] - v1[0]), "{v1:?} -> {v2:?}");
@@ -2434,10 +3331,19 @@ mod tests {
         assert_eq!(a.panel.as_ref().unwrap().view, v2);
         // Double-click returns to following.
         a.frame(4000.0);
-        cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"down","x":{x},"y":{y}}}"#));
-        cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"up","x":{x},"y":{y}}}"#));
+        cmd(
+            &mut a,
+            &format!(r#"{{"t":"pointer","phase":"down","x":{x},"y":{y}}}"#),
+        );
+        cmd(
+            &mut a,
+            &format!(r#"{{"t":"pointer","phase":"up","x":{x},"y":{y}}}"#),
+        );
         a.frame(4100.0);
-        cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"down","x":{x},"y":{y}}}"#));
+        cmd(
+            &mut a,
+            &format!(r#"{{"t":"pointer","phase":"down","x":{x},"y":{y}}}"#),
+        );
         assert!(a.panel.as_ref().unwrap().follow);
         // resetSliceView does the same, and setSliceView sets an exact window.
         let ev = cmd(&mut a, r#"{"t":"setSliceView","min":[-1,-2],"max":[3,6]}"#);
@@ -2447,11 +3353,17 @@ mod tests {
         let ev = cmd(&mut a, r#"{"t":"resetSliceView"}"#);
         assert_eq!(slice_ev(&ev).unwrap()["follow"], true);
         // Bad views are errors.
-        for bad in [r#"{"t":"setSliceView","min":[1,0],"max":[0,1]}"#, r#"{"t":"setSliceView"}"#] {
+        for bad in [
+            r#"{"t":"setSliceView","min":[1,0],"max":[0,1]}"#,
+            r#"{"t":"setSliceView"}"#,
+        ] {
             assert!(has(&cmd(&mut a, bad), "error"), "{bad}");
         }
         cmd(&mut a, r#"{"t":"clearSlice"}"#);
-        assert!(has(&cmd(&mut a, r#"{"t":"setSliceView","view":[0,1,0,1]}"#), "error"));
+        assert!(has(
+            &cmd(&mut a, r#"{"t":"setSliceView","view":[0,1,0,1]}"#),
+            "error"
+        ));
     }
 
     #[test]
@@ -2460,14 +3372,25 @@ mod tests {
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
         a.frame(0.0);
         a.frame(2000.0);
-        cmd(&mut a, r#"{"t":"setExpr","id":"p","latex":"x^2+y^2+z^2=4"}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setExpr","id":"p","latex":"x^2+y^2+z^2=4"}"#,
+        );
         cmd(&mut a, r#"{"t":"setSlice","fixed":"z=1"}"#);
         let r = a.inset().unwrap().rect;
         let ev = cmd(&mut a, r#"{"t":"setSliceView","view":[-1,1,-100,100]}"#);
-        let v: Vec<f64> = slice_ev(&ev).unwrap()["view"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+        let v: Vec<f64> = slice_ev(&ev).unwrap()["view"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap())
+            .collect();
         assert_eq!((v[0], v[1]), (-1.0, 1.0));
         let aspect = r[2] as f64 / r[3] as f64;
-        assert!(((v[1] - v[0]) / (v[3] - v[2]) - aspect).abs() < 1e-9, "vertical span refit to the aspect: {v:?}");
+        assert!(
+            ((v[1] - v[0]) / (v[3] - v[2]) - aspect).abs() < 1e-9,
+            "vertical span refit to the aspect: {v:?}"
+        );
         // A new slice through other axes goes back to following.
         let ev = cmd(&mut a, r#"{"t":"setSlice","fixed":"y=1"}"#);
         assert_eq!(slice_ev(&ev).unwrap()["follow"], true);
@@ -2481,11 +3404,17 @@ mod tests {
         cmd(&mut a, r#"{"t":"setSlice","fixed":"y=1"}"#);
         let check = |a: &App, what: &str| -> usize {
             let r = a.inset().unwrap().rect;
-            let labels: Vec<_> = a.inset_screen_labels().into_iter().filter(|l| l.visible).collect();
+            let labels: Vec<_> = a
+                .inset_screen_labels()
+                .into_iter()
+                .filter(|l| l.visible)
+                .collect();
             assert!(!labels.is_empty(), "{what}: no visible inset labels");
             for l in &labels {
                 let (x, y) = (l.x - r[0] as f64, l.y - r[1] as f64);
-                assert!(l.inset && l.clip == Some([r[0] as f64, r[1] as f64, r[2] as f64, r[3] as f64]));
+                assert!(
+                    l.inset && l.clip == Some([r[0] as f64, r[1] as f64, r[2] as f64, r[3] as f64])
+                );
                 assert!(
                     label_box_inside(l.axis, &l.text, x, y, r[2] as f64, r[3] as f64),
                     "{what}: label {:?} at ({x:.1},{y:.1}) leaves {}x{}",
@@ -2497,22 +3426,41 @@ mod tests {
             // Hidden labels are exactly the ones that would leave the rectangle.
             for l in a.inset_screen_labels().iter().filter(|l| !l.visible) {
                 let (x, y) = (l.x - r[0] as f64, l.y - r[1] as f64);
-                assert!(!label_box_inside(l.axis, &l.text, x, y, r[2] as f64, r[3] as f64) || x < 0.0 || y < 0.0 || x > r[2] as f64 || y > r[3] as f64);
+                assert!(
+                    !label_box_inside(l.axis, &l.text, x, y, r[2] as f64, r[3] as f64)
+                        || x < 0.0
+                        || y < 0.0
+                        || x > r[2] as f64
+                        || y > r[3] as f64
+                );
             }
             labels.len()
         };
         let n0 = check(&a, "follow");
         assert!(n0 >= 4);
         // Axis names are among them.
-        assert!(a.inset_screen_labels().iter().any(|l| l.visible && l.text == "x"));
-        assert!(a.inset_screen_labels().iter().any(|l| l.visible && l.text == "f"));
+        assert!(a
+            .inset_screen_labels()
+            .iter()
+            .any(|l| l.visible && l.text == "x"));
+        assert!(a
+            .inset_screen_labels()
+            .iter()
+            .any(|l| l.visible && l.text == "f"));
         // Zoomed far into a corner (the zero axes are off screen): tick labels are re-laid out.
         cmd(&mut a, r#"{"t":"setSliceView","view":[40,60,300,500]}"#);
         check(&a, "far from the origin");
-        let ticks: Vec<String> =
-            a.inset_screen_labels().into_iter().filter(|l| l.visible && l.text != "x" && l.text != "f").map(|l| l.text).collect();
+        let ticks: Vec<String> = a
+            .inset_screen_labels()
+            .into_iter()
+            .filter(|l| l.visible && l.text != "x" && l.text != "f")
+            .map(|l| l.text)
+            .collect();
         assert!(ticks.iter().any(|t| t == "50"), "{ticks:?}");
-        cmd(&mut a, r#"{"t":"setSliceView","view":[-0.001,0.001,-0.0004,0.0004]}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setSliceView","view":[-0.001,0.001,-0.0004,0.0004]}"#,
+        );
         check(&a, "tiny window");
         // A plane slice too.
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
@@ -2527,29 +3475,252 @@ mod tests {
     #[test]
     fn slice_constant_uses_regression_parameters_and_tracks_refits() {
         let mut a = app();
-        cmd(&mut a, r#"{"t":"addTable","id":"t","columns":["x_1","y_1"],"data":[[1,3],[2,5],[3,7],[4,9]]}"#);
-        cmd(&mut a, r#"{"t":"setExpr","id":"r","latex":"y_1 ~ a x_1 + b"}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"addTable","id":"t","columns":["x_1","y_1"],"data":[[1,3],[2,5],[3,7],[4,9]]}"#,
+        );
+        cmd(
+            &mut a,
+            r#"{"t":"setExpr","id":"r","latex":"y_1 ~ a x_1 + b"}"#,
+        );
         cmd(&mut a, r#"{"t":"setExpr","id":"p","latex":"y=x^2"}"#);
         let ev = cmd(&mut a, r#"{"t":"setSlice","fixed":"y=a+b"}"#);
         let s = slice_ev(&ev).unwrap();
         assert_eq!(s["active"], true, "{s}");
-        assert!((s["fixed"]["y"].as_f64().unwrap() - 3.0).abs() < 1e-6, "{s}");
+        assert!(
+            (s["fixed"]["y"].as_f64().unwrap() - 3.0).abs() < 1e-6,
+            "{s}"
+        );
         assert_eq!(s["points"], 2, "x^2 = 3 has two roots");
         // Refit: the data now lies on y = 3x + 1, so a + b = 4.
         let mut last = None;
         for (row, y) in [(0, 4), (1, 7), (2, 10), (3, 13)] {
-            let ev = cmd(&mut a, &format!(r#"{{"t":"setCell","id":"t","row":{row},"col":1,"value":{y}}}"#));
+            let ev = cmd(
+                &mut a,
+                &format!(r#"{{"t":"setCell","id":"t","row":{row},"col":1,"value":{y}}}"#),
+            );
             if let Some(s) = slice_ev(&ev) {
                 last = Some(s.clone());
             }
         }
         let s = last.expect("slice event follows the refit");
-        assert!((s["fixed"]["y"].as_f64().unwrap() - 4.0).abs() < 1e-6, "{s}");
+        assert!(
+            (s["fixed"]["y"].as_f64().unwrap() - 4.0).abs() < 1e-6,
+            "{s}"
+        );
         // Hiding the regression removes the parameters: the slice reports an error, no panic.
         let ev = cmd(&mut a, r#"{"t":"setHidden","id":"r","hidden":true}"#);
         let s = slice_ev(&ev).unwrap();
         assert_eq!(s["active"], false);
         assert!(s["error"].is_string());
     }
-}
 
+    fn style_of(a: &App, id: &str) -> doc::ItemStyle {
+        a.doc
+            .items
+            .iter()
+            .find(|i| i.id == id)
+            .unwrap()
+            .style
+            .clone()
+    }
+
+    fn error_msg(ev: &[serde_json::Value]) -> Option<String> {
+        ev.iter()
+            .find(|e| e["t"] == "error")
+            .map(|e| e["message"].as_str().unwrap_or("").to_string())
+    }
+
+    #[test]
+    fn set_style_merges_resets_and_validates() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"p","latex":"(1,2)"}"#);
+        let n0 = a.layers()[0].geometry.segments.len();
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"setStyle","id":"p","style":{"pointStyle":"circle","pointSize":14,"showLabel":true,"label":"P"}}"#,
+        );
+        assert!(error_msg(&ev).is_none(), "{ev:?}");
+        assert!(has(&ev, "labels"), "rebuilt");
+        let st = style_of(&a, "p");
+        assert_eq!(st.point_style, Some(doc::PointStyle::Circle));
+        assert_eq!((st.point_size, st.show_label), (Some(14.0), true));
+        assert!(a.layers()[0].geometry.segments.len() > n0, "ring drawn");
+        assert!(a
+            .screen_labels()
+            .iter()
+            .any(|l| l.axis == crate::scene::ITEM_LABEL_AXIS && l.text == "P" && l.visible));
+        // Merge keeps the other keys; null resets one.
+        cmd(
+            &mut a,
+            r#"{"t":"setStyle","id":"p","style":{"lineStyle":"dashed","opacity":0.5}}"#,
+        );
+        let st = style_of(&a, "p");
+        assert_eq!(st.line_style, Some(doc::LineStyle::Dashed));
+        assert_eq!(st.point_size, Some(14.0));
+        cmd(
+            &mut a,
+            r#"{"t":"setStyle","id":"p","style":{"pointSize":null,"showLabel":null,"label":null}}"#,
+        );
+        let st = style_of(&a, "p");
+        assert!(st.point_size.is_none() && !st.show_label && st.label.is_none());
+        assert_eq!(st.opacity, Some(0.5));
+        // Bad values and unknown ids/keys: an error and no change.
+        let before = style_of(&a, "p");
+        for bad in [
+            r#"{"t":"setStyle","id":"p","style":{"pointSize":0}}"#,
+            r#"{"t":"setStyle","id":"p","style":{"pointSize":41}}"#,
+            r#"{"t":"setStyle","id":"p","style":{"opacity":2}}"#,
+            r#"{"t":"setStyle","id":"p","style":{"fillOpacity":-1}}"#,
+            r#"{"t":"setStyle","id":"p","style":{"lineWidth":0.1}}"#,
+            r#"{"t":"setStyle","id":"p","style":{"lineWidth":30}}"#,
+            r#"{"t":"setStyle","id":"p","style":{"lineStyle":"wavy"}}"#,
+            r#"{"t":"setStyle","id":"p","style":{"showLabel":"yes"}}"#,
+            r#"{"t":"setStyle","id":"p","style":{"colour":"red"}}"#,
+            r#"{"t":"setStyle","id":"p","style":{"opacity":0.2,"pointSize":99}}"#,
+            r#"{"t":"setStyle","id":"nope","style":{"opacity":0.2}}"#,
+            r#"{"t":"setStyle","id":"p","style":3}"#,
+        ] {
+            let ev = cmd(&mut a, bad);
+            assert!(error_msg(&ev).is_some(), "{bad}: {ev:?}");
+            assert_eq!(style_of(&a, "p"), before, "{bad}");
+        }
+        assert!(
+            error_msg(&cmd(&mut a, r#"{"t":"setStyle","id":"nope","style":{}}"#))
+                .unwrap()
+                .contains("nope")
+        );
+        // Tables too, and the style survives export.
+        cmd(&mut a, r#"{"t":"addTable","id":"t","data":[[1,2],[3,4]]}"#);
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"setStyle","id":"t","style":{"pointStyle":"square","lineWidth":4,"fillOpacity":0.3}}"#,
+        );
+        assert!(error_msg(&ev).is_none(), "{ev:?}");
+        let ev = cmd(&mut a, r#"{"t":"export"}"#);
+        let json = ev.iter().find(|e| e["t"] == "doc").unwrap()["json"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let back = doc::from_json(&json).unwrap();
+        let t = back.items.iter().find(|i| i.id == "t").unwrap();
+        assert_eq!(t.style.point_style, Some(doc::PointStyle::Square));
+        assert_eq!(
+            (t.style.line_width, t.style.fill_opacity),
+            (Some(4.0), Some(0.3))
+        );
+        assert!(json.contains("\"lineStyle\":\"dashed\""));
+    }
+
+    #[test]
+    fn set_folder_files_items_and_hidden_folders_hide_them() {
+        let mut a = app();
+        cmd(
+            &mut a,
+            r#"{"t":"addItem","id":"f","kind":"folder","latex":"F"}"#,
+        );
+        cmd(
+            &mut a,
+            r#"{"t":"addItem","id":"g","kind":"folder","latex":"G"}"#,
+        );
+        cmd(&mut a, r#"{"t":"setExpr","id":"c","latex":"y=x^2"}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"n","latex":"note"}"#);
+        let ev = cmd(&mut a, r#"{"t":"setFolder","id":"c","folder":"f"}"#);
+        assert!(error_msg(&ev).is_none(), "{ev:?}");
+        assert_eq!(a.doc.items[2].folder.as_deref(), Some("f"));
+        let drawn = |a: &App| a.colors.iter().any(|c| c.id == "c");
+        assert!(drawn(&a));
+        cmd(&mut a, r#"{"t":"setHidden","id":"f","hidden":true}"#);
+        assert!(!drawn(&a), "hidden folder hides its items");
+        cmd(&mut a, r#"{"t":"setHidden","id":"f","hidden":false}"#);
+        assert!(drawn(&a));
+        for bad in [
+            r#"{"t":"setFolder","id":"c","folder":"c"}"#,
+            r#"{"t":"setFolder","id":"c","folder":"n"}"#,
+            r#"{"t":"setFolder","id":"c","folder":"zz"}"#,
+            r#"{"t":"setFolder","id":"zz","folder":"f"}"#,
+            r#"{"t":"setFolder","id":"g","folder":"f"}"#,
+            r#"{"t":"setFolder","id":"f","folder":"f"}"#,
+        ] {
+            assert!(error_msg(&cmd(&mut a, bad)).is_some(), "{bad}");
+            assert_eq!(a.doc.items[2].folder.as_deref(), Some("f"), "{bad}");
+        }
+        cmd(&mut a, r#"{"t":"setFolder","id":"c","folder":null}"#);
+        assert!(a.doc.items[2].folder.is_none());
+        cmd(&mut a, r#"{"t":"setFolder","id":"c","folder":"g"}"#);
+        cmd(&mut a, r#"{"t":"setFolder","id":"c"}"#);
+        assert!(a.doc.items[2].folder.is_none(), "missing folder un-files");
+        assert!(a.doc.validate().is_ok());
+    }
+
+    #[test]
+    fn set_view_flags_and_window() {
+        let mut a = app();
+        let view = |ev: &[serde_json::Value]| ev.iter().rev().find(|e| e["t"] == "view").cloned();
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"setView","grid":false,"axisNumbers":false}"#,
+        );
+        let v = view(&ev).expect("view event");
+        assert_eq!(
+            (v["grid"].clone(), v["axes"].clone()),
+            (false.into(), true.into())
+        );
+        assert_eq!(v["axisNumbers"], false);
+        assert!(a.screen_labels().is_empty(), "no tick numbers");
+        cmd(&mut a, r#"{"t":"setView","axes":false,"axisNumbers":true}"#);
+        assert!(!a.doc.view.grid && !a.doc.view.axes && a.doc.view.axis_numbers);
+        assert!(
+            a.layers()[0].geometry.segments.is_empty(),
+            "no grid, no axes in 2D"
+        );
+        // Window: exactly what the event and export report afterwards.
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"setView","window":{"min":[-2,-1,-3],"max":[6,3,3]}}"#,
+        );
+        let v = view(&ev).unwrap();
+        assert_eq!(v["min"], serde_json::json!([-2.0, -1.0, -3.0]));
+        assert_eq!(v["max"], serde_json::json!([6.0, 3.0, 3.0]));
+        let ev = cmd(&mut a, r#"{"t":"export"}"#);
+        let json = ev.iter().find(|e| e["t"] == "doc").unwrap()["json"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let d = doc::from_json(&json).unwrap();
+        assert_eq!(d.view.window.min, [-2.0, -1.0, -3.0]);
+        assert_eq!(d.view.window.max, [6.0, 3.0, 3.0]);
+        assert!(!d.view.grid && !d.view.axes && d.view.axis_numbers);
+        assert!(json.contains("\"grid\":false") && !json.contains("axisNumbers"));
+        // Loading the same window gives the same camera.
+        let mut b = app();
+        cmd(
+            &mut b,
+            &serde_json::json!({"t": "loadDoc", "json": json}).to_string(),
+        );
+        assert_eq!(b.rig.window().min, a.rig.window().min);
+        assert_eq!(b.rig.render_origin(), a.rig.render_origin());
+        // Items, sliders and the mode are untouched; bad windows are errors and change nothing.
+        cmd(&mut a, r#"{"t":"setExpr","id":"e","latex":"y=x"}"#);
+        cmd(&mut a, r#"{"t":"setSlider","name":"k","value":2}"#);
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        a.frame(10_000.0);
+        cmd(
+            &mut a,
+            r#"{"t":"setView","window":{"min":[-1,-1,-1],"max":[1,1,1]}}"#,
+        );
+        assert_eq!(a.mode(), Mode::D3);
+        assert_eq!(a.doc.items.len(), 1);
+        assert_eq!(a.doc.sliders["k"].value, 2.0);
+        for bad in [
+            r#"{"t":"setView","window":{"min":[1,-1,-1],"max":[1,1,1]}}"#,
+            r#"{"t":"setView","window":{"min":[0,0,0],"max":[1,1,-1]}}"#,
+            r#"{"t":"setView","window":{"min":[0,0],"max":[1,1]}}"#,
+            r#"{"t":"setView","grid":"no"}"#,
+        ] {
+            assert!(error_msg(&cmd(&mut a, bad)).is_some(), "{bad}");
+        }
+        assert_eq!(a.rig.window().max, [1.0, 1.0, 1.0]);
+        assert!(!a.doc.view.grid);
+    }
+}

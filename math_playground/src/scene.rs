@@ -23,23 +23,27 @@ use math_core::analyze::{analyze, Kind};
 use math_core::ast::{BinOp, Expr, Rel};
 use math_core::compile::{compile, Angle, Program};
 use math_core::complex::{compile_complex, parse_complex};
+use math_core::doc::{AngleMode, Doc, Item, ItemKind, ItemStyle, LineStyle, PointStyle};
 use math_core::list::{eval_value, Bindings, Value};
-use math_core::stats;
-use math_core::table::{ParsedColumn, TableStyle};
-use math_core::doc::{AngleMode, Doc, Item, ItemKind};
 use math_core::mesh;
 use math_core::parse::{parse_with, ParseCtx};
 use math_core::resolve::Defs;
 use math_core::slice::ResolvedSlice;
+use math_core::stats;
+use math_core::table::{ParsedColumn, TableStyle};
 use math_core::view::{Mode, Window3};
 use math_core::wgsl::emit_module;
 use math_core::wgsl_complex::{emit_complex_function, emit_domain_module, COMPLEX_PRELUDE};
 
 mod slice_draw;
-pub use slice_draw::{inset_rect, label_box, label_box_inside, SlicePanel, ViewReq, LABEL_CHAR_W, LABEL_GAP_X, LABEL_GAP_Y, LABEL_H, SLICE_COLOR};
+pub use slice_draw::{
+    inset_rect, label_box, label_box_inside, SlicePanel, ViewReq, LABEL_CHAR_W, LABEL_GAP_X,
+    LABEL_GAP_Y, LABEL_H, SLICE_COLOR,
+};
 
 use crate::geometry::{
-    FieldKind, FieldSpec, Label, MeshVertex, SceneGeometry, SegmentInstance, Theme, MAX_FIELD_PARAMS,
+    FieldKind, FieldSpec, Label, MeshVertex, SceneGeometry, SegmentInstance, Theme,
+    MAX_FIELD_PARAMS,
 };
 
 mod calc_draw;
@@ -81,6 +85,17 @@ const MAX_ARROWS_2D: usize = 4000;
 const MAX_LATTICE: usize = 12;
 /// Half-angle of an arrowhead's barbs.
 const BARB_ANGLE: f64 = 0.45;
+/// Alpha factor the field shader (and the CPU fallback) applies to an inequality fill; an item's
+/// `fillOpacity` is divided by it so that it becomes the effective opacity of the shading.
+const FILL_SHADER_ALPHA: f32 = 0.22;
+/// Most dash pieces one polyline may produce; the rest of a longer one is drawn solid.
+const MAX_DASH_PIECES: usize = 50_000;
+/// Most `showLabel` point labels per item.
+const MAX_POINT_LABELS: usize = 100;
+/// Label axis code of item labels (`showLabel`): 0/1 are x/y ticks, 2 the z ticks, 3 a title.
+pub const ITEM_LABEL_AXIS: u8 = 4;
+/// Segments of an open-circle point.
+const RING_SIDES: usize = 20;
 
 // ---------------------------------------------------------------------------------------------
 // Nice spacing and number formatting
@@ -90,7 +105,11 @@ const BARB_ANGLE: f64 = 0.45;
 /// about `target_px` pixels apart when `span` world units cover `px` pixels. Degenerate input
 /// (non-finite, zero) falls back to a spacing for a unit span.
 pub fn nice_step(span: f64, px: f64, target_px: f64) -> f64 {
-    let span = if span.is_finite() && span > 0.0 { span.abs() } else { 1.0 };
+    let span = if span.is_finite() && span > 0.0 {
+        span.abs()
+    } else {
+        1.0
+    };
     let px = if px.is_finite() && px >= 1.0 { px } else { 1.0 };
     let raw = span / px * target_px;
     let e = raw.log10().floor().clamp(-300.0, 300.0);
@@ -145,7 +164,11 @@ pub fn format_tick(v: f64, step: f64) -> String {
     if !v.is_finite() {
         return String::new();
     }
-    let step = if step.is_finite() && step > 0.0 { step } else { 1.0 };
+    let step = if step.is_finite() && step > 0.0 {
+        step
+    } else {
+        1.0
+    };
     if v.abs() < step * 1e-6 {
         return "0".to_string();
     }
@@ -188,7 +211,9 @@ fn multiples(lo: f64, hi: f64, step: f64) -> Vec<(i64, f64)> {
     if !(k0.is_finite() && k1.is_finite()) || k1 - k0 > MAX_LINES as f64 {
         return Vec::new();
     }
-    (k0 as i64..=k1 as i64).map(|k| (k, k as f64 * step)).collect()
+    (k0 as i64..=k1 as i64)
+        .map(|k| (k, k as f64 * step))
+        .collect()
 }
 
 fn parse_hex_color(s: &str) -> Option<[f32; 4]> {
@@ -196,7 +221,11 @@ fn parse_hex_color(s: &str) -> Option<[f32; 4]> {
     if h.len() != 6 || !h.is_ascii() {
         return None;
     }
-    let c = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok().map(|v| v as f32 / 255.0);
+    let c = |i: usize| {
+        u8::from_str_radix(&h[i..i + 2], 16)
+            .ok()
+            .map(|v| v as f32 / 255.0)
+    };
     Some([c(0)?, c(2)?, c(4)?, 1.0])
 }
 
@@ -209,6 +238,74 @@ fn parse_hex_color(s: &str) -> Option<[f32; 4]> {
 struct Style {
     color: [f32; 4],
     line_w: f32,
+    /// Dash pattern `(on, off)` in pixels along the curve (`on == 0` draws dots); `None` is solid.
+    dash: Option<(f64, f64)>,
+    /// Marker of the item's points and its diameter in pixels.
+    point: PointStyle,
+    point_size: f32,
+    /// Effective opacity of an inequality fill (`None`: the built-in shading).
+    fill: Option<f32>,
+}
+
+impl Style {
+    /// Solid lines, dot markers of the default size, default fill.
+    fn new(color: [f32; 4], line_w: f32) -> Style {
+        Style {
+            color,
+            line_w,
+            dash: None,
+            point: PointStyle::Dot,
+            point_size: DOT_W,
+            fill: None,
+        }
+    }
+
+    /// The style of an item with resolved `color` (opacity already applied).
+    fn for_item(s: &ItemStyle, color: [f32; 4]) -> Style {
+        let line_w = s.line_width.map(|w| w as f32).unwrap_or(CURVE_W);
+        let w = line_w as f64;
+        // Segments have round caps of radius w/2, so the visible dash is `on + w` long and the
+        // visible gap `off - w`.
+        let dash = match s.line_style {
+            Some(LineStyle::Dashed) => {
+                let (on, off) = ((3.0 * w).max(8.0), (2.0 * w).max(5.0));
+                Some(((on - w).max(1.0), off + w))
+            }
+            Some(LineStyle::Dotted) => Some((0.0, (2.5 * w).max(4.0))),
+            _ => None,
+        };
+        Style {
+            color,
+            line_w,
+            dash,
+            point: s.point_style.unwrap_or(PointStyle::Dot),
+            point_size: s.point_size.map(|v| v as f32).unwrap_or(DOT_W),
+            fill: s.fill_opacity.map(|v| v.clamp(0.0, 1.0) as f32),
+        }
+    }
+}
+
+/// Per-build settings of the [`Builder`] beyond the window (view flags, point labels).
+struct BuildExt {
+    mode: Mode,
+    grid: bool,
+    axes: bool,
+    axis_numbers: bool,
+    /// `showLabel` of the item being drawn: custom text (or `None` for coordinates) and how many
+    /// labels it may still place.
+    labels: Option<(Option<String>, usize)>,
+}
+
+impl Default for BuildExt {
+    fn default() -> Self {
+        BuildExt {
+            mode: Mode::D2,
+            grid: true,
+            axes: true,
+            axis_numbers: true,
+            labels: None,
+        }
+    }
 }
 
 struct Prepared<'a> {
@@ -240,6 +337,8 @@ struct Builder<'a> {
     pdefs: Defs,
     /// Current slider values by name.
     sliders: BTreeMap<String, f64>,
+    /// Mode, view flags and per-item label state.
+    ext: BuildExt,
 }
 
 /// WGSL expression reading slider parameter `i` from the field uniform.
@@ -256,7 +355,9 @@ fn is_listish(e: &Expr) -> bool {
         Expr::Num(_) | Expr::Var(_) => false,
         Expr::List(_) => true,
         Expr::Call(n, args) => {
-            matches!(n.as_str(), "range" | "for" | "index") || STAT_PLOTS.contains(&n.as_str()) || args.iter().any(is_listish)
+            matches!(n.as_str(), "range" | "for" | "index")
+                || STAT_PLOTS.contains(&n.as_str())
+                || args.iter().any(is_listish)
         }
         Expr::Neg(a) => is_listish(a),
         Expr::Bin(_, a, b) | Expr::Rel(_, a, b) => is_listish(a) || is_listish(b),
@@ -269,7 +370,11 @@ fn is_listish(e: &Expr) -> bool {
 /// for a constant list. `data` is non-empty and finite.
 fn default_bin_width(data: &[f64]) -> f64 {
     let n = data.len() as f64;
-    let (mn, mx) = data.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, v| (a.0.min(*v), a.1.max(*v)));
+    let (mn, mx) = data
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |a, v| {
+            (a.0.min(*v), a.1.max(*v))
+        });
     let range = mx - mn;
     if range <= 0.0 {
         return 1.0;
@@ -289,7 +394,11 @@ fn default_bin_width(data: &[f64]) -> f64 {
 /// Equal-width bins aligned to multiples of `w` (left-closed, so `[k*w, (k+1)*w)`; the maximum
 /// lands in the last bin). Returns `(start, w, bins)` with each bin holding its values.
 fn bin_values(data: &[f64], width: Option<f64>) -> Result<(f64, f64, Vec<Vec<f64>>), String> {
-    let (mn, mx) = data.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, v| (a.0.min(*v), a.1.max(*v)));
+    let (mn, mx) = data
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |a, v| {
+            (a.0.min(*v), a.1.max(*v))
+        });
     let w = match width {
         Some(w) if w.is_finite() && w > 0.0 => w,
         Some(_) => return Err("the bin width must be a positive number".to_string()),
@@ -299,7 +408,9 @@ fn bin_values(data: &[f64], width: Option<f64>) -> Result<(f64, f64, Vec<Vec<f64
     let slot = |v: f64| (((v - start) / w) + 1e-9).floor().max(0.0);
     let nb = slot(mx) + 1.0;
     if nb.is_nan() || nb > MAX_BINS as f64 {
-        return Err(format!("too many bins (more than {MAX_BINS}); use a larger bin width"));
+        return Err(format!(
+            "too many bins (more than {MAX_BINS}); use a larger bin width"
+        ));
     }
     let nb = nb as usize;
     let mut bins = vec![Vec::new(); nb];
@@ -321,7 +432,9 @@ impl<'a> Builder<'a> {
     fn seg(&mut self, a: [f64; 3], b: [f64; 3], w: f32, color: [f32; 4]) {
         let (p0, p1) = (self.rb(a), self.rb(b));
         if p0.iter().chain(p1.iter()).all(|v| v.is_finite()) {
-            self.out.segments.push(SegmentInstance::new(p0, p1, w, color));
+            self.out
+                .segments
+                .push(SegmentInstance::new(p0, p1, w, color));
         }
     }
 
@@ -334,7 +447,8 @@ impl<'a> Builder<'a> {
     /// them after the lit mesh and fields with depth TEST but no depth WRITE, so translucent
     /// bars neither hide the grid/curves nor depend on draw order.
     fn quad(&mut self, x0: f64, x1: f64, y0: f64, y1: f64, color: [f32; 4]) {
-        let corners = [[x0, y0, 0.0], [x1, y0, 0.0], [x1, y1, 0.0], [x0, y1, 0.0]].map(|c| self.rb(c));
+        let corners =
+            [[x0, y0, 0.0], [x1, y0, 0.0], [x1, y1, 0.0], [x0, y1, 0.0]].map(|c| self.rb(c));
         if corners.iter().flatten().any(|v| !v.is_finite()) {
             return;
         }
@@ -342,7 +456,9 @@ impl<'a> Builder<'a> {
         for c in corners {
             self.out.vertices.push(MeshVertex::new(c, [0.0; 3], color));
         }
-        self.out.flat_indices.extend([0, 1, 2, 0, 2, 3].map(|i| i + base));
+        self.out
+            .flat_indices
+            .extend([0, 1, 2, 0, 2, 3].map(|i| i + base));
     }
 
     /// World units per pixel along y (an approximation in 3D, where scale varies).
@@ -362,8 +478,173 @@ impl<'a> Builder<'a> {
     }
 
     fn polyline(&mut self, pts: &[[f64; 3]], st: Style) {
+        if let Some((on, off)) = st.dash {
+            return self.dashed(pts, st, on, off);
+        }
         for w in pts.windows(2) {
             self.seg(w[0], w[1], st.line_w, st.color);
+        }
+    }
+
+    /// Pixels per world unit along each axis (3D: an approximation, the scale varies).
+    fn px_per_unit(&self) -> [f64; 3] {
+        let (vw, vh) = self.px();
+        let span = |a: usize| (self.win.max[a] - self.win.min[a]).max(1e-300);
+        match self.ext.mode {
+            Mode::D1 => [vw / span(0); 3],
+            Mode::D2 => [vw / span(0), vh / span(1), vw / span(0)],
+            Mode::D3 => {
+                let p = 0.7 * vw.min(vh);
+                [p / span(0), p / span(1), p / span(2)]
+            }
+        }
+    }
+
+    /// `polyline` split into dashes of `on` pixels every `on + off` pixels (a dot every period
+    /// when `on` is 0). The pattern continues across vertices.
+    fn dashed(&mut self, pts: &[[f64; 3]], st: Style, on: f64, off: f64) {
+        let k = self.px_per_unit();
+        let period = (on + off).max(1.0);
+        let mut budget = MAX_DASH_PIECES;
+        let mut s = 0.0f64;
+        for w in pts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let len =
+                ((d[0] * k[0]).powi(2) + (d[1] * k[1]).powi(2) + (d[2] * k[2]).powi(2)).sqrt();
+            if !len.is_finite() || len <= 0.0 {
+                continue;
+            }
+            let at = |t: f64| [a[0] + d[0] * t, a[1] + d[1] * t, a[2] + d[2] * t];
+            let s1 = s + len;
+            let pieces = len / period + 2.0;
+            if pieces > budget as f64 {
+                // Absurdly long (off-screen) runs: draw the rest solid rather than stall.
+                self.seg(a, b, st.line_w, st.color);
+                s = s1;
+                continue;
+            }
+            let mut n = ((s - on) / period).floor().max(0.0);
+            loop {
+                let ds = n * period;
+                if ds >= s1 {
+                    break;
+                }
+                if on <= 0.0 {
+                    if ds >= s {
+                        let p = at((ds - s) / len);
+                        self.seg(p, p, st.line_w, st.color);
+                    }
+                } else {
+                    let (lo, hi) = (ds.max(s), (ds + on).min(s1));
+                    if hi > lo {
+                        self.seg(at((lo - s) / len), at((hi - s) / len), st.line_w, st.color);
+                    }
+                }
+                n += 1.0;
+                budget = budget.saturating_sub(1);
+            }
+            s = s1;
+        }
+    }
+
+    /// One point marker in the item's style (`pointStyle`, `pointSize`), plus its `showLabel`
+    /// label. Open shapes are sized in pixels; in 3D every style is a dot.
+    fn point(&mut self, p: [f64; 3], st: Style) {
+        let size = st.point_size as f64;
+        let k = self.px_per_unit();
+        let off = |dx: f64, dy: f64| [p[0] + dx / k[0], p[1] + dy / k[1], p[2]];
+        match (st.point, self.ext.mode) {
+            (PointStyle::Dot, _) | (_, Mode::D3) => self.seg(p, p, st.point_size, st.color),
+            (PointStyle::Circle, _) => {
+                let rw = (size * 0.22).max(1.5);
+                let r = ((size - rw) * 0.5).max(0.5);
+                let ring: Vec<[f64; 3]> = (0..=RING_SIDES)
+                    .map(|i| {
+                        let t = 2.0 * PI * i as f64 / RING_SIDES as f64;
+                        off(r * t.cos(), r * t.sin())
+                    })
+                    .collect();
+                for w in ring.windows(2) {
+                    self.seg(w[0], w[1], rw as f32, st.color);
+                }
+            }
+            (PointStyle::Cross, _) => {
+                let cw = (size * 0.22).max(1.5);
+                let h = ((size - cw) * 0.5).max(0.5);
+                self.seg(off(-h, -h), off(h, h), cw as f32, st.color);
+                self.seg(off(-h, h), off(h, -h), cw as f32, st.color);
+            }
+            (PointStyle::Square, _) => {
+                let sw = (size * 0.18).max(1.5);
+                let h = ((size - sw) * 0.5).max(0.5);
+                let c = [off(-h, -h), off(h, -h), off(h, h), off(-h, h), off(-h, -h)];
+                for w in c.windows(2) {
+                    self.seg(w[0], w[1], sw as f32, st.color);
+                }
+            }
+        }
+        self.point_label(p);
+    }
+
+    /// The `showLabel` label of a drawn point (axis code [`ITEM_LABEL_AXIS`], anchored at the point): the item's
+    /// label text, else its coordinates. In 1D the value is already labelled, so only custom
+    /// text is added there.
+    fn point_label(&mut self, p: [f64; 3]) {
+        let mode = self.ext.mode;
+        let Some((text, left)) = self.ext.labels.as_mut() else {
+            return;
+        };
+        if *left == 0 || !p.iter().all(|v| v.is_finite()) {
+            return;
+        }
+        let text = match (text, mode) {
+            (Some(t), _) => t.clone(),
+            (None, Mode::D1) => return,
+            (None, Mode::D2) => format!("({}, {})", format_value(p[0]), format_value(p[1])),
+            (None, Mode::D3) => format!(
+                "({}, {}, {})",
+                format_value(p[0]),
+                format_value(p[1]),
+                format_value(p[2])
+            ),
+        };
+        *left -= 1;
+        self.label(p, text, ITEM_LABEL_AXIS);
+    }
+
+    /// Arms `showLabel` point labels for the item about to be drawn.
+    fn begin_item_labels(&mut self, s: &ItemStyle) {
+        self.ext.labels = s.show_label.then(|| {
+            let text = s.label.clone().filter(|t| !t.trim().is_empty());
+            (text, MAX_POINT_LABELS)
+        });
+    }
+
+    /// Ends the item's labels. An item with `showLabel` and label text that placed no point
+    /// label (a curve) gets the text at its first drawn sample inside the window.
+    fn end_item_labels(&mut self, s: &ItemStyle, seg0: usize) {
+        let Some((Some(text), left)) = self.ext.labels.take() else {
+            return;
+        };
+        if left < MAX_POINT_LABELS || !s.show_label {
+            return;
+        }
+        let (lo, hi) = (self.win.min, self.win.max);
+        let m = |a: usize| 0.05 * (hi[a] - lo[a]);
+        let dims = self.ext.mode.dims() as usize;
+        let at = self.out.segments[seg0.min(self.out.segments.len())..]
+            .iter()
+            .map(|sg| {
+                [
+                    sg.p0[0] as f64 + self.origin[0],
+                    sg.p0[1] as f64 + self.origin[1],
+                    sg.p0[2] as f64 + self.origin[2],
+                ]
+            })
+            .find(|p| (0..dims.clamp(2, 3)).all(|a| p[a] >= lo[a] + m(a) && p[a] <= hi[a] - m(a)));
+        if let Some(p) = at {
+            self.label(p, text, ITEM_LABEL_AXIS);
         }
     }
 
@@ -392,9 +673,11 @@ impl<'a> Builder<'a> {
                 let s = nice_step(span(0), vw, TARGET_MAJOR_PX);
                 [s, s, s]
             }
-            Mode::D2 => {
-                [nice_step(span(0), vw, TARGET_MAJOR_PX), nice_step(span(1), vh, TARGET_MAJOR_PX), 1.0]
-            }
+            Mode::D2 => [
+                nice_step(span(0), vw, TARGET_MAJOR_PX),
+                nice_step(span(1), vh, TARGET_MAJOR_PX),
+                1.0,
+            ],
             Mode::D3 => {
                 let px = 0.7 * vw.min(vh);
                 [
@@ -406,13 +689,24 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Grid, axes and tick numbers as the view flags allow (`grid`, `axes`, `axisNumbers`); the
+    /// 3D box edges are always drawn.
     fn grid_and_axes(&mut self, mode: Mode) {
         let steps = self.steps(mode);
+        let (grid, axes) = (self.ext.grid, self.ext.axes);
         match mode {
-            Mode::D1 => self.axes_1d(steps[0]),
+            Mode::D1 => {
+                if axes {
+                    self.axes_1d(steps[0]);
+                }
+            }
             Mode::D2 => {
-                self.plane_grid(0.0, steps);
-                self.axes_2d(steps);
+                if grid {
+                    self.plane_grid(0.0, steps);
+                }
+                if axes {
+                    self.axes_2d(steps);
+                }
             }
             Mode::D3 => {
                 let zp = if self.win.min[2] <= 0.0 && 0.0 <= self.win.max[2] {
@@ -420,9 +714,13 @@ impl<'a> Builder<'a> {
                 } else {
                     self.win.min[2]
                 };
-                self.plane_grid(zp, steps);
+                if grid {
+                    self.plane_grid(zp, steps);
+                }
                 self.box_edges();
-                self.axes_3d(steps);
+                if axes {
+                    self.axes_3d(steps);
+                }
             }
         }
     }
@@ -449,7 +747,11 @@ impl<'a> Builder<'a> {
                     b[other] = hi[other];
                     a[2] = zp;
                     b[2] = zp;
-                    let (w, c) = if is_major { (MAJOR_W, major_c) } else { (MINOR_W, minor_c) };
+                    let (w, c) = if is_major {
+                        (MAJOR_W, major_c)
+                    } else {
+                        (MINOR_W, minor_c)
+                    };
                     self.seg(a, b, w, c);
                 }
             }
@@ -508,8 +810,12 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Major tick labels along one axis, anchored at `anchor` on the other axes.
+    /// Major tick labels along one axis, anchored at `anchor` on the other axes (none when the
+    /// view hides axis numbers).
     fn axis_labels(&mut self, axis: u8, step: f64, anchor: [f64; 3], skip_zero: bool) {
+        if !self.ext.axis_numbers {
+            return;
+        }
         let a = axis as usize;
         for (k, v) in multiples(self.win.min[a], self.win.max[a], step) {
             if skip_zero && k == 0 {
@@ -588,8 +894,19 @@ impl<'a> Builder<'a> {
             depth,
             400_000,
         );
+        if st.dash.is_some() {
+            // Dashes need the pieces joined into curves so the pattern runs along them.
+            let lines = chain_segments(&segs, min_cell * 1e-3);
+            self.add_lines2(&lines, st);
+            return Ok(());
+        }
         for s in segs {
-            self.seg([s[0][0], s[0][1], 0.0], [s[1][0], s[1][1], 0.0], st.line_w, st.color);
+            self.seg(
+                [s[0][0], s[0][1], 0.0],
+                [s[1][0], s[1][1], 0.0],
+                st.line_w,
+                st.color,
+            );
         }
         Ok(())
     }
@@ -599,8 +916,14 @@ impl<'a> Builder<'a> {
     /// sliders (or one named like a spatial/complex variable) everything is folded instead.
     fn field_resolve(&self, raw: &Expr, defs: &Defs) -> Result<(Expr, Vec<String>), String> {
         let r = self.pdefs.resolve(raw).map_err(|e| e.to_string())?;
-        let used: Vec<String> = r.free_vars().into_iter().filter(|n| self.sliders.contains_key(n)).collect();
-        let clash = used.iter().any(|n| matches!(n.as_str(), "x" | "y" | "z" | "i"));
+        let used: Vec<String> = r
+            .free_vars()
+            .into_iter()
+            .filter(|n| self.sliders.contains_key(n))
+            .collect();
+        let clash = used
+            .iter()
+            .any(|n| matches!(n.as_str(), "x" | "y" | "z" | "i"));
         if used.len() > MAX_FIELD_PARAMS || clash {
             return Ok((defs.resolve(raw).map_err(|e| e.to_string())?, Vec::new()));
         }
@@ -608,12 +931,21 @@ impl<'a> Builder<'a> {
     }
 
     fn param_values(&self, names: &[String]) -> Vec<f32> {
-        names.iter().map(|n| self.sliders.get(n).copied().unwrap_or(0.0) as f32).collect()
+        names
+            .iter()
+            .map(|n| self.sliders.get(n).copied().unwrap_or(0.0) as f32)
+            .collect()
     }
 
     /// Emits a GPU field over the window's x/y rectangle on the z=0 plane. `raw` is the
     /// UNRESOLVED expression; used sliders become uniform parameters (see `FieldSpec`).
-    fn field(&mut self, raw: &Expr, defs: &Defs, kind: FieldKind, color: [f32; 4]) -> Result<(), String> {
+    fn field(
+        &mut self,
+        raw: &Expr,
+        defs: &Defs,
+        kind: FieldKind,
+        color: [f32; 4],
+    ) -> Result<(), String> {
         let (e, used) = self.field_resolve(raw, defs)?;
         if e.contains_var("z") {
             return Err("fields may only use x and y (z is not supported)".to_string());
@@ -653,9 +985,20 @@ impl<'a> Builder<'a> {
     }
 
     /// Inequality shading: fills where `f < 0` for `<`/`<=`, `f > 0` for `>`/`>=`.
-    fn inequality_field(&mut self, rel: Rel, f: &Expr, defs: &Defs, st: Style) -> Result<(), String> {
+    fn inequality_field(
+        &mut self,
+        rel: Rel,
+        f: &Expr,
+        defs: &Defs,
+        st: Style,
+    ) -> Result<(), String> {
         let greater = matches!(rel, Rel::Gt | Rel::Ge);
-        self.field(f, defs, FieldKind::Fill { greater }, st.color)
+        let mut color = st.color;
+        if let Some(fo) = st.fill {
+            // The shader multiplies by FILL_SHADER_ALPHA; the result is `opacity * fillOpacity`.
+            color[3] *= fo / FILL_SHADER_ALPHA;
+        }
+        self.field(f, defs, FieldKind::Fill { greater }, color)
     }
 
     /// Domain-colours a complex expression of `z = x + iy` over the window on the z=0 plane.
@@ -677,7 +1020,9 @@ impl<'a> Builder<'a> {
         let p = compile_complex(&r, &vars).map_err(|e| {
             let m = e.to_string();
             if ["'sum'", "'int'", "'prod'"].iter().any(|n| m.contains(n)) {
-                format!("{m}: sum, int and prod are not available in complex items (use a real item)")
+                format!(
+                    "{m}: sum, int and prod are not available in complex items (use a real item)"
+                )
             } else {
                 m
             }
@@ -687,8 +1032,9 @@ impl<'a> Builder<'a> {
         } else {
             let mut m = String::from(COMPLEX_PRELUDE);
             m.push_str(&emit_complex_function("cplx", &p).map_err(|e| e.to_string())?);
-            let args: Vec<String> =
-                (0..used.len()).map(|i| format!("vec2<f32>({}, 0.0)", param_ref(i))).collect();
+            let args: Vec<String> = (0..used.len())
+                .map(|i| format!("vec2<f32>({}, 0.0)", param_ref(i)))
+                .collect();
             m.push_str(&format!(
                 "fn field_color(x: f32, y: f32) -> vec4<f32> {{\n    \
                  return vec4<f32>(am_domain_color(cplx(vec2<f32>(x, y), {})), 1.0);\n}}\n",
@@ -696,7 +1042,11 @@ impl<'a> Builder<'a> {
             ));
             m
         };
-        let alpha = if mode == Mode::D3 { DOMAIN_ALPHA_3D } else { 1.0 };
+        let alpha = if mode == Mode::D3 {
+            DOMAIN_ALPHA_3D
+        } else {
+            1.0
+        };
         let (lo, hi) = (self.win.min, self.win.max);
         let rb = |v: f64, a: usize| (v - self.origin[a]) as f32;
         let params = self.param_values(&used);
@@ -723,7 +1073,13 @@ impl<'a> Builder<'a> {
     fn explicit_y_2d(&mut self, rhs: &Expr, defs: &Defs, st: Style) -> Result<(), String> {
         let w = self.win;
         let p = self.prog(&defs.resolve(rhs).map_err(|e| e.to_string())?, &["x"])?;
-        let lines = mesh::sample_explicit(&p, w.min[0], w.max[0], self.vw.max(1.0) as usize, (w.min[1], w.max[1]));
+        let lines = mesh::sample_explicit(
+            &p,
+            w.min[0],
+            w.max[0],
+            self.vw.max(1.0) as usize,
+            (w.min[1], w.max[1]),
+        );
         self.add_lines2(&lines, st);
         Ok(())
     }
@@ -731,7 +1087,9 @@ impl<'a> Builder<'a> {
     fn draw_2d(&mut self, pr: &Prepared, defs: &Defs, st: Style) -> Result<(), String> {
         match &pr.kind {
             // A bare expression of x alone (`x^2`, `d/dx x^2`, `sin(x)`) is the curve y = expr.
-            Kind::Field { expr } if pr.dims[0] && !pr.dims[1] && !pr.dims[2] => self.explicit_y_2d(expr, defs, st),
+            Kind::Field { expr } if pr.dims[0] && !pr.dims[1] && !pr.dims[2] => {
+                self.explicit_y_2d(expr, defs, st)
+            }
             Kind::Field { expr } => self.field(expr, defs, FieldKind::Hue, st.color),
             Kind::VectorField { components } => {
                 if pr.dims[2] {
@@ -778,7 +1136,7 @@ impl<'a> Builder<'a> {
             }
             Kind::Point { components } if components.len() == 2 => {
                 let v = self.eval_tuple(components, defs)?;
-                self.dot([v[0], v[1], 0.0], st.color);
+                self.point([v[0], v[1], 0.0], st);
                 Ok(())
             }
             Kind::List { items } => {
@@ -786,7 +1144,7 @@ impl<'a> Builder<'a> {
                     if let Expr::Tuple(c) = it {
                         if c.len() == 2 {
                             let v = self.eval_tuple(c, defs)?;
-                            self.dot([v[0], v[1], 0.0], st.color);
+                            self.point([v[0], v[1], 0.0], st);
                         }
                     }
                 }
@@ -817,7 +1175,9 @@ impl<'a> Builder<'a> {
             let q = self.rb([pos[0] as f64, pos[1] as f64, pos[2] as f64]);
             self.out.vertices.push(MeshVertex::new(q, *n, col));
         }
-        self.out.indices.extend(mesh.indices.iter().map(|i| i + base));
+        self.out
+            .indices
+            .extend(mesh.indices.iter().map(|i| i + base));
         Ok(())
     }
 
@@ -865,13 +1225,15 @@ impl<'a> Builder<'a> {
                 self.surface(&r, st)
             }
             Kind::Field { expr } => self.field(expr, defs, FieldKind::Hue, st.color),
-            Kind::VectorField { components } => self.vector_field_3d(components, defs, st, pr.item.color.is_some()),
+            Kind::VectorField { components } => {
+                self.vector_field_3d(components, defs, st, pr.item.color.is_some())
+            }
             Kind::Parametric { components } if (2..=3).contains(&components.len()) => {
                 self.curve_3d(components, defs, st)
             }
             Kind::Point { components } if (2..=3).contains(&components.len()) => {
                 let v = self.eval_tuple(components, defs)?;
-                self.dot([v[0], v[1], v.get(2).copied().unwrap_or(0.0)], st.color);
+                self.point([v[0], v[1], v.get(2).copied().unwrap_or(0.0)], st);
                 Ok(())
             }
             Kind::List { items } => {
@@ -879,7 +1241,7 @@ impl<'a> Builder<'a> {
                     if let Expr::Tuple(c) = it {
                         if (2..=3).contains(&c.len()) {
                             let v = self.eval_tuple(c, defs)?;
-                            self.dot([v[0], v[1], v.get(2).copied().unwrap_or(0.0)], st.color);
+                            self.point([v[0], v[1], v.get(2).copied().unwrap_or(0.0)], st);
                         }
                     }
                 }
@@ -907,7 +1269,12 @@ impl<'a> Builder<'a> {
     }
 
     /// Compiles each component (definitions and sliders resolved) over `vars`.
-    fn field_progs(&self, comps: &[Expr], defs: &Defs, vars: &[&str]) -> Result<Vec<Program>, String> {
+    fn field_progs(
+        &self,
+        comps: &[Expr],
+        defs: &Defs,
+        vars: &[&str],
+    ) -> Result<Vec<Program>, String> {
         comps
             .iter()
             .map(|c| self.prog(&defs.resolve(c).map_err(|e| e.to_string())?, vars))
@@ -918,7 +1285,11 @@ impl<'a> Builder<'a> {
     /// not shrink every other arrow to a dot).
     fn magnitude_reference(mags: &mut [f64]) -> f64 {
         mags.sort_by(|a, b| a.total_cmp(b));
-        let r = mags.get(((mags.len() as f64) * 0.9) as usize).or(mags.last()).copied().unwrap_or(1.0);
+        let r = mags
+            .get(((mags.len() as f64) * 0.9) as usize)
+            .or(mags.last())
+            .copied()
+            .unwrap_or(1.0);
         if r.is_finite() && r > 0.0 {
             r
         } else {
@@ -929,7 +1300,15 @@ impl<'a> Builder<'a> {
     /// One flat (screen-plane) arrow centred on `c`. `u` is the unit direction in pixel space
     /// (x right, y up), `len_px` its length; `xpp`/`ypp` are world units per pixel.
     #[allow(clippy::too_many_arguments)]
-    fn arrow_px(&mut self, c: [f64; 3], u: (f64, f64), len_px: f64, xpp: f64, ypp: f64, color: [f32; 4]) {
+    fn arrow_px(
+        &mut self,
+        c: [f64; 3],
+        u: (f64, f64),
+        len_px: f64,
+        xpp: f64,
+        ypp: f64,
+        color: [f32; 4],
+    ) {
         let at = |s: f64| [c[0] + u.0 * s * xpp, c[1] + u.1 * s * ypp, c[2]];
         let (tail, tip) = (at(-0.5 * len_px), at(0.5 * len_px));
         self.seg(tail, tip, ARROW_W, color);
@@ -938,11 +1317,22 @@ impl<'a> Builder<'a> {
             let (s, co) = (sgn * BARB_ANGLE).sin_cos();
             // -u rotated by +-BARB_ANGLE.
             let b = (-(u.0 * co - u.1 * s), -(u.0 * s + u.1 * co));
-            self.seg(tip, [tip[0] + b.0 * head * xpp, tip[1] + b.1 * head * ypp, tip[2]], ARROW_W, color);
+            self.seg(
+                tip,
+                [tip[0] + b.0 * head * xpp, tip[1] + b.1 * head * ypp, tip[2]],
+                ARROW_W,
+                color,
+            );
         }
     }
 
-    fn vector_field_2d(&mut self, comps: &[Expr], defs: &Defs, st: Style, fixed_color: bool) -> Result<(), String> {
+    fn vector_field_2d(
+        &mut self,
+        comps: &[Expr],
+        defs: &Defs,
+        st: Style,
+        fixed_color: bool,
+    ) -> Result<(), String> {
         let progs = self.field_progs(&comps[..comps.len().min(2)], defs, &["x", "y"])?;
         let w = self.win;
         let (vw, vh) = self.px();
@@ -964,7 +1354,9 @@ impl<'a> Builder<'a> {
             for (_, y) in &ys {
                 let v = [
                     progs[0].eval_with(&[*x, *y], &mut stack),
-                    progs.get(1).map_or(0.0, |p| p.eval_with(&[*x, *y], &mut stack)),
+                    progs
+                        .get(1)
+                        .map_or(0.0, |p| p.eval_with(&[*x, *y], &mut stack)),
                 ];
                 if v[0].is_finite() && v[1].is_finite() {
                     samples.push(([*x, *y], v, v[0].hypot(v[1])));
@@ -976,7 +1368,11 @@ impl<'a> Builder<'a> {
         let cell_px = step / xpp;
         for (p, v, m) in samples {
             let f = (m / reference).min(1.0);
-            let color = if fixed_color { st.color } else { self.magnitude_color(f, st.color[3]) };
+            let color = if fixed_color {
+                st.color
+            } else {
+                self.magnitude_color(f, st.color[3])
+            };
             if m <= 0.0 {
                 self.seg([p[0], p[1], 0.0], [p[0], p[1], 0.0], 3.0, color);
                 continue;
@@ -994,7 +1390,13 @@ impl<'a> Builder<'a> {
     }
 
     /// A row of arrows along the number line: `(f(x))` points right where f > 0, left where < 0.
-    fn vector_field_1d(&mut self, comp: &Expr, defs: &Defs, st: Style, fixed_color: bool) -> Result<(), String> {
+    fn vector_field_1d(
+        &mut self,
+        comp: &Expr,
+        defs: &Defs,
+        st: Style,
+        fixed_color: bool,
+    ) -> Result<(), String> {
         let progs = self.field_progs(std::slice::from_ref(comp), defs, &["x"])?;
         let w = self.win;
         let (vw, _) = self.px();
@@ -1013,7 +1415,11 @@ impl<'a> Builder<'a> {
         let reference = Self::magnitude_reference(&mut mags);
         for (x, v) in samples {
             let f = (v.abs() / reference).min(1.0);
-            let color = if fixed_color { st.color } else { self.magnitude_color(f, st.color[3]) };
+            let color = if fixed_color {
+                st.color
+            } else {
+                self.magnitude_color(f, st.color[3])
+            };
             if v == 0.0 {
                 self.seg([x, 0.0, 0.0], [x, 0.0, 0.0], 3.0, color);
                 continue;
@@ -1026,7 +1432,13 @@ impl<'a> Builder<'a> {
 
     /// Arrows on a coarse lattice (at most `MAX_LATTICE`^3). With only two components the field
     /// lives on the z = 0 plane.
-    fn vector_field_3d(&mut self, comps: &[Expr], defs: &Defs, st: Style, fixed_color: bool) -> Result<(), String> {
+    fn vector_field_3d(
+        &mut self,
+        comps: &[Expr],
+        defs: &Defs,
+        st: Style,
+        fixed_color: bool,
+    ) -> Result<(), String> {
         let progs = self.field_progs(comps, defs, &["x", "y", "z"])?;
         let w = self.win;
         let span = (0..3).map(|a| w.max[a] - w.min[a]).fold(0.0, f64::max);
@@ -1035,7 +1447,10 @@ impl<'a> Builder<'a> {
             if a == 2 && comps.len() < 3 {
                 return vec![0.0];
             }
-            multiples(w.min[a], w.max[a], step).into_iter().map(|(_, v)| v).collect()
+            multiples(w.min[a], w.max[a], step)
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect()
         };
         let mut g;
         loop {
@@ -1065,22 +1480,40 @@ impl<'a> Builder<'a> {
         let reference = Self::magnitude_reference(&mut mags);
         for (p, v, m) in samples {
             let f = (m / reference).min(1.0);
-            let color = if fixed_color { st.color } else { self.magnitude_color(f, st.color[3]) };
+            let color = if fixed_color {
+                st.color
+            } else {
+                self.magnitude_color(f, st.color[3])
+            };
             if m <= 0.0 {
                 self.seg(p, p, 4.0, color);
                 continue;
             }
             let d = [v[0] / m, v[1] / m, v[2] / m];
             let len = step * 0.85 * (0.25 + 0.75 * f);
-            let tail = [p[0] - d[0] * len / 2.0, p[1] - d[1] * len / 2.0, p[2] - d[2] * len / 2.0];
-            let tip = [p[0] + d[0] * len / 2.0, p[1] + d[1] * len / 2.0, p[2] + d[2] * len / 2.0];
+            let tail = [
+                p[0] - d[0] * len / 2.0,
+                p[1] - d[1] * len / 2.0,
+                p[2] - d[2] * len / 2.0,
+            ];
+            let tip = [
+                p[0] + d[0] * len / 2.0,
+                p[1] + d[1] * len / 2.0,
+                p[2] + d[2] * len / 2.0,
+            ];
             self.seg(tail, tip, ARROW_W, color);
             // Three barbs around the shaft: perpendicular basis from the least aligned axis.
-            let k = (0..3).min_by(|a, b| d[*a].abs().total_cmp(&d[*b].abs())).unwrap_or(0);
+            let k = (0..3)
+                .min_by(|a, b| d[*a].abs().total_cmp(&d[*b].abs()))
+                .unwrap_or(0);
             let mut e = [0.0; 3];
             e[k] = 1.0;
             let cr = |a: [f64; 3], b: [f64; 3]| {
-                [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+                [
+                    a[1] * b[2] - a[2] * b[1],
+                    a[2] * b[0] - a[0] * b[2],
+                    a[0] * b[1] - a[1] * b[0],
+                ]
             };
             let norm = |a: [f64; 3]| {
                 let n = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt().max(1e-12);
@@ -1106,7 +1539,14 @@ impl<'a> Builder<'a> {
 
     /// Plots a table: columns 0 and 1 are x and y (a third column is z in 3D). Rows with a blank
     /// or non-numeric cell are skipped. `Line` also joins consecutive rows.
-    fn draw_table(&mut self, cols: &[ParsedColumn], style: TableStyle, defs: &Defs, mode: Mode, st: Style) -> Result<(), String> {
+    fn draw_table(
+        &mut self,
+        cols: &[ParsedColumn],
+        style: TableStyle,
+        defs: &Defs,
+        mode: Mode,
+        st: Style,
+    ) -> Result<(), String> {
         if style == TableStyle::Hidden || cols.is_empty() {
             return Ok(());
         }
@@ -1114,7 +1554,11 @@ impl<'a> Builder<'a> {
         let mut errors: Vec<String> = Vec::new();
         let mut value = |b: &Self, ci: usize, ri: usize| -> Option<f64> {
             let e = cols.get(ci)?.cells.get(ri)?.as_ref()?;
-            match defs.resolve(e).map_err(|e| e.to_string()).and_then(|r| b.prog(&r, &[])) {
+            match defs
+                .resolve(e)
+                .map_err(|e| e.to_string())
+                .and_then(|r| b.prog(&r, &[]))
+            {
                 Ok(p) => {
                     let v = p.eval(&[]);
                     v.is_finite().then_some(v)
@@ -1132,8 +1576,16 @@ impl<'a> Builder<'a> {
         let mut runs: Vec<Vec<[f64; 3]>> = Vec::new();
         for ri in 0..rows {
             let x = value(self, 0, ri);
-            let y = if mode == Mode::D1 { Some(0.0) } else { value(self, 1, ri) };
-            let z = if mode == Mode::D3 && cols.len() > 2 { value(self, 2, ri) } else { Some(0.0) };
+            let y = if mode == Mode::D1 {
+                Some(0.0)
+            } else {
+                value(self, 1, ri)
+            };
+            let z = if mode == Mode::D3 && cols.len() > 2 {
+                value(self, 2, ri)
+            } else {
+                Some(0.0)
+            };
             match (x, y, z) {
                 (Some(x), Some(y), Some(z)) => {
                     run.push([x, y, z]);
@@ -1150,7 +1602,7 @@ impl<'a> Builder<'a> {
         }
         for p in pts {
             if mode != Mode::D1 || (p[0] >= self.win.min[0] && p[0] <= self.win.max[0]) {
-                self.dot(p, st.color);
+                self.point(p, st);
             }
         }
         if errors.is_empty() {
@@ -1164,8 +1616,17 @@ impl<'a> Builder<'a> {
 
     /// Draws list-valued items and statistical plots. Returns `Ok(false)` when the item is not
     /// list-ish (or still uses x/y/z) and should take the ordinary per-kind path.
-    fn draw_listish(&mut self, pr: &Prepared, defs: &Defs, mode: Mode, st: Style) -> Result<bool, String> {
-        if !matches!(pr.kind, Kind::List { .. } | Kind::Point { .. } | Kind::Value { .. }) {
+    fn draw_listish(
+        &mut self,
+        pr: &Prepared,
+        defs: &Defs,
+        mode: Mode,
+        st: Style,
+    ) -> Result<bool, String> {
+        if !matches!(
+            pr.kind,
+            Kind::List { .. } | Kind::Point { .. } | Kind::Value { .. }
+        ) {
             return Ok(false);
         }
         let r = defs.resolve(&pr.expr).map_err(|e| e.to_string())?;
@@ -1190,11 +1651,11 @@ impl<'a> Builder<'a> {
         match (mode, p.len()) {
             (Mode::D1, n) if n >= 1 => {
                 if p[0] >= self.win.min[0] && p[0] <= self.win.max[0] {
-                    self.dot([p[0], 0.0, 0.0], st.color);
+                    self.point([p[0], 0.0, 0.0], st);
                 }
             }
-            (Mode::D2, 2) => self.dot([p[0], p[1], 0.0], st.color),
-            (Mode::D3, 2 | 3) => self.dot([p[0], p[1], p.get(2).copied().unwrap_or(0.0)], st.color),
+            (Mode::D2, 2) => self.point([p[0], p[1], 0.0], st),
+            (Mode::D3, 2 | 3) => self.point([p[0], p[1], p.get(2).copied().unwrap_or(0.0)], st),
             _ => {}
         }
     }
@@ -1213,7 +1674,7 @@ impl<'a> Builder<'a> {
                         if l.len() <= MAX_LABELLED {
                             self.on_line(*x, st);
                         } else if *x >= self.win.min[0] && *x <= self.win.max[0] {
-                            self.dot([*x, 0.0, 0.0], st.color);
+                            self.point([*x, 0.0, 0.0], st);
                         }
                     }
                 }
@@ -1229,7 +1690,14 @@ impl<'a> Builder<'a> {
 
     /// `histogram(L[, binwidth])`, `boxplot(L)`, `dotplot(L[, binwidth])`. Drawn on the z = 0
     /// plane in 2D and 3D, nothing in 1D.
-    fn stat_plot(&mut self, name: &str, args: &[Expr], bind: &Bindings, mode: Mode, st: Style) -> Result<(), String> {
+    fn stat_plot(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        bind: &Bindings,
+        mode: Mode,
+        st: Style,
+    ) -> Result<(), String> {
         let max_args = if name == "boxplot" { 1 } else { 2 };
         if args.is_empty() || args.len() > max_args {
             return Err(format!(
@@ -1277,7 +1745,11 @@ impl<'a> Builder<'a> {
         fill[3] *= BAR_ALPHA;
         let mut outline: Vec<[f64; 3]> = vec![[start, 0.0, 0.0]];
         for (i, b) in bins.iter().enumerate() {
-            let (x0, x1, h) = (start + i as f64 * w, start + (i + 1) as f64 * w, b.len() as f64);
+            let (x0, x1, h) = (
+                start + i as f64 * w,
+                start + (i + 1) as f64 * w,
+                b.len() as f64,
+            );
             if !b.is_empty() {
                 self.quad(x0, x1, 0.0, h, fill);
             }
@@ -1345,7 +1817,7 @@ impl<'a> Builder<'a> {
 
     fn on_line(&mut self, x: f64, st: Style) {
         if x.is_finite() && x >= self.win.min[0] && x <= self.win.max[0] {
-            self.dot([x, 0.0, 0.0], st.color);
+            self.point([x, 0.0, 0.0], st);
             self.label([x, 0.0, 0.0], format_value(x), 0);
         }
     }
@@ -1385,6 +1857,58 @@ impl<'a> Builder<'a> {
             _ => Ok(()),
         }
     }
+}
+
+/// Joins unordered contour pieces into polylines by matching endpoints (snapped to a grid of
+/// `tol`), so a dash pattern can run along each curve. Every piece is used exactly once.
+fn chain_segments(segs: &[[[f64; 2]; 2]], tol: f64) -> Vec<Vec<[f64; 2]>> {
+    use std::collections::HashMap;
+    let tol = if tol.is_finite() && tol > 0.0 {
+        tol
+    } else {
+        1e-9
+    };
+    let key = |p: [f64; 2]| ((p[0] / tol).round() as i64, (p[1] / tol).round() as i64);
+    let mut at: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    for (i, s) in segs.iter().enumerate() {
+        for p in s {
+            at.entry(key(*p)).or_default().push(i);
+        }
+    }
+    let mut used = vec![false; segs.len()];
+    // The unused piece touching `p` and its far end.
+    let mut next = |p: [f64; 2], used: &mut Vec<bool>| -> Option<[f64; 2]> {
+        let list = at.get_mut(&key(p))?;
+        while let Some(i) = list.pop() {
+            if !used[i] {
+                used[i] = true;
+                let s = segs[i];
+                return Some(if key(s[0]) == key(p) { s[1] } else { s[0] });
+            }
+        }
+        None
+    };
+    let mut out = Vec::new();
+    for i in 0..segs.len() {
+        if used[i] {
+            continue;
+        }
+        used[i] = true;
+        let mut fwd = vec![segs[i][0], segs[i][1]];
+        while let Some(q) = next(*fwd.last().unwrap_or(&segs[i][1]), &mut used) {
+            fwd.push(q);
+        }
+        let mut back = Vec::new();
+        let mut tail = segs[i][0];
+        while let Some(q) = next(tail, &mut used) {
+            back.push(q);
+            tail = q;
+        }
+        back.reverse();
+        back.extend(fwd);
+        out.push(back);
+    }
+    out
 }
 
 /// True if `theta` appears anywhere outside a trigonometric call.
@@ -1470,7 +1994,9 @@ fn prepare<'a>(
         .items
         .iter()
         .filter(|i| {
-            is_drawable_kind(i.kind) && !i.latex.trim().is_empty() && !math_core::actions::looks_like_action(&i.latex)
+            is_drawable_kind(i.kind)
+                && !i.latex.trim().is_empty()
+                && !math_core::actions::looks_like_action(&i.latex)
         })
         .collect();
     let none = BTreeSet::new();
@@ -1490,7 +2016,9 @@ fn prepare<'a>(
             match parse_complex(&it.latex, &ctx) {
                 Ok(e) => out.push(Prepared {
                     item: it,
-                    kind: Kind::Value { expr: Expr::Num(0.0) },
+                    kind: Kind::Value {
+                        expr: Expr::Num(0.0),
+                    },
                     dims: [false; 3],
                     expr: e.clone(),
                     complex: Some(e),
@@ -1506,7 +2034,13 @@ fn prepare<'a>(
         match parse_with(&it.latex, &ctx) {
             Ok(e) => {
                 let a = analyze(&e, &none);
-                out.push(Prepared { item: it, kind: a.kind, dims: a.dims, complex: None, expr: e });
+                out.push(Prepared {
+                    item: it,
+                    kind: a.kind,
+                    dims: a.dims,
+                    complex: None,
+                    expr: e,
+                });
             }
             Err(e) => {
                 if !it.hidden {
@@ -1523,7 +2057,10 @@ fn prepare<'a>(
         let (cols, errs) = tb.parse(&ctx);
         if !it.hidden {
             for (ci, ri, msg) in errs.iter().take(3) {
-                diags.push((it.id.clone(), format!("{} row {}: {msg}", tb.columns[*ci].name, ri + 1)));
+                diags.push((
+                    it.id.clone(),
+                    format!("{} row {}: {msg}", tb.columns[*ci].name, ri + 1),
+                ));
             }
         }
         let known = defs.defined_names();
@@ -1577,10 +2114,38 @@ fn prepare<'a>(
 fn prepare_fitted<'a>(
     doc: &'a Doc,
     diags: &mut Vec<(String, String)>,
-) -> (Vec<Prepared<'a>>, Defs, Defs, Vec<TableData<'a>>, BTreeMap<String, math_core::regress::FitResult>) {
+) -> (
+    Vec<Prepared<'a>>,
+    Defs,
+    Defs,
+    Vec<TableData<'a>>,
+    BTreeMap<String, math_core::regress::FitResult>,
+) {
     let (items, mut defs, mut pdefs, tables) = prepare(doc, diags);
     let fits = calc_draw::fit_regressions(&items, &mut defs, &mut pdefs, diags);
     (items, defs, pdefs, tables, fits)
+}
+
+/// `doc` with every item filed in a hidden folder marked hidden (not drawn, no diagnostics, but
+/// its definitions stay in scope). Borrowed unchanged when no hidden folder has items.
+pub fn with_folders_applied(doc: &Doc) -> std::borrow::Cow<'_, Doc> {
+    let hidden: BTreeSet<&str> = doc
+        .items
+        .iter()
+        .filter(|i| i.kind == ItemKind::Folder && i.hidden)
+        .map(|i| i.id.as_str())
+        .collect();
+    let affected = |i: &Item| !i.hidden && i.folder.as_deref().is_some_and(|f| hidden.contains(f));
+    if !doc.items.iter().any(affected) {
+        return std::borrow::Cow::Borrowed(doc);
+    }
+    let mut d = doc.clone();
+    for i in &mut d.items {
+        if affected(i) {
+            i.hidden = true;
+        }
+    }
+    std::borrow::Cow::Owned(d)
 }
 
 /// Builds the drawable geometry for `doc` in `mode` (see the module docs).
@@ -1597,6 +2162,7 @@ pub fn build_scene(
     viewport_px: (u32, u32),
     theme: &Theme,
 ) -> SceneGeometry {
+    let doc = &*with_folders_applied(doc);
     let mut b = Builder {
         out: SceneGeometry::default(),
         origin,
@@ -1609,7 +2175,18 @@ pub fn build_scene(
             AngleMode::Deg => Angle::Deg,
         },
         pdefs: Defs::new(),
-        sliders: doc.sliders.iter().map(|(n, c)| (n.clone(), c.value)).collect(),
+        sliders: doc
+            .sliders
+            .iter()
+            .map(|(n, c)| (n.clone(), c.value))
+            .collect(),
+        ext: BuildExt {
+            mode,
+            grid: doc.view.grid,
+            axes: doc.view.axes,
+            axis_numbers: doc.view.axis_numbers,
+            labels: None,
+        },
     };
     b.grid_and_axes(mode);
     let mut diags = Vec::new();
@@ -1632,20 +2209,25 @@ pub fn build_scene(
         if let Some(o) = pr.item.style.opacity {
             color[3] *= o.clamp(0.0, 1.0) as f32;
         }
-        let line_w = pr.item.style.line_width.map(|w| w as f32).unwrap_or(CURVE_W);
-        let st = Style { color, line_w };
+        let st = Style::for_item(&pr.item.style, color);
+        b.begin_item_labels(&pr.item.style);
+        let seg0 = b.out.segments.len();
         if matches!(pr.kind, Kind::Regression { .. }) {
             if let Some(fit) = fits.get(&pr.item.id) {
                 if let Err(msg) = b.draw_regression(pr, fit, &defs, mode, st) {
                     diags.push((pr.item.id.clone(), msg));
                 }
             }
+            b.end_item_labels(&pr.item.style, seg0);
             continue;
         }
         let r = match mode {
-            _ if pr.complex.is_some() => {
-                b.draw_complex(pr.complex.as_ref().unwrap_or(&Expr::Num(0.0)), &defs, mode, st)
-            }
+            _ if pr.complex.is_some() => b.draw_complex(
+                pr.complex.as_ref().unwrap_or(&Expr::Num(0.0)),
+                &defs,
+                mode,
+                st,
+            ),
             _ => match b.draw_listish(pr, &defs, mode, st) {
                 Ok(true) => Ok(()),
                 Err(e) => Err(e),
@@ -1659,6 +2241,7 @@ pub fn build_scene(
         if let Err(msg) = r {
             diags.push((pr.item.id.clone(), msg));
         }
+        b.end_item_labels(&pr.item.style, seg0);
     }
     for t in tables.iter().filter(|t| !t.item.hidden) {
         let mut color = t
@@ -1672,11 +2255,13 @@ pub fn build_scene(
         if let Some(o) = t.item.style.opacity {
             color[3] *= o.clamp(0.0, 1.0) as f32;
         }
-        let line_w = t.item.style.line_width.map(|w| w as f32).unwrap_or(CURVE_W);
+        let st = Style::for_item(&t.item.style, color);
         let style = t.item.table.as_ref().map(|x| x.style).unwrap_or_default();
-        if let Err(msg) = b.draw_table(&t.cols, style, &defs, mode, Style { color, line_w }) {
+        b.begin_item_labels(&t.item.style);
+        if let Err(msg) = b.draw_table(&t.cols, style, &defs, mode, st) {
             diags.push((t.item.id.clone(), msg));
         }
+        b.ext.labels = None;
     }
     // Slice overlay (additive; a slice that does not fit the mode is simply not drawn here, the
     // app reports why).
@@ -1762,6 +2347,7 @@ pub fn build_slice_panel_view(
     view: Option<&ViewReq>,
 ) -> Option<Result<SliceOutcome, String>> {
     let cfg = doc.slice.as_ref()?;
+    let doc = &*with_folders_applied(doc);
     let mut diags = Vec::new();
     let (items, defs, pdefs, _tables, _fits) = prepare_fitted(doc, &mut diags);
     let angle = match doc.view.angle {
@@ -1777,7 +2363,11 @@ pub fn build_slice_panel_view(
     let ctx = slice_draw::PanelCtx {
         defs: &defs,
         pdefs: &pdefs,
-        sliders: doc.sliders.iter().map(|(n, c)| (n.clone(), c.value)).collect(),
+        sliders: doc
+            .sliders
+            .iter()
+            .map(|(n, c)| (n.clone(), c.value))
+            .collect(),
         view,
     };
     let panel = slice_draw::build_panel(doc, &rs, &sitems, window, main_px, theme, &ctx);
@@ -1823,6 +2413,7 @@ fn literal_number(e: &Expr) -> Option<f64> {
 /// All draggable points of `doc`: visible 2-tuples with at least one coordinate that is a plain
 /// number, a slider, or a numeric definition (`a=3`). Formulas stay fixed.
 pub fn point_handles(doc: &Doc) -> Vec<PointHandle> {
+    let doc = &*with_folders_applied(doc);
     let mut diags = Vec::new();
     let (items, defs, _, _) = prepare(doc, &mut diags);
     let angle = match doc.view.angle {
@@ -1833,13 +2424,20 @@ pub fn point_handles(doc: &Doc) -> Vec<PointHandle> {
     for p in &items {
         if let Kind::Definition { name, params, body } = &p.kind {
             if params.is_empty() && literal_number(body).is_some() {
-                numeric_defs.entry(name.as_str()).or_insert(p.item.id.as_str());
+                numeric_defs
+                    .entry(name.as_str())
+                    .or_insert(p.item.id.as_str());
             }
         }
     }
     let mut out = Vec::new();
-    for p in items.iter().filter(|p| !p.item.hidden && p.complex.is_none()) {
-        let Kind::Point { components } = &p.kind else { continue };
+    for p in items
+        .iter()
+        .filter(|p| !p.item.hidden && p.complex.is_none())
+    {
+        let Kind::Point { components } = &p.kind else {
+            continue;
+        };
         if components.len() != 2 {
             continue;
         }
@@ -1851,7 +2449,10 @@ pub fn point_handles(doc: &Doc) -> Vec<PointHandle> {
                 _ if literal_number(c).is_some() => CoordSrc::Literal,
                 Expr::Var(n) if doc.sliders.contains_key(n) => CoordSrc::Slider(n.clone()),
                 Expr::Var(n) => match numeric_defs.get(n.as_str()) {
-                    Some(item) => CoordSrc::Def { item: item.to_string(), name: n.clone() },
+                    Some(item) => CoordSrc::Def {
+                        item: item.to_string(),
+                        name: n.clone(),
+                    },
                     None => CoordSrc::Fixed,
                 },
                 _ => CoordSrc::Fixed,
@@ -1872,7 +2473,10 @@ pub fn point_handles(doc: &Doc) -> Vec<PointHandle> {
                 id: p.item.id.clone(),
                 pos,
                 src,
-                text: [math_core::print::to_text(&components[0]), math_core::print::to_text(&components[1])],
+                text: [
+                    math_core::print::to_text(&components[0]),
+                    math_core::print::to_text(&components[1]),
+                ],
             });
         }
     }
@@ -1897,7 +2501,14 @@ mod tests {
     }
 
     fn build(d: &Doc, mode: Mode) -> SceneGeometry {
-        build_scene(d, mode, Window3::default(), [0.0; 3], (800, 600), &Theme::light())
+        build_scene(
+            d,
+            mode,
+            Window3::default(),
+            [0.0; 3],
+            (800, 600),
+            &Theme::light(),
+        )
     }
 
     /// Number of segments before the content layer (grid + axes), for comparison.
@@ -1920,7 +2531,14 @@ mod tests {
     fn parabola_2d() {
         let d = doc_with(&[("a", "y=x^2")]);
         let origin = [1.0, 2.0, 0.0];
-        let g = build_scene(&d, Mode::D2, Window3::default(), origin, (800, 600), &Theme::light());
+        let g = build_scene(
+            &d,
+            Mode::D2,
+            Window3::default(),
+            origin,
+            (800, 600),
+            &Theme::light(),
+        );
         let content = &g.segments[base_len(Mode::D2)..];
         assert!(content.len() > 20);
         let mut checked = 0;
@@ -1954,16 +2572,33 @@ mod tests {
     fn preview_meshes_surfaces_coarser_and_keeps_everything_else() {
         let d = doc_with(&[("s", "z=\\sin(x)\\cos(y)"), ("p", "(1,2,3)")]);
         let full = build(&d, Mode::D3);
-        let (pre, coarse) = build_scene_preview(&d, Mode::D3, Window3::default(), [0.0; 3], (800, 600), &Theme::light());
+        let (pre, coarse) = build_scene_preview(
+            &d,
+            Mode::D3,
+            Window3::default(),
+            [0.0; 3],
+            (800, 600),
+            &Theme::light(),
+        );
         assert!(coarse);
         assert!(!pre.vertices.is_empty() && pre.vertices.len() * 4 < full.vertices.len());
-        assert_eq!(pre.segments, full.segments, "grid, axes and the point are identical");
+        assert_eq!(
+            pre.segments, full.segments,
+            "grid, axes and the point are identical"
+        );
         assert_eq!(pre.labels, full.labels);
         assert_eq!(pre.item_colors, full.item_colors);
         // The cap is scoped to the preview call.
         assert_eq!(build(&d, Mode::D3).vertices.len(), full.vertices.len());
         // Nothing to coarsen: not coarse, and identical to a full build.
-        let (flat, coarse) = build_scene_preview(&d, Mode::D2, Window3::default(), [0.0; 3], (800, 600), &Theme::light());
+        let (flat, coarse) = build_scene_preview(
+            &d,
+            Mode::D2,
+            Window3::default(),
+            [0.0; 3],
+            (800, 600),
+            &Theme::light(),
+        );
         assert!(!coarse);
         assert_eq!(flat, build(&d, Mode::D2));
     }
@@ -1973,7 +2608,11 @@ mod tests {
         let d = doc_with(&[("s", "x^2+y^2+z^2=4")]);
         let t = std::time::Instant::now();
         let g = build(&d, Mode::D3);
-        eprintln!("sphere scene built in {:?}, {} verts", t.elapsed(), g.vertices.len());
+        eprintln!(
+            "sphere scene built in {:?}, {} verts",
+            t.elapsed(),
+            g.vertices.len()
+        );
         assert!(g.vertices.len() > 200);
         for v in &g.vertices {
             let r = (v.pos[0].powi(2) + v.pos[1].powi(2) + v.pos[2].powi(2)).sqrt();
@@ -2006,7 +2645,15 @@ mod tests {
         assert_eq!(g.diagnostics.len(), 1);
         assert!(g.diagnostics[0].1.contains('a'), "{:?}", g.diagnostics);
         assert_eq!(g.segments.len(), base_len(Mode::D2));
-        d.sliders.insert("a".into(), SliderCfg { min: -5.0, max: 5.0, step: None, value: 2.0 });
+        d.sliders.insert(
+            "a".into(),
+            SliderCfg {
+                min: -5.0,
+                max: 5.0,
+                step: None,
+                value: 2.0,
+            },
+        );
         let g = build(&d, Mode::D2);
         assert!(g.diagnostics.is_empty());
         let content = &g.segments[base_len(Mode::D2)..];
@@ -2061,7 +2708,10 @@ mod tests {
         for span in [0.37, 3.3, 17.0, 460.0, 1e-3] {
             let s = nice_step(span, 800.0, 100.0);
             let m = s / 10f64.powf(s.log10().floor());
-            assert!([1.0, 2.0, 5.0].iter().any(|c| (m - c).abs() < 1e-9), "{span} {s}");
+            assert!(
+                [1.0, 2.0, 5.0].iter().any(|c| (m - c).abs() < 1e-9),
+                "{span} {s}"
+            );
         }
         assert_eq!(minor_divisions(2.0), 4);
         assert_eq!(minor_divisions(0.5), 5);
@@ -2102,9 +2752,16 @@ mod tests {
         let mut d = Doc::new_default();
         d.items.push(Item::new("v", ItemKind::Expression, "2+3"));
         let g = build(&d, Mode::D1);
-        let dot = g.segments.iter().find(|s| s.p0 == s.p1 && s.width == DOT_W).expect("dot");
+        let dot = g
+            .segments
+            .iter()
+            .find(|s| s.p0 == s.p1 && s.width == DOT_W)
+            .expect("dot");
         assert_eq!(dot.p0, [5.0, 0.0, 0.0]);
-        assert!(g.labels.iter().any(|l| l.text == "5" && l.pos == [5.0, 0.0, 0.0]));
+        assert!(g
+            .labels
+            .iter()
+            .any(|l| l.text == "5" && l.pos == [5.0, 0.0, 0.0]));
     }
 
     #[test]
@@ -2148,28 +2805,48 @@ mod tests {
         for mode in [Mode::D1, Mode::D2, Mode::D3] {
             let t = std::time::Instant::now();
             let g = build(&d, mode);
-            eprintln!("{mode:?}: {:?} ({} segs, {} verts)", t.elapsed(), g.segments.len(), g.vertices.len());
+            eprintln!(
+                "{mode:?}: {:?} ({} segs, {} verts)",
+                t.elapsed(),
+                g.segments.len(),
+                g.vertices.len()
+            );
             assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
         }
         let g = build(&d, Mode::D2);
-        assert!(g.segments.iter().any(|s| s.p0 == [1.0, 2.0, 0.0] && s.p0 == s.p1));
+        assert!(g
+            .segments
+            .iter()
+            .any(|s| s.p0 == [1.0, 2.0, 0.0] && s.p0 == s.p1));
     }
 
     #[test]
     fn inequality_emits_fill_field_with_flag() {
         use crate::geometry::FieldKind;
-        for (src, greater) in [("y<x^2", false), ("y<=x^2", false), ("y>sin(x)", true), ("y>=x", true)] {
+        for (src, greater) in [
+            ("y<x^2", false),
+            ("y<=x^2", false),
+            ("y>sin(x)", true),
+            ("y>=x", true),
+        ] {
             let g = build(&doc_with(&[("a", src)]), Mode::D2);
             assert!(g.diagnostics.is_empty(), "{src}: {:?}", g.diagnostics);
             assert_eq!(g.fields.len(), 1, "{src}");
             assert_eq!(g.fields[0].kind, FieldKind::Fill { greater }, "{src}");
-            assert!(g.fields[0].wgsl.contains("fn field_fn(v0: f32, v1: f32) -> f32"));
+            assert!(g.fields[0]
+                .wgsl
+                .contains("fn field_fn(v0: f32, v1: f32) -> f32"));
             // boundary contour still drawn
             assert!(g.segments.len() > base_len(Mode::D2), "{src}");
         }
         // 3D: plane patch plus the boundary surface; 1D: no field.
-        assert_eq!(build(&doc_with(&[("a", "y<x^2")]), Mode::D3).fields.len(), 1);
-        assert!(build(&doc_with(&[("a", "y<x^2")]), Mode::D1).fields.is_empty());
+        assert_eq!(
+            build(&doc_with(&[("a", "y<x^2")]), Mode::D3).fields.len(),
+            1
+        );
+        assert!(build(&doc_with(&[("a", "y<x^2")]), Mode::D1)
+            .fields
+            .is_empty());
         // uses z: boundary surface only, no plane fill and no error
         let g = build(&doc_with(&[("a", "x^2+y^2+z^2<36")]), Mode::D3);
         assert!(g.fields.is_empty() && g.diagnostics.is_empty() && !g.vertices.is_empty());
@@ -2178,7 +2855,15 @@ mod tests {
     #[test]
     fn bare_expression_of_x_draws_as_a_curve_like_y_equals() {
         let base = base_len(Mode::D2);
-        for src in ["x^2", "2x", r"\frac{d}{dx}x^2", r"\frac{d}{dx}\left(x^3\right)", r"\frac{d^2}{dx^2}\sin x", "d/dx x^2", "sin(x)"] {
+        for src in [
+            "x^2",
+            "2x",
+            r"\frac{d}{dx}x^2",
+            r"\frac{d}{dx}\left(x^3\right)",
+            r"\frac{d^2}{dx^2}\sin x",
+            "d/dx x^2",
+            "sin(x)",
+        ] {
             let g = build(&doc_with(&[("a", src)]), Mode::D2);
             assert!(g.diagnostics.is_empty(), "{src}: {:?}", g.diagnostics);
             assert!(g.fields.is_empty(), "{src} must not be a hue field");
@@ -2191,7 +2876,15 @@ mod tests {
         assert_eq!(a.segments.len(), b.segments.len());
         assert_eq!(b.segments.len(), c.segments.len());
         // genuinely two-variable scalars are still hue fields
-        assert_eq!(build(&doc_with(&[("a", r"\frac{d}{dx}\left(x^2y\right)")]), Mode::D2).fields.len(), 1);
+        assert_eq!(
+            build(
+                &doc_with(&[("a", r"\frac{d}{dx}\left(x^2y\right)")]),
+                Mode::D2
+            )
+            .fields
+            .len(),
+            1
+        );
     }
 
     #[test]
@@ -2199,16 +2892,31 @@ mod tests {
         use crate::geometry::FieldKind;
         use math_core::analyze::{analyze, Kind};
         use math_core::compile::{compile, Angle};
-        for src in [r"0\le y\le x^2", r"0\leq y\leq x^{2}", r"x^2\ge y\ge 0", r"x^{2}\geq y\geq0", "0<=y<=x^2"] {
+        for src in [
+            r"0\le y\le x^2",
+            r"0\leq y\leq x^{2}",
+            r"x^2\ge y\ge 0",
+            r"x^{2}\geq y\geq0",
+            "0<=y<=x^2",
+        ] {
             let g = build(&doc_with(&[("a", src)]), Mode::D2);
             assert!(g.diagnostics.is_empty(), "{src}: {:?}", g.diagnostics);
             assert_eq!(g.fields.len(), 1, "{src}");
-            assert_eq!(g.fields[0].kind, FieldKind::Fill { greater: false }, "{src}");
+            assert_eq!(
+                g.fields[0].kind,
+                FieldKind::Fill { greater: false },
+                "{src}"
+            );
             // the shader and the boundary contour use the one margin function: both bounds
             let e = math_core::parse::parse(src).unwrap();
-            let Kind::Inequality { f, .. } = analyze(&e, &BTreeSet::new()).kind else { panic!("{src}") };
+            let Kind::Inequality { f, .. } = analyze(&e, &BTreeSet::new()).kind else {
+                panic!("{src}")
+            };
             let m = compile(&f, &["x", "y"], Angle::Rad).unwrap();
-            assert!(m.eval(&[1.0, 0.5]) < 0.0, "{src}: between the bounds is filled");
+            assert!(
+                m.eval(&[1.0, 0.5]) < 0.0,
+                "{src}: between the bounds is filled"
+            );
             assert!(m.eval(&[0.5, 5.0]) > 0.0, "{src}: above x^2 is NOT filled");
             assert!(m.eval(&[3.0, -1.0]) > 0.0, "{src}: below 0 is NOT filled");
             assert!(m.eval(&[-2.0, 3.0]) < 0.0, "{src}: x<0 side too");
@@ -2217,20 +2925,37 @@ mod tests {
 
     #[test]
     fn mathlive_integral_and_sum_items_evaluate() {
-        for src in [r"\int_{0}^{2}x^{2}\,dx", r"\sum_{n=0}^{6}\frac{x^{n}}{n!}", r"y=\int_0^x t\,dt", r"\prod_{k=1}^{4}k"] {
+        for src in [
+            r"\int_{0}^{2}x^{2}\,dx",
+            r"\sum_{n=0}^{6}\frac{x^{n}}{n!}",
+            r"y=\int_0^x t\,dt",
+            r"\prod_{k=1}^{4}k",
+        ] {
             let g = build(&doc_with(&[("a", src)]), Mode::D2);
             assert!(g.diagnostics.is_empty(), "{src}: {:?}", g.diagnostics);
         }
         let g = build(&doc_with(&[("a", r"\int_{0}^{2}x^{2}")]), Mode::D2);
         assert_eq!(g.diagnostics.len(), 1);
-        assert!(g.diagnostics[0].1.contains("differential"), "{:?}", g.diagnostics);
+        assert!(
+            g.diagnostics[0].1.contains("differential"),
+            "{:?}",
+            g.diagnostics
+        );
         let g = build(&doc_with(&[("a", r"\int x\,dx")]), Mode::D2);
-        assert!(g.diagnostics[0].1.contains("indefinite"), "{:?}", g.diagnostics);
+        assert!(
+            g.diagnostics[0].1.contains("indefinite"),
+            "{:?}",
+            g.diagnostics
+        );
     }
 
     #[test]
     fn letter_times_latex_function_is_a_slider_candidate_like_k() {
-        for (a, k) in [(r"y=a\sin\left(x\right)", r"y=k\sin\left(x\right)"), (r"y=a\cos x", "y=k*cos(x)"), (r"y=a\ln x", "y=k*ln(x)")] {
+        for (a, k) in [
+            (r"y=a\sin\left(x\right)", r"y=k\sin\left(x\right)"),
+            (r"y=a\cos x", "y=k*cos(x)"),
+            (r"y=a\ln x", "y=k*ln(x)"),
+        ] {
             let da = build(&doc_with(&[("i", a)]), Mode::D2).diagnostics;
             let dk = build(&doc_with(&[("i", k)]), Mode::D2).diagnostics;
             assert_eq!(da.len(), 1, "{a}: {da:?}");
@@ -2238,7 +2963,15 @@ mod tests {
             assert_eq!(dk[0].1, "undefined variable 'k'");
         }
         let mut d = doc_with(&[("i", r"y=a\sin\left(x\right)")]);
-        d.sliders.insert("a".into(), SliderCfg { min: -5.0, max: 5.0, step: None, value: 2.0 });
+        d.sliders.insert(
+            "a".into(),
+            SliderCfg {
+                min: -5.0,
+                max: 5.0,
+                step: None,
+                value: 2.0,
+            },
+        );
         let g = build(&d, Mode::D2);
         assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
         assert!(g.segments.len() > base_len(Mode::D2) + 20);
@@ -2248,7 +2981,14 @@ mod tests {
     fn field_rect_is_origin_relative() {
         let d = doc_with(&[("a", "x+y")]);
         let origin = [3.0, -2.0, 0.0];
-        let g = build_scene(&d, Mode::D2, Window3::default(), origin, (800, 600), &Theme::light());
+        let g = build_scene(
+            &d,
+            Mode::D2,
+            Window3::default(),
+            origin,
+            (800, 600),
+            &Theme::light(),
+        );
         let f = &g.fields[0];
         assert_eq!(f.origin_xy, [3.0, -2.0]);
         let w = Window3::default();
@@ -2284,7 +3024,15 @@ mod tests {
         let mut d = doc_with(&[("a", "a*x+y")]);
         let g = build(&d, Mode::D2);
         assert!(g.fields.is_empty() && g.diagnostics.len() == 1);
-        d.sliders.insert("a".into(), SliderCfg { min: -5.0, max: 5.0, step: None, value: 2.0 });
+        d.sliders.insert(
+            "a".into(),
+            SliderCfg {
+                min: -5.0,
+                max: 5.0,
+                step: None,
+                value: 2.0,
+            },
+        );
         let f2 = build(&d, Mode::D2).fields[0].clone();
         d.sliders.get_mut("a").unwrap().value = 3.0;
         let f3 = build(&d, Mode::D2).fields[0].clone();
@@ -2292,35 +3040,83 @@ mod tests {
         assert_eq!(f2.wgsl, f3.wgsl, "a slider drag must not change the shader");
         assert_eq!(f2.params, vec![2.0]);
         assert_eq!(f3.params, vec![3.0]);
-        assert!(f2.wgsl.contains("fp.params[0].x") && f2.wgsl.contains("fn field_core(v0: f32, v1: f32, v2: f32)"));
+        assert!(
+            f2.wgsl.contains("fp.params[0].x")
+                && f2.wgsl.contains("fn field_core(v0: f32, v1: f32, v2: f32)")
+        );
     }
 
     #[test]
     fn slider_field_params_are_sorted_and_definitions_stay_folded() {
         // `k` is a plain definition (folded); `b` and `a` are sliders (inputs, sorted by name).
         let mut d = doc_with(&[("k", "k=4"), ("f", "y<b*x+a*k")]);
-        d.sliders.insert("a".into(), SliderCfg { min: -5.0, max: 5.0, step: None, value: 2.0 });
-        d.sliders.insert("b".into(), SliderCfg { min: -5.0, max: 5.0, step: None, value: 7.0 });
+        d.sliders.insert(
+            "a".into(),
+            SliderCfg {
+                min: -5.0,
+                max: 5.0,
+                step: None,
+                value: 2.0,
+            },
+        );
+        d.sliders.insert(
+            "b".into(),
+            SliderCfg {
+                min: -5.0,
+                max: 5.0,
+                step: None,
+                value: 7.0,
+            },
+        );
         let f = build(&d, Mode::D2).fields[0].clone();
         assert_eq!(f.params, vec![2.0, 7.0]);
-        assert!(f.wgsl.contains("4.0") && f.wgsl.contains("fp.params[0].y"), "{}", f.wgsl);
+        assert!(
+            f.wgsl.contains("4.0") && f.wgsl.contains("fp.params[0].y"),
+            "{}",
+            f.wgsl
+        );
         d.sliders.get_mut("b").unwrap().value = -1.0;
         let g = build(&d, Mode::D2).fields[0].clone();
         assert_eq!(f.wgsl, g.wgsl);
         assert_eq!(g.params, vec![2.0, -1.0]);
         // A slider overrides a same-named definition.
         let mut d = doc_with(&[("k", "k=4"), ("f", "y<k*x")]);
-        d.sliders.insert("k".into(), SliderCfg { min: 0.0, max: 9.0, step: None, value: 5.0 });
+        d.sliders.insert(
+            "k".into(),
+            SliderCfg {
+                min: 0.0,
+                max: 9.0,
+                step: None,
+                value: 5.0,
+            },
+        );
         assert_eq!(build(&d, Mode::D2).fields[0].params, vec![5.0]);
     }
 
     #[test]
     fn too_many_sliders_fall_back_to_folding() {
-        let names: Vec<String> = (0..17).map(|i| format!("{}", (b'a' + i as u8) as char)).collect();
-        let latex = format!("y<{}", names.iter().map(|n| format!("{n}*x")).collect::<Vec<_>>().join("+"));
+        let names: Vec<String> = (0..17)
+            .map(|i| format!("{}", (b'a' + i as u8) as char))
+            .collect();
+        let latex = format!(
+            "y<{}",
+            names
+                .iter()
+                .map(|n| format!("{n}*x"))
+                .collect::<Vec<_>>()
+                .join("+")
+        );
         let mut d = doc_with(&[("f", latex.as_str())]);
         for n in &names {
-            d.sliders.insert(n.clone(), SliderCfg { min: 0.0, max: 9.0, step: None, value: 2.0 });
+            d.sliders.insert(
+                n.clone(),
+                SliderCfg {
+                    min: 0.0,
+                    max: 9.0,
+                    step: None,
+                    value: 2.0,
+                },
+            );
         }
         let g = build(&d, Mode::D2);
         assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
@@ -2342,7 +3138,9 @@ mod tests {
                 assert_eq!(g.fields.len(), 1, "{latex} {mode:?}");
                 let f = &g.fields[0];
                 assert_eq!(f.kind, FieldKind::Domain);
-                assert!(f.wgsl.contains("fn field_color(x: f32, y: f32) -> vec4<f32>"));
+                assert!(f
+                    .wgsl
+                    .contains("fn field_color(x: f32, y: f32) -> vec4<f32>"));
                 assert!((f.color[3] - alpha).abs() < 1e-6);
             }
             let g = build(&complex_doc(latex), Mode::D1);
@@ -2355,7 +3153,11 @@ mod tests {
         let g = build(&complex_doc("w+1"), Mode::D2);
         assert!(g.fields.is_empty());
         assert_eq!(g.diagnostics.len(), 1);
-        assert!(g.diagnostics[0].1.contains("undefined variable 'w'"), "{:?}", g.diagnostics);
+        assert!(
+            g.diagnostics[0].1.contains("undefined variable 'w'"),
+            "{:?}",
+            g.diagnostics
+        );
         // `i` is the imaginary unit, never an undefined variable (so no slider is offered).
         let g = build(&complex_doc("i*z+i"), Mode::D2);
         assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
@@ -2371,16 +3173,46 @@ mod tests {
     fn complex_slider_flows_through_and_z_is_not_shadowed() {
         let mut d = complex_doc("a*z");
         assert_eq!(build(&d, Mode::D2).diagnostics.len(), 1);
-        d.sliders.insert("a".into(), SliderCfg { min: -5.0, max: 5.0, step: None, value: 2.0 });
+        d.sliders.insert(
+            "a".into(),
+            SliderCfg {
+                min: -5.0,
+                max: 5.0,
+                step: None,
+                value: 2.0,
+            },
+        );
         let f2 = build(&d, Mode::D2).fields[0].clone();
         d.sliders.get_mut("a").unwrap().value = 3.0;
         let f3 = build(&d, Mode::D2).fields[0].clone();
-        assert_eq!(f2.wgsl, f3.wgsl, "domain colouring: slider is a uniform too");
-        assert_eq!((f2.params.clone(), f3.params.clone()), (vec![2.0], vec![3.0]));
+        assert_eq!(
+            f2.wgsl, f3.wgsl,
+            "domain colouring: slider is a uniform too"
+        );
+        assert_eq!(
+            (f2.params.clone(), f3.params.clone()),
+            (vec![2.0], vec![3.0])
+        );
         let w3 = f3.wgsl;
         // A slider or definition named z / i must not replace the plane variable.
-        d.sliders.insert("z".into(), SliderCfg { min: 0.0, max: 9.0, step: None, value: 7.0 });
-        d.sliders.insert("i".into(), SliderCfg { min: 0.0, max: 9.0, step: None, value: 7.0 });
+        d.sliders.insert(
+            "z".into(),
+            SliderCfg {
+                min: 0.0,
+                max: 9.0,
+                step: None,
+                value: 7.0,
+            },
+        );
+        d.sliders.insert(
+            "i".into(),
+            SliderCfg {
+                min: 0.0,
+                max: 9.0,
+                step: None,
+                value: 7.0,
+            },
+        );
         let w = build(&d, Mode::D2).fields[0].wgsl.clone();
         assert_eq!(w, w3);
     }
@@ -2393,7 +3225,10 @@ mod tests {
         assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
         assert_eq!(g.fields.len(), 1);
         assert_eq!(g.fields[0].kind, FieldKind::Domain);
-        assert!(g.segments.len() > base_len(Mode::D2), "real item still draws");
+        assert!(
+            g.segments.len() > base_len(Mode::D2),
+            "real item still draws"
+        );
     }
 
     // ----- lists and statistical plots ------------------------------------------------------
@@ -2403,12 +3238,25 @@ mod tests {
         g.segments[base_len(mode)..]
             .iter()
             .filter(|s| s.p0 == s.p1 && s.width == DOT_W)
-            .map(|s| [s.p0[0] as f64 + origin[0], s.p0[1] as f64 + origin[1], s.p0[2] as f64 + origin[2]])
+            .map(|s| {
+                [
+                    s.p0[0] as f64 + origin[0],
+                    s.p0[1] as f64 + origin[1],
+                    s.p0[2] as f64 + origin[2],
+                ]
+            })
             .collect()
     }
 
     fn build_at(d: &Doc, mode: Mode, origin: [f64; 3]) -> SceneGeometry {
-        build_scene(d, mode, Window3::default(), origin, (800, 600), &Theme::light())
+        build_scene(
+            d,
+            mode,
+            Window3::default(),
+            origin,
+            (800, 600),
+            &Theme::light(),
+        )
     }
 
     fn close(a: f64, b: f64) -> bool {
@@ -2421,10 +3269,13 @@ mod tests {
             .chunks(6)
             .map(|q| {
                 let vs: Vec<_> = q.iter().map(|i| g.vertices[*i as usize]).collect();
-                assert!(vs.iter().all(|v| v.normal == [0.0; 3] && v.pos[2] == (-origin[2]) as f32));
+                assert!(vs
+                    .iter()
+                    .all(|v| v.normal == [0.0; 3] && v.pos[2] == (-origin[2]) as f32));
                 let xs: Vec<f64> = vs.iter().map(|v| v.pos[0] as f64 + origin[0]).collect();
                 let ys: Vec<f64> = vs.iter().map(|v| v.pos[1] as f64 + origin[1]).collect();
-                let f = |v: &[f64], m: fn(f64, f64) -> f64, init: f64| v.iter().copied().fold(init, m);
+                let f =
+                    |v: &[f64], m: fn(f64, f64) -> f64, init: f64| v.iter().copied().fold(init, m);
                 [
                     f(&xs, f64::min, f64::INFINITY),
                     f(&xs, f64::max, f64::NEG_INFINITY),
@@ -2467,21 +3318,29 @@ mod tests {
         d.items[0].style.opacity = Some(0.5);
         let g = build(&d, Mode::D2);
         let s = g.segments.last().unwrap();
-        assert!(close(s.color[2] as f64, 0x99 as f64 / 255.0) && close(s.color[3] as f64, 0.5), "{:?}", s.color);
+        assert!(
+            close(s.color[2] as f64, 0x99 as f64 / 255.0) && close(s.color[3] as f64, 0.5),
+            "{:?}",
+            s.color
+        );
     }
 
     #[test]
     fn point_lists_in_3d_and_1d() {
         let mut d = doc_with(&[("p", "(a, b, c)"), ("q", "(a, b)")]);
         for (n, v) in [("a", "[1,2]"), ("b", "[3,4]"), ("c", "[5,6]")] {
-            d.items.push(Item::new(n, ItemKind::Equation, &format!("{n}={v}")));
+            d.items
+                .push(Item::new(n, ItemKind::Equation, &format!("{n}={v}")));
         }
         let g = build(&d, Mode::D3);
         assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
         let pts = dots(&g, Mode::D3, [0.0; 3]);
         assert_eq!(pts.len(), 4);
         assert!(pts.contains(&[1.0, 3.0, 5.0]) && pts.contains(&[2.0, 4.0, 6.0]));
-        assert!(pts.contains(&[1.0, 3.0, 0.0]) && pts.contains(&[2.0, 4.0, 0.0]), "2-comp at z=0: {pts:?}");
+        assert!(
+            pts.contains(&[1.0, 3.0, 0.0]) && pts.contains(&[2.0, 4.0, 0.0]),
+            "2-comp at z=0: {pts:?}"
+        );
         // 2D: 3-component points have no place on the plane (no diagnostic either).
         let g = build(&doc_with(&[("p", "[(1,2,3)]")]), Mode::D2);
         assert!(g.diagnostics.is_empty() && dots(&g, Mode::D2, [0.0; 3]).is_empty());
@@ -2489,7 +3348,10 @@ mod tests {
         let g = build(&doc_with(&[("p", "[(1,2),(3,4)]")]), Mode::D1);
         assert!(g.diagnostics.is_empty());
         let pts = dots(&g, Mode::D1, [0.0; 3]);
-        assert_eq!(pts.iter().map(|p| (p[0], p[1])).collect::<Vec<_>>(), vec![(1.0, 0.0), (3.0, 0.0)]);
+        assert_eq!(
+            pts.iter().map(|p| (p[0], p[1])).collect::<Vec<_>>(),
+            vec![(1.0, 0.0), (3.0, 0.0)]
+        );
     }
 
     #[test]
@@ -2506,14 +3368,25 @@ mod tests {
             assert!(g.vertices.is_empty() && g.flat_indices.is_empty());
         }
         // A range, and a scalar aggregate of a list on the 1D line.
-        let g = build(&doc_with(&[("l", "[1...5]"), ("m", "mean([1,2,6])")]), Mode::D1);
+        let g = build(
+            &doc_with(&[("l", "[1...5]"), ("m", "mean([1,2,6])")]),
+            Mode::D1,
+        );
         assert_eq!(dots(&g, Mode::D1, [0.0; 3]).len(), 6);
     }
 
     #[test]
     fn slider_flows_into_list_items() {
         let mut d = doc_with(&[("l", "[n*a for n=[1...5]]")]);
-        d.sliders.insert("a".into(), SliderCfg { min: 0.0, max: 5.0, step: None, value: 2.0 });
+        d.sliders.insert(
+            "a".into(),
+            SliderCfg {
+                min: 0.0,
+                max: 5.0,
+                step: None,
+                value: 2.0,
+            },
+        );
         let xs = |d: &Doc| -> Vec<f64> {
             let g = build(d, Mode::D1);
             assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
@@ -2524,7 +3397,15 @@ mod tests {
         assert_eq!(xs(&d), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
         // And into a histogram bin width.
         let mut d = doc_with(&[("h", &format!("histogram({SAMPLE}, w)"))]);
-        d.sliders.insert("w".into(), SliderCfg { min: 0.1, max: 5.0, step: None, value: 1.0 });
+        d.sliders.insert(
+            "w".into(),
+            SliderCfg {
+                min: 0.1,
+                max: 5.0,
+                step: None,
+                value: 1.0,
+            },
+        );
         let n1 = build(&d, Mode::D2).flat_indices.len();
         d.sliders.get_mut("w").unwrap().value = 10.0;
         let g = build(&d, Mode::D2);
@@ -2538,32 +3419,67 @@ mod tests {
         let d = doc_with(&[("h", &format!("histogram({SAMPLE}, 1)"))]);
         let g = build_at(&d, Mode::D2, origin);
         assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
-        assert!(g.indices.is_empty(), "bars are flat geometry, not lit surfaces");
+        assert!(
+            g.indices.is_empty(),
+            "bars are flat geometry, not lit surfaces"
+        );
         let b = bars(&g, origin);
-        let want = [[1.0, 2.0, 1.0], [2.0, 3.0, 2.0], [3.0, 4.0, 3.0], [4.0, 5.0, 2.0], [5.0, 6.0, 1.0], [9.0, 10.0, 1.0]];
+        let want = [
+            [1.0, 2.0, 1.0],
+            [2.0, 3.0, 2.0],
+            [3.0, 4.0, 3.0],
+            [4.0, 5.0, 2.0],
+            [5.0, 6.0, 1.0],
+            [9.0, 10.0, 1.0],
+        ];
         assert_eq!(b.len(), want.len(), "{b:?}");
         for (bar, w) in b.iter().zip(want) {
-            assert!(close(bar[0], w[0]) && close(bar[1], w[1]) && close(bar[2], 0.0) && close(bar[3], w[2]), "{bar:?} vs {w:?}");
+            assert!(
+                close(bar[0], w[0])
+                    && close(bar[1], w[1])
+                    && close(bar[2], 0.0)
+                    && close(bar[3], w[2]),
+                "{bar:?} vs {w:?}"
+            );
         }
         // Translucent fill; outline uses the full item colour at 1.5 px.
-        assert!(g.vertices.iter().all(|v| close(v.color[3] as f64, BAR_ALPHA as f64)));
-        let outline: Vec<_> = g.segments[base_len(Mode::D2)..].iter().filter(|s| s.width == BAR_OUTLINE_W).collect();
+        assert!(g
+            .vertices
+            .iter()
+            .all(|v| close(v.color[3] as f64, BAR_ALPHA as f64)));
+        let outline: Vec<_> = g.segments[base_len(Mode::D2)..]
+            .iter()
+            .filter(|s| s.width == BAR_OUTLINE_W)
+            .collect();
         assert!(outline.len() >= 12 && outline.iter().all(|s| s.color[3] == 1.0));
         // Default bin width (no argument): every value lands in some bar.
         let d = doc_with(&[("h", &format!("histogram({SAMPLE})"))]);
         let g = build(&d, Mode::D2);
         let total: f64 = bars(&g, [0.0; 3]).iter().map(|b| b[3] - b[2]).sum();
-        assert!(g.diagnostics.is_empty() && g.flat_indices.len() >= 12, "{:?}", g.diagnostics);
-        assert!(close(total, 10.0), "bar heights are counts and sum to n: {total}");
+        assert!(
+            g.diagnostics.is_empty() && g.flat_indices.len() >= 12,
+            "{:?}",
+            g.diagnostics
+        );
+        assert!(
+            close(total, 10.0),
+            "bar heights are counts and sum to n: {total}"
+        );
     }
 
     #[test]
     fn default_bin_width_rules() {
         let sample = [1.0, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0, 4.0, 5.0, 9.0];
         // Freedman-Diaconis: IQR = 1.75, n = 10.
-        assert!(close(default_bin_width(&sample), 2.0 * 1.75 * 10f64.powf(-1.0 / 3.0)));
+        assert!(close(
+            default_bin_width(&sample),
+            2.0 * 1.75 * 10f64.powf(-1.0 / 3.0)
+        ));
         // IQR 0 -> Sturges: range 4 / (ceil(log2 8) + 1).
-        assert!(close(default_bin_width(&[0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 4.0]), 1.0));
+        assert!(close(
+            default_bin_width(&[0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 4.0]),
+            1.0
+        ));
         assert_eq!(default_bin_width(&[3.0, 3.0]), 1.0);
     }
 
@@ -2582,24 +3498,51 @@ mod tests {
     #[test]
     fn boxplot_matches_quartiles() {
         let data = [1.0, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0, 4.0, 5.0, 9.0];
-        let (q1, med, q3) =
-            (stats::quartile(&data, 1.0).unwrap(), stats::quartile(&data, 2.0).unwrap(), stats::quartile(&data, 3.0).unwrap());
+        let (q1, med, q3) = (
+            stats::quartile(&data, 1.0).unwrap(),
+            stats::quartile(&data, 2.0).unwrap(),
+            stats::quartile(&data, 3.0).unwrap(),
+        );
         let origin = [0.5, 0.0, 0.0];
         let d = doc_with(&[("b", &format!("boxplot({SAMPLE})"))]);
         let g = build_at(&d, Mode::D2, origin);
         assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
         let b = bars(&g, origin);
         assert_eq!(b.len(), 1);
-        assert!(close(b[0][0], q1) && close(b[0][1], q3), "{b:?} q1={q1} q3={q3}");
-        assert!(close(b[0][2], -b[0][3]) && b[0][3] > 0.0, "centred on y = 0");
-        let segs: Vec<_> = g.segments[base_len(Mode::D2)..].iter().filter(|s| s.p0 != s.p1).collect();
+        assert!(
+            close(b[0][0], q1) && close(b[0][1], q3),
+            "{b:?} q1={q1} q3={q3}"
+        );
+        assert!(
+            close(b[0][2], -b[0][3]) && b[0][3] > 0.0,
+            "centred on y = 0"
+        );
+        let segs: Vec<_> = g.segments[base_len(Mode::D2)..]
+            .iter()
+            .filter(|s| s.p0 != s.p1)
+            .collect();
         let x = |v: f32| v as f64 + origin[0];
         // Median line.
-        assert!(segs.iter().any(|s| s.width == 3.0 && close(x(s.p0[0]), med) && close(x(s.p1[0]), med)));
+        assert!(segs
+            .iter()
+            .any(|s| s.width == 3.0 && close(x(s.p0[0]), med) && close(x(s.p1[0]), med)));
         // Whiskers: lower to 1, upper to 5 (9 is beyond Q3 + 1.5 IQR = 6.625).
-        let horiz: Vec<_> = segs.iter().filter(|s| s.p0[1] == 0.0 && s.p1[1] == 0.0).collect();
-        assert!(horiz.iter().any(|s| close(x(s.p0[0]), q1) && close(x(s.p1[0]), 1.0)), "{horiz:?}");
-        assert!(horiz.iter().any(|s| close(x(s.p0[0]), q3) && close(x(s.p1[0]), 5.0)), "{horiz:?}");
+        let horiz: Vec<_> = segs
+            .iter()
+            .filter(|s| s.p0[1] == 0.0 && s.p1[1] == 0.0)
+            .collect();
+        assert!(
+            horiz
+                .iter()
+                .any(|s| close(x(s.p0[0]), q1) && close(x(s.p1[0]), 1.0)),
+            "{horiz:?}"
+        );
+        assert!(
+            horiz
+                .iter()
+                .any(|s| close(x(s.p0[0]), q3) && close(x(s.p1[0]), 5.0)),
+            "{horiz:?}"
+        );
         // Outlier dot at 9.
         let pts = dots(&g, Mode::D2, origin);
         assert_eq!(pts.len(), 1);
@@ -2614,14 +3557,21 @@ mod tests {
         let pts = dots(&g, Mode::D2, [0.0; 3]);
         assert_eq!(pts.len(), 10);
         let at = |x: f64| {
-            let mut ys: Vec<f64> = pts.iter().filter(|p| close(p[0], x)).map(|p| p[1]).collect();
+            let mut ys: Vec<f64> = pts
+                .iter()
+                .filter(|p| close(p[0], x))
+                .map(|p| p[1])
+                .collect();
             ys.sort_by(f64::total_cmp);
             ys
         };
         for (x, n) in [(1.0, 1), (2.0, 2), (3.0, 3), (4.0, 2), (5.0, 1), (9.0, 1)] {
             let ys = at(x);
             assert_eq!(ys.len(), n, "x={x}");
-            assert!(ys[0] > 0.0 && ys.windows(2).all(|w| w[1] > w[0]), "stacked upward: {ys:?}");
+            assert!(
+                ys[0] > 0.0 && ys.windows(2).all(|w| w[1] > w[0]),
+                "stacked upward: {ys:?}"
+            );
         }
         assert!(g.flat_indices.is_empty());
     }
@@ -2643,14 +3593,22 @@ mod tests {
         ] {
             for mode in [Mode::D2, Mode::D3] {
                 let g = build(&doc_with(&[("it", bad)]), mode);
-                assert_eq!(g.diagnostics.len(), 1, "{bad} {mode:?}: {:?}", g.diagnostics);
+                assert_eq!(
+                    g.diagnostics.len(),
+                    1,
+                    "{bad} {mode:?}: {:?}",
+                    g.diagnostics
+                );
                 assert_eq!(g.diagnostics[0].0, "it");
                 assert!(!g.diagnostics[0].1.is_empty());
                 assert!(g.vertices.is_empty() && g.flat_indices.is_empty(), "{bad}");
             }
         }
         // Other items are unaffected by a bad list.
-        let g = build(&doc_with(&[("bad", "histogram([])"), ("ok", "[(1,2)]")]), Mode::D2);
+        let g = build(
+            &doc_with(&[("bad", "histogram([])"), ("ok", "[(1,2)]")]),
+            Mode::D2,
+        );
         assert_eq!(g.diagnostics.len(), 1);
         assert_eq!(dots(&g, Mode::D2, [0.0; 3]).len(), 1);
     }
@@ -2676,7 +3634,11 @@ mod tests {
 
     /// Content segments, minus the dot drawn at a zero vector.
     fn content(g: &SceneGeometry, mode: Mode) -> Vec<SegmentInstance> {
-        g.segments[base_len(mode)..].iter().filter(|s| s.p0 != s.p1).copied().collect()
+        g.segments[base_len(mode)..]
+            .iter()
+            .filter(|s| s.p0 != s.p1)
+            .copied()
+            .collect()
     }
 
     #[test]
@@ -2686,15 +3648,29 @@ mod tests {
         assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
         let c = content(&g, Mode::D2);
         // Each arrow is a shaft plus two barbs, so segment count is a multiple of 3.
-        assert!(c.len() >= 3 * 100 && c.len().is_multiple_of(3), "{}", c.len());
+        assert!(
+            c.len() >= 3 * 100 && c.len().is_multiple_of(3),
+            "{}",
+            c.len()
+        );
         // Rotation field: longer arrows far from the origin, so more than one colour appears.
-        let mut colours: Vec<[u32; 3]> =
-            c.iter().map(|s| [s.color[0].to_bits(), s.color[1].to_bits(), s.color[2].to_bits()]).collect();
+        let mut colours: Vec<[u32; 3]> = c
+            .iter()
+            .map(|s| {
+                [
+                    s.color[0].to_bits(),
+                    s.color[1].to_bits(),
+                    s.color[2].to_bits(),
+                ]
+            })
+            .collect();
         colours.sort();
         colours.dedup();
         assert!(colours.len() > 3, "colour should vary with magnitude");
         // Arrows stay inside (roughly) the window.
-        assert!(c.iter().all(|s| s.p0[0].abs() < 12.5 && s.p0[1].abs() < 12.5));
+        assert!(c
+            .iter()
+            .all(|s| s.p0[0].abs() < 12.5 && s.p0[1].abs() < 12.5));
         // Counter-clockwise: at (5, 0) the arrow points up (+y).
         let shaft = c
             .iter()
@@ -2702,16 +3678,27 @@ mod tests {
             .min_by(|a, b| {
                 let da = (a.p0[0] + a.p1[0]) / 2.0 - 5.0;
                 let db = (b.p0[0] + b.p1[0]) / 2.0 - 5.0;
-                (da.abs() + (a.p0[1] + a.p1[1]).abs()).total_cmp(&(db.abs() + (b.p0[1] + b.p1[1]).abs()))
+                (da.abs() + (a.p0[1] + a.p1[1]).abs())
+                    .total_cmp(&(db.abs() + (b.p0[1] + b.p1[1]).abs()))
             })
             .unwrap();
-        assert!(shaft.p1[1] > shaft.p0[1] && (shaft.p1[0] - shaft.p0[0]).abs() < 1e-3, "{shaft:?}");
+        assert!(
+            shaft.p1[1] > shaft.p0[1] && (shaft.p1[0] - shaft.p0[0]).abs() < 1e-3,
+            "{shaft:?}"
+        );
     }
 
     #[test]
     fn vector_field_arrow_count_is_capped_and_scales_with_zoom() {
         let d = doc_with(&[("f", "(sin(y), cos(x))")]);
-        let wide = build_scene(&d, Mode::D2, Window3::new([-1e4; 3], [1e4; 3]), [0.0; 3], (4000, 4000), &Theme::light());
+        let wide = build_scene(
+            &d,
+            Mode::D2,
+            Window3::new([-1e4; 3], [1e4; 3]),
+            [0.0; 3],
+            (4000, 4000),
+            &Theme::light(),
+        );
         let n = wide.segments.len();
         assert!(n < 3 * super::MAX_ARROWS_2D + 4000, "{n}");
     }
@@ -2721,8 +3708,22 @@ mod tests {
         let mut d = doc_with(&[("f", "(a*y, g(x))"), ("g", "g(x)=x")]);
         d.items[1].kind = ItemKind::Expression;
         let g = build(&d, Mode::D2);
-        assert!(g.diagnostics.iter().any(|(id, m)| id == "f" && m.contains('a')), "{:?}", g.diagnostics);
-        d.sliders.insert("a".into(), SliderCfg { min: -10.0, max: 10.0, step: None, value: 2.0 });
+        assert!(
+            g.diagnostics
+                .iter()
+                .any(|(id, m)| id == "f" && m.contains('a')),
+            "{:?}",
+            g.diagnostics
+        );
+        d.sliders.insert(
+            "a".into(),
+            SliderCfg {
+                min: -10.0,
+                max: 10.0,
+                step: None,
+                value: 2.0,
+            },
+        );
         let g = build(&d, Mode::D2);
         assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
         assert!(content(&g, Mode::D2).len() > 100);
@@ -2735,10 +3736,19 @@ mod tests {
         assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
         let n = content(&g, Mode::D3).len();
         // Shaft + 3 barbs per arrow, at most 12^3 arrows, and clearly more than a plane's worth.
-        assert!(n.is_multiple_of(4) && (4 * 50..=4 * 12 * 12 * 12).contains(&n), "{n}");
+        assert!(
+            n.is_multiple_of(4) && (4 * 50..=4 * 12 * 12 * 12).contains(&n),
+            "{n}"
+        );
         // A planar (P,Q) field in 3D lies on z = 0.
         let g = build(&doc_with(&[("f", "(y, -x)")]), Mode::D3);
-        assert!(content(&g, Mode::D3).iter().step_by(4).all(|s| s.p0[2] == 0.0 && s.p1[2] == 0.0), "shafts lie in z = 0");
+        assert!(
+            content(&g, Mode::D3)
+                .iter()
+                .step_by(4)
+                .all(|s| s.p0[2] == 0.0 && s.p1[2] == 0.0),
+            "shafts lie in z = 0"
+        );
         // 1D: a field mentioning y or z draws nothing; a pure x field draws a row on y = 0.
         let g = build(&doc_with(&[("f", "(x, y)")]), Mode::D1);
         assert!(content(&g, Mode::D1).is_empty());
@@ -2751,7 +3761,15 @@ mod tests {
         assert!(g.diagnostics.is_empty());
         // One dot and one curve, no arrow soup.
         let n = content(&g, Mode::D2).len();
-        assert!(n > 1000 && g.segments.iter().filter(|s| s.p0 == s.p1 && s.width == DOT_W).count() == 1, "{n}");
+        assert!(
+            n > 1000
+                && g.segments
+                    .iter()
+                    .filter(|s| s.p0 == s.p1 && s.width == DOT_W)
+                    .count()
+                    == 1,
+            "{n}"
+        );
     }
 
     fn table_doc(cols: &[(&str, &[&str])], style: TableStyle) -> Doc {
@@ -2774,7 +3792,15 @@ mod tests {
     fn table_plots_first_two_columns_as_points_and_lines() {
         let cols: [(&str, &[&str]); 2] = [("x_1", &["1", "2", "3"]), ("y_1", &["2", "4", "a"])];
         let mut d = table_doc(&cols, TableStyle::Points);
-        d.sliders.insert("a".into(), SliderCfg { min: 0.0, max: 10.0, step: None, value: 9.0 });
+        d.sliders.insert(
+            "a".into(),
+            SliderCfg {
+                min: 0.0,
+                max: 10.0,
+                step: None,
+                value: 9.0,
+            },
+        );
         let g = build(&d, Mode::D2);
         assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
         let dp = dots(&g, Mode::D2, [0.0; 3]);
@@ -2790,18 +3816,32 @@ mod tests {
 
     #[test]
     fn table_blank_and_bad_cells_skip_rows_and_report() {
-        let cols: [(&str, &[&str]); 2] = [("x_1", &["1", "", "3", "4+"]), ("y_1", &["1", "2", "3", "4"])];
+        let cols: [(&str, &[&str]); 2] = [
+            ("x_1", &["1", "", "3", "4+"]),
+            ("y_1", &["1", "2", "3", "4"]),
+        ];
         let g = build(&table_doc(&cols, TableStyle::Points), Mode::D2);
         assert_eq!(dots(&g, Mode::D2, [0.0; 3]).len(), 2);
-        assert!(g.diagnostics.iter().any(|(id, m)| id == "t" && m.contains("x_1") && m.contains("row 4")), "{:?}", g.diagnostics);
+        assert!(
+            g.diagnostics
+                .iter()
+                .any(|(id, m)| id == "t" && m.contains("x_1") && m.contains("row 4")),
+            "{:?}",
+            g.diagnostics
+        );
     }
 
     #[test]
     fn table_columns_are_lists_for_other_items() {
-        let cols: [(&str, &[&str]); 2] = [("x_1", &["1", "2", "3", "4"]), ("y_1", &["1", "2", "3", "4"])];
+        let cols: [(&str, &[&str]); 2] = [
+            ("x_1", &["1", "2", "3", "4"]),
+            ("y_1", &["1", "2", "3", "4"]),
+        ];
         let mut d = table_doc(&cols, TableStyle::Hidden);
-        d.items.push(Item::new("h", ItemKind::Equation, "histogram(x_1)"));
-        d.items.push(Item::new("m", ItemKind::Equation, "mean(y_1)"));
+        d.items
+            .push(Item::new("h", ItemKind::Equation, "histogram(x_1)"));
+        d.items
+            .push(Item::new("m", ItemKind::Equation, "mean(y_1)"));
         let g = build(&d, Mode::D1);
         assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
         // mean(y_1) = 2.5 is a value: a dot on the number line (hidden table draws nothing).
@@ -2810,7 +3850,10 @@ mod tests {
         assert!(close(dp[0][0], 2.5));
         let g2 = build(&d, Mode::D2);
         assert!(g2.diagnostics.is_empty(), "{:?}", g2.diagnostics);
-        assert!(!g2.vertices.is_empty(), "histogram of a table column draws bars");
+        assert!(
+            !g2.vertices.is_empty(),
+            "histogram of a table column draws bars"
+        );
         // A hidden table still defines its lists; deleting the table makes the name unbound.
         d.items.remove(0);
         assert!(!build(&d, Mode::D2).diagnostics.is_empty());
@@ -2823,5 +3866,344 @@ mod tests {
         let dp = dots(&g, Mode::D3, [0.0; 3]);
         assert_eq!(dp.len(), 1);
         assert!(close(dp[0][2], 3.0), "{dp:?}");
+    }
+
+    // ----- item styles and view flags -------------------------------------------------------
+
+    fn styled(src: &str, f: impl Fn(&mut math_core::doc::ItemStyle)) -> Doc {
+        let mut d = doc_with(&[("a", src)]);
+        f(&mut d.items[0].style);
+        d
+    }
+
+    /// Item segments (after the grid and axes) and their total length in world units.
+    fn item_segs(g: &SceneGeometry, mode: Mode) -> (Vec<SegmentInstance>, f64) {
+        let v: Vec<SegmentInstance> = g.segments[base_len(mode)..].to_vec();
+        let len = v
+            .iter()
+            .map(|s| {
+                (0..3)
+                    .map(|k| ((s.p1[k] - s.p0[k]) as f64).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+            })
+            .sum();
+        (v, len)
+    }
+
+    #[test]
+    fn dashed_and_dotted_curves_leave_gaps() {
+        for (src, mode) in [
+            ("y=x", Mode::D2),
+            ("x^2+y^2=25", Mode::D2),
+            ("r=2+\\sin(3\\theta)", Mode::D2),
+            ("(\\cos(t),\\sin(t),t)", Mode::D3),
+        ] {
+            let (solid, ls) = item_segs(&build(&styled(src, |_| {}), mode), mode);
+            let dashed_doc = styled(src, |s| s.line_style = Some(LineStyle::Dashed));
+            let (dashed, ld) = item_segs(&build(&dashed_doc, mode), mode);
+            assert!(!solid.is_empty() && !dashed.is_empty(), "{src}");
+            let r = ld / ls;
+            assert!(r > 0.25 && r < 0.75, "{src}: dashed/solid length {r}");
+            let dotted_doc = styled(src, |s| s.line_style = Some(LineStyle::Dotted));
+            let (dotted, _) = item_segs(&build(&dotted_doc, mode), mode);
+            assert!(dotted.len() > 10, "{src}");
+            assert!(
+                dotted.iter().all(|s| s.p0 == s.p1 && s.width == CURVE_W),
+                "{src}"
+            );
+        }
+        // A straight 2-row table line: one solid segment, many shorter dashes, phase-continuous
+        // across the vertex of a 3-row line.
+        let mut d = table_doc(
+            &[("x_1", &["-5", "5"]), ("y_1", &["0", "0"])],
+            TableStyle::Line,
+        );
+        let (solid, _) = item_segs(&build(&d, Mode::D2), Mode::D2);
+        assert_eq!(solid.iter().filter(|s| s.p0 != s.p1).count(), 1);
+        d.items[0].style.line_style = Some(LineStyle::Dashed);
+        let (dashed, _) = item_segs(&build(&d, Mode::D2), Mode::D2);
+        let dashes: Vec<_> = dashed.iter().filter(|s| s.p0 != s.p1).collect();
+        // 10 units = 400 px; at width 2.5 the visible dash is 8 px and the visible gap 5 px, so
+        // the period is 13 px: 31 dashes.
+        assert!((30..=32).contains(&dashes.len()), "{}", dashes.len());
+        let on = (dashes[0].p1[0] - dashes[0].p0[0]) as f64 * 40.0;
+        assert!(
+            (on - 5.5).abs() < 1e-3,
+            "visible dash 8 px = 5.5 px + caps: {on}"
+        );
+        // Geometric gap between consecutive dashes: 13 - 5.5 = 7.5 px (5 px visible).
+        let gap = (dashes[1].p0[0] - dashes[0].p1[0]) as f64 * 40.0;
+        assert!((gap - 7.5).abs() < 1e-3, "{gap}");
+    }
+
+    #[test]
+    fn dashed_off_screen_runs_are_bounded() {
+        // A parametric curve that leaves the window by far still builds quickly.
+        let d = styled("(10^9 t, t)", |s| s.line_style = Some(LineStyle::Dotted));
+        let g = build(&d, Mode::D2);
+        assert!(g.segments.len() < 200_000, "{}", g.segments.len());
+    }
+
+    #[test]
+    fn view_flags_hide_grid_axes_and_numbers() {
+        let th = Theme::light();
+        let grid_w = |s: &SegmentInstance| s.color == th.grid_minor || s.color == th.grid_major;
+        let base = build(&Doc::new_default(), Mode::D2);
+        assert!(base.segments.iter().any(grid_w));
+        assert!(base.segments.iter().any(|s| s.width == AXIS_W));
+        assert!(!base.labels.is_empty());
+        let mut d = Doc::new_default();
+        d.view.grid = false;
+        let g = build(&d, Mode::D2);
+        assert!(!g.segments.iter().any(grid_w), "no grid lines");
+        assert!(g.segments.iter().any(|s| s.width == AXIS_W), "axes kept");
+        assert_eq!(g.labels, base.labels, "numbers kept");
+        let mut d = Doc::new_default();
+        d.view.axes = false;
+        let g = build(&d, Mode::D2);
+        assert!(
+            !g.segments.iter().any(|s| s.color == th.axis),
+            "no axis lines or ticks"
+        );
+        assert!(g.labels.is_empty(), "no tick labels without axes");
+        assert!(g.segments.iter().any(grid_w), "grid kept");
+        let mut d = Doc::new_default();
+        d.view.axis_numbers = false;
+        let g = build(&d, Mode::D2);
+        assert!(g.labels.is_empty());
+        assert_eq!(g.segments, base.segments, "lines unchanged");
+        // 1D: the number line goes with the axes; 3D keeps its box edges.
+        let mut d = Doc::new_default();
+        d.view.axes = false;
+        assert!(build(&d, Mode::D1).segments.is_empty());
+        d.view.grid = false;
+        let g3 = build(&d, Mode::D3);
+        assert_eq!(g3.segments.len(), 12, "only the 12 box edges");
+        assert!(g3.labels.is_empty());
+        let mut d = Doc::new_default();
+        d.view.axis_numbers = false;
+        let g3 = build(&d, Mode::D3);
+        assert!(g3.labels.is_empty() && g3.segments.iter().any(|s| s.width == AXIS_W));
+        // Item value labels on the number line are not tick numbers and stay.
+        let mut d = doc_with(&[("v", "3")]);
+        d.view.axis_numbers = false;
+        assert_eq!(build(&d, Mode::D1).labels.len(), 1);
+    }
+
+    #[test]
+    fn point_styles_and_sizes() {
+        let px = |g: &SceneGeometry| item_segs(g, Mode::D2).0;
+        // Dot: one zero-length segment as wide as the size.
+        let g = build(&styled("(1,2)", |s| s.point_size = Some(20.0)), Mode::D2);
+        let v = px(&g);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].p0 == v[0].p1 && v[0].width == 20.0);
+        assert_eq!(
+            px(&build(&styled("(1,2)", |_| {}), Mode::D2))[0].width,
+            DOT_W
+        );
+        // Circle: a ring of segments, every vertex the same pixel distance from the point.
+        let g = build(
+            &styled("(1,2)", |s| s.point_style = Some(PointStyle::Circle)),
+            Mode::D2,
+        );
+        let v = px(&g);
+        assert_eq!(v.len(), RING_SIDES);
+        let dist =
+            |p: [f32; 3]| (((p[0] - 1.0) * 40.0).powi(2) + ((p[1] - 2.0) * 30.0).powi(2)).sqrt();
+        let r0 = dist(v[0].p0);
+        assert!(r0 > 2.0 && r0 < 4.5, "{r0}");
+        assert!(v
+            .iter()
+            .all(|s| (dist(s.p0) - r0).abs() < 1e-3 && s.p0 != s.p1));
+        // A bigger size makes a bigger ring.
+        let g = build(
+            &styled("(1,2)", |s| {
+                s.point_style = Some(PointStyle::Circle);
+                s.point_size = Some(30.0);
+            }),
+            Mode::D2,
+        );
+        assert!(dist(px(&g)[0].p0) > 2.5 * r0);
+        // Cross: two diagonals through the point.
+        let g = build(
+            &styled("(1,2)", |s| s.point_style = Some(PointStyle::Cross)),
+            Mode::D2,
+        );
+        let v = px(&g);
+        assert_eq!(v.len(), 2);
+        for s in &v {
+            let mid = [(s.p0[0] + s.p1[0]) / 2.0, (s.p0[1] + s.p1[1]) / 2.0];
+            assert!((mid[0] - 1.0).abs() < 1e-5 && (mid[1] - 2.0).abs() < 1e-5);
+            let (dx, dy) = ((s.p1[0] - s.p0[0]) * 40.0, (s.p1[1] - s.p0[1]) * 30.0);
+            assert!((dx.abs() - dy.abs()).abs() < 1e-3, "45 degrees on screen");
+        }
+        // Square: four sides forming a closed outline, axis aligned.
+        let g = build(
+            &styled("(1,2)", |s| s.point_style = Some(PointStyle::Square)),
+            Mode::D2,
+        );
+        let v = px(&g);
+        assert_eq!(v.len(), 4);
+        assert!(v.iter().all(|s| s.p0[0] == s.p1[0] || s.p0[1] == s.p1[1]));
+        assert_eq!(v[3].p1, v[0].p0);
+        // Point lists and table points use the style too; 3D falls back to dots.
+        let g = build(
+            &styled("[(1,2),(3,4)]", |s| s.point_style = Some(PointStyle::Cross)),
+            Mode::D2,
+        );
+        assert_eq!(px(&g).len(), 4);
+        let mut t = table_doc(
+            &[("x_1", &["1", "2"]), ("y_1", &["1", "2"])],
+            TableStyle::Points,
+        );
+        t.items[0].style.point_style = Some(PointStyle::Square);
+        assert_eq!(px(&build(&t, Mode::D2)).len(), 8);
+        let d = styled("(1,2,3)", |s| {
+            s.point_style = Some(PointStyle::Circle);
+            s.point_size = Some(14.0);
+        });
+        let (v, _) = item_segs(&build(&d, Mode::D3), Mode::D3);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].p0 == v[0].p1 && v[0].width == 14.0);
+        // 1D: an open ring on the number line.
+        let d = styled("(2)", |s| s.point_style = Some(PointStyle::Circle));
+        let (v, _) = item_segs(&build(&d, Mode::D1), Mode::D1);
+        assert_eq!(v.len(), RING_SIDES);
+    }
+
+    #[test]
+    fn fill_opacity_scales_the_inequality_shading() {
+        let g = build(&styled("y<x", |_| {}), Mode::D2);
+        assert_eq!(g.fields[0].color[3], 1.0, "default unchanged");
+        let g = build(&styled("y<x", |s| s.fill_opacity = Some(0.5)), Mode::D2);
+        let a = g.fields[0].color[3] * FILL_SHADER_ALPHA;
+        assert!((a - 0.5).abs() < 1e-6, "effective fill opacity {a}");
+        let g = build(
+            &styled("y<x", |s| {
+                s.fill_opacity = Some(0.5);
+                s.opacity = Some(0.5);
+            }),
+            Mode::D2,
+        );
+        assert!((g.fields[0].color[3] * FILL_SHADER_ALPHA - 0.25).abs() < 1e-6);
+        let g = build(&styled("y<x", |s| s.fill_opacity = Some(0.0)), Mode::D2);
+        assert_eq!(g.fields[0].color[3], 0.0);
+        // The CPU fallback raster follows it as well.
+        let g = build(
+            &styled("y<sum(k,k,1,2)", |s| s.fill_opacity = Some(0.6)),
+            Mode::D2,
+        );
+        assert!(
+            (g.vertices[0].color[3] - 0.6).abs() < 1e-5,
+            "{}",
+            g.vertices[0].color[3]
+        );
+        // 3D region fill too.
+        let g = build(&styled("y<x", |s| s.fill_opacity = Some(0.5)), Mode::D3);
+        assert!((g.fields[0].color[3] * FILL_SHADER_ALPHA - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn show_label_places_item_labels_at_points() {
+        let pl = |g: &SceneGeometry| -> Vec<Label> {
+            g.labels
+                .iter()
+                .filter(|l| l.axis == ITEM_LABEL_AXIS)
+                .cloned()
+                .collect()
+        };
+        assert!(pl(&build(&doc_with(&[("p", "[(1,2),(3,4)]")]), Mode::D2)).is_empty());
+        let g = build(
+            &styled("[(1,2),(3,4.5)]", |s| s.show_label = true),
+            Mode::D2,
+        );
+        let l = pl(&g);
+        assert_eq!(l.len(), 2);
+        assert_eq!((l[0].text.as_str(), l[0].pos), ("(1, 2)", [1.0, 2.0, 0.0]));
+        assert_eq!(l[1].text, "(3, 4.5)");
+        // Custom text wins; the label alone does not show without the flag.
+        let g = build(
+            &styled("(1,2)", |s| {
+                s.show_label = true;
+                s.label = Some("A".into());
+            }),
+            Mode::D2,
+        );
+        assert_eq!(pl(&g)[0].text, "A");
+        assert!(pl(&build(
+            &styled("(1,2)", |s| s.label = Some("A".into())),
+            Mode::D2
+        ))
+        .is_empty());
+        // 3D coordinates, capped count.
+        let g = build(&styled("(1,2,3)", |s| s.show_label = true), Mode::D3);
+        assert_eq!(pl(&g)[0].text, "(1, 2, 3)");
+        let many: Vec<String> = (0..150)
+            .map(|i| format!("({}, 0)", i as f64 * 0.1))
+            .collect();
+        let g = build(
+            &styled(&format!("[{}]", many.join(",")), |s| s.show_label = true),
+            Mode::D2,
+        );
+        assert_eq!(pl(&g).len(), MAX_POINT_LABELS);
+        // A curve with label text gets one label on a drawn sample inside the window.
+        let g = build(
+            &styled("y=x", |s| {
+                s.show_label = true;
+                s.label = Some("diag".into());
+            }),
+            Mode::D2,
+        );
+        let l = pl(&g);
+        assert_eq!(l.len(), 1);
+        assert!(
+            l[0].text == "diag" && (l[0].pos[0] - l[0].pos[1]).abs() < 0.1,
+            "{l:?}"
+        );
+        // Table points label too.
+        let mut t = table_doc(&[("x_1", &["1"]), ("y_1", &["5"])], TableStyle::Points);
+        t.items[0].style.show_label = true;
+        assert_eq!(pl(&build(&t, Mode::D2))[0].text, "(1, 5)");
+    }
+
+    #[test]
+    fn items_in_a_hidden_folder_are_not_drawn_but_define() {
+        let mut d = Doc::new_default();
+        d.add_item(Item::new("f", ItemKind::Folder, "")).unwrap();
+        for (id, l) in [("c", "y=x^2"), ("k", "k=3")] {
+            let mut it = Item::new(id, ItemKind::Equation, l);
+            it.folder = Some("f".into());
+            d.add_item(it).unwrap();
+        }
+        d.add_item(Item::new("u", ItemKind::Equation, "y=k x"))
+            .unwrap();
+        let shown = build(&d, Mode::D2);
+        assert!(shown.diagnostics.is_empty(), "{:?}", shown.diagnostics);
+        assert_eq!(shown.item_colors.len(), 2);
+        d.items[0].hidden = true;
+        let g = build(&d, Mode::D2);
+        assert!(
+            g.diagnostics.is_empty(),
+            "k=3 is still defined: {:?}",
+            g.diagnostics
+        );
+        let ids: Vec<&str> = g.item_colors.iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(ids, ["u"], "the parabola is not drawn");
+        assert!(g.segments.len() < shown.segments.len());
+        // An error inside a hidden folder is not reported either.
+        d.items[1].latex = "y=".into();
+        assert!(build(&d, Mode::D2).diagnostics.is_empty());
+        assert!(with_folders_applied(&Doc::new_default()).is_empty_borrow());
+    }
+
+    trait CowExt {
+        fn is_empty_borrow(&self) -> bool;
+    }
+    impl CowExt for std::borrow::Cow<'_, Doc> {
+        fn is_empty_borrow(&self) -> bool {
+            matches!(self, std::borrow::Cow::Borrowed(_))
+        }
     }
 }
