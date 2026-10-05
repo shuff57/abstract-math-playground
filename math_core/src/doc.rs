@@ -70,6 +70,15 @@ pub struct ViewState {
     pub angle: AngleMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// Minor/major grid lines (additive field; saved only when false).
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub grid: bool,
+    /// Axis lines and their tick numbers (additive field; saved only when false).
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub axes: bool,
+    /// Tick numbers along the axes (additive field; saved only when false).
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub axis_numbers: bool,
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -126,11 +135,75 @@ pub struct ItemStyle {
     /// Regression items: draw a tick from each data point to the fitted curve.
     #[serde(default, skip_serializing_if = "is_false")]
     pub residuals: bool,
+    /// Diameter of a drawn point in pixels (same units as `line_width`), `1..=40`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_size: Option<f64>,
+    /// Opacity of an inequality / region shading in `[0, 1]` (default: the built-in 0.22).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_opacity: Option<f64>,
+    /// Draw a text label next to the item's points (the `label` text, else the coordinates).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub show_label: bool,
 }
+
+/// Valid range of [`ItemStyle::point_size`].
+pub const POINT_SIZE_RANGE: std::ops::RangeInclusive<f64> = 1.0..=40.0;
 
 impl ItemStyle {
     fn is_empty(&self) -> bool {
         *self == ItemStyle::default()
+    }
+
+    /// Checks the numeric fields: `opacity` and `fillOpacity` in `[0, 1]`, `lineWidth` in
+    /// `(0, 100]`, `pointSize` in `[1, 40]`, all finite. Returns every problem, `; `-joined.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut e = Vec::new();
+        let unit = |v: f64| v.is_finite() && (0.0..=1.0).contains(&v);
+        if self.opacity.is_some_and(|o| !unit(o)) {
+            e.push("opacity must be in [0,1]".to_string());
+        }
+        if let Some(w) = self.line_width {
+            if !(w.is_finite() && w > 0.0 && w <= 100.0) {
+                e.push("lineWidth must be in (0,100]".to_string());
+            }
+        }
+        if self
+            .point_size
+            .is_some_and(|s| !(s.is_finite() && POINT_SIZE_RANGE.contains(&s)))
+        {
+            e.push("pointSize must be in [1,40]".to_string());
+        }
+        if self.fill_opacity.is_some_and(|o| !unit(o)) {
+            e.push("fillOpacity must be in [0,1]".to_string());
+        }
+        if e.is_empty() {
+            Ok(())
+        } else {
+            Err(e.join("; "))
+        }
+    }
+}
+
+impl WindowBox {
+    /// Every axis finite with `min < max` and a sane span (as [`Doc::validate`] requires).
+    pub fn validate(&self) -> Result<(), String> {
+        let mut e = Vec::new();
+        for a in 0..3 {
+            let (lo, hi) = (self.min[a], self.max[a]);
+            if !lo.is_finite() || !hi.is_finite() {
+                e.push(format!("window axis {a}: non-finite bound"));
+                continue;
+            }
+            let span = hi - lo;
+            if lo >= hi || span <= 1e-300 || span >= 1e300 {
+                e.push(format!("window axis {a}: need min < max with sane span"));
+            }
+        }
+        if e.is_empty() {
+            Ok(())
+        } else {
+            Err(e.join("; "))
+        }
     }
 }
 
@@ -381,14 +454,9 @@ fn check_item_fields(it: &Item, ctx: &str, e: &mut Errs) {
             e.push(format!("{ctx}: color must match #rrggbb"));
         }
     }
-    if let Some(o) = it.style.opacity {
-        if !(o.is_finite() && (0.0..=1.0).contains(&o)) {
-            e.push(format!("{ctx}: opacity must be in [0,1]"));
-        }
-    }
-    if let Some(w) = it.style.line_width {
-        if !(w.is_finite() && w > 0.0 && w <= 100.0) {
-            e.push(format!("{ctx}: lineWidth must be in (0,100]"));
+    if let Err(m) = it.style.validate() {
+        for part in m.split("; ") {
+            e.push(format!("{ctx}: {part}"));
         }
     }
 }
@@ -406,6 +474,9 @@ impl Doc {
                 },
                 angle: AngleMode::Rad,
                 theme: None,
+                grid: true,
+                axes: true,
+                axis_numbers: true,
             },
             items: Vec::new(),
             sliders: BTreeMap::new(),
@@ -420,16 +491,9 @@ impl Doc {
         if self.v != CURRENT_VERSION {
             e.push(format!("v is {} but expected {CURRENT_VERSION}", self.v));
         }
-        let w = &self.view.window;
-        for a in 0..3 {
-            let (lo, hi) = (w.min[a], w.max[a]);
-            if !lo.is_finite() || !hi.is_finite() {
-                e.push(format!("window axis {a}: non-finite bound"));
-                continue;
-            }
-            let span = hi - lo;
-            if lo >= hi || span <= 1e-300 || span >= 1e300 {
-                e.push(format!("window axis {a}: need min < max with sane span"));
+        if let Err(m) = self.view.window.validate() {
+            for part in m.split("; ") {
+                e.push(part.to_string());
             }
         }
         if self.items.len() > MAX_ITEMS {
@@ -649,6 +713,9 @@ mod tests {
                     opacity: Some(0.5),
                     label: Some("lbl".into()),
                     residuals: i % 4 == 0,
+                    point_size: Some(12.0),
+                    fill_opacity: Some(0.4),
+                    show_label: true,
                 };
             }
             d.add_item(it).unwrap();
@@ -956,5 +1023,100 @@ mod tests {
         let mut bad = d.clone();
         bad.items[0].table.as_mut().unwrap().columns[0].name = "not a name".into();
         assert!(from_json(&to_json(&bad)).is_err());
+    }
+
+    #[test]
+    fn style_and_view_flags_round_trip_and_defaults_stay_absent() {
+        // Defaults are not written, so older documents and hashes are unchanged.
+        let d = Doc::new_default();
+        let j = to_json(&d);
+        for k in [
+            "grid",
+            "axes",
+            "axisNumbers",
+            "pointSize",
+            "fillOpacity",
+            "showLabel",
+        ] {
+            assert!(!j.contains(k), "{k} in {j}");
+        }
+        let mut it = Item::new("a", ItemKind::Points, "(1,2)");
+        it.style.line_style = Some(LineStyle::Solid);
+        let mut d2 = d.clone();
+        d2.add_item(it).unwrap();
+        let j2 = to_json(&d2);
+        assert!(!j2.contains("pointSize") && !j2.contains("showLabel"));
+        // A document without the new keys loads with the defaults.
+        let g = from_json(GOLDEN).unwrap();
+        assert!(g.view.grid && g.view.axes && g.view.axis_numbers);
+        assert!(g.items[0].style.point_size.is_none() && !g.items[0].style.show_label);
+        // Non-defaults round-trip through JSON and the share hash.
+        let mut d = rich_doc();
+        d.view.grid = false;
+        d.view.axes = false;
+        d.view.axis_numbers = false;
+        let j = to_json(&d);
+        assert!(j.contains("\"grid\":false") && j.contains("\"axisNumbers\":false"));
+        assert!(j.contains("\"pointSize\":12.0") && j.contains("\"fillOpacity\":0.4"));
+        assert!(j.contains("\"showLabel\":true"));
+        assert_eq!(from_json(&j).unwrap(), d);
+        assert_eq!(decode_hash(&encode_hash(&d)).unwrap(), d);
+        let mut d = rich_doc();
+        d.view.axes = false;
+        let back = from_json(&to_json(&d)).unwrap();
+        assert!(back.view.grid && !back.view.axes && back.view.axis_numbers);
+    }
+
+    #[test]
+    fn new_style_fields_are_validated() {
+        let bad = |f: &dyn Fn(&mut ItemStyle)| {
+            let mut d = Doc::new_default();
+            let mut it = Item::new("a", ItemKind::Points, "(1,2)");
+            f(&mut it.style);
+            d.items.push(it);
+            d.validate()
+        };
+        assert!(bad(&|_| {}).is_ok());
+        for ok in [1.0, 9.0, 40.0] {
+            assert!(bad(&|s| s.point_size = Some(ok)).is_ok(), "{ok}");
+        }
+        for v in [0.5, 40.5, f64::NAN, f64::INFINITY] {
+            match bad(&|s| s.point_size = Some(v)) {
+                Err(DocError::Invalid(m)) => assert!(m.contains("pointSize"), "{m}"),
+                o => panic!("{v}: {o:?}"),
+            }
+        }
+        for v in [-0.01, 1.01, f64::NAN] {
+            match bad(&|s| s.fill_opacity = Some(v)) {
+                Err(DocError::Invalid(m)) => assert!(m.contains("fillOpacity"), "{m}"),
+                o => panic!("{v}: {o:?}"),
+            }
+        }
+        assert!(bad(&|s| s.fill_opacity = Some(0.0)).is_ok());
+        assert!(bad(&|s| s.opacity = Some(f64::NAN)).is_err());
+        assert!(bad(&|s| s.line_width = Some(f64::INFINITY)).is_err());
+        // Several problems are all reported.
+        let e = bad(&|s| {
+            s.opacity = Some(2.0);
+            s.point_size = Some(0.0);
+        });
+        assert!(
+            matches!(e, Err(DocError::Invalid(m)) if m.contains("opacity") && m.contains("pointSize"))
+        );
+        // Through JSON as well.
+        let j = GOLDEN.replace("\"lineWidth\":2.0", "\"pointSize\":99");
+        assert!(matches!(from_json(&j), Err(DocError::Invalid(_))));
+        assert!(WindowBox {
+            min: [0.0; 3],
+            max: [1.0; 3]
+        }
+        .validate()
+        .is_ok());
+        assert!(WindowBox {
+            min: [0.0; 3],
+            max: [1.0, 0.0, 1.0]
+        }
+        .validate()
+        .is_err());
     }
 }
