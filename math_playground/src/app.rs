@@ -93,6 +93,21 @@ pub enum Command {
         axis_numbers: Option<bool>,
         #[serde(default)]
         window: Option<doc::WindowBox>,
+        #[serde(default, rename = "minorGrid", alias = "minor_grid")]
+        minor_grid: Option<bool>,
+        #[serde(default)]
+        arrows: Option<bool>,
+        #[serde(default)]
+        lock: Option<bool>,
+        /// Axis names and steps: absent keeps the value, `null` or an empty string / `0` clears it.
+        #[serde(default, rename = "xLabel", deserialize_with = "opt_opt")]
+        x_label: Option<Option<String>>,
+        #[serde(default, rename = "yLabel", deserialize_with = "opt_opt")]
+        y_label: Option<Option<String>>,
+        #[serde(default, rename = "xStep", deserialize_with = "opt_opt")]
+        x_step: Option<Option<f64>>,
+        #[serde(default, rename = "yStep", deserialize_with = "opt_opt")]
+        y_step: Option<Option<f64>>,
     },
     SetSlider {
         name: String,
@@ -307,6 +322,18 @@ pub enum Event {
         axes: bool,
         #[serde(rename = "axisNumbers")]
         axis_numbers: bool,
+        #[serde(rename = "minorGrid")]
+        minor_grid: bool,
+        arrows: bool,
+        lock: bool,
+        #[serde(rename = "xLabel")]
+        x_label: Option<String>,
+        #[serde(rename = "yLabel")]
+        y_label: Option<String>,
+        #[serde(rename = "xStep")]
+        x_step: Option<f64>,
+        #[serde(rename = "yStep")]
+        y_step: Option<f64>,
     },
     /// Tick labels for the current scene in world coordinates, for a text overlay to project.
     Labels {
@@ -710,6 +737,13 @@ impl App {
                 axes,
                 axis_numbers,
                 window,
+                minor_grid,
+                arrows,
+                lock,
+                x_label,
+                y_label,
+                x_step,
+                y_step,
             } => {
                 if let Some(w) = &window {
                     if let Err(m) = w.validate() {
@@ -719,10 +753,37 @@ impl App {
                         return;
                     }
                 }
+                for (n, st) in [("xStep", x_step), ("yStep", y_step)] {
+                    if let Some(Some(v)) = st {
+                        if v != 0.0 && !(v.is_finite() && v > 0.0) {
+                            self.outbox.push(Event::Error {
+                                message: format!("setView: {n} must be a positive number"),
+                            });
+                            return;
+                        }
+                    }
+                }
                 let v = &mut self.doc.view;
                 v.grid = grid.unwrap_or(v.grid);
                 v.axes = axes.unwrap_or(v.axes);
                 v.axis_numbers = axis_numbers.unwrap_or(v.axis_numbers);
+                v.minor_grid = minor_grid.unwrap_or(v.minor_grid);
+                v.arrows = arrows.unwrap_or(v.arrows);
+                v.lock = lock.unwrap_or(v.lock);
+                let name = |t: Option<Option<String>>, cur: Option<String>| match t {
+                    None => cur,
+                    Some(t) => t
+                        .map(|t| t.trim().chars().take(64).collect::<String>())
+                        .filter(|t| !t.is_empty()),
+                };
+                v.x_label = name(x_label, v.x_label.take());
+                v.y_label = name(y_label, v.y_label.take());
+                let step = |t: Option<Option<f64>>, cur: Option<f64>| match t {
+                    None => cur,
+                    Some(t) => t.filter(|v| *v > 0.0),
+                };
+                v.x_step = step(x_step, v.x_step);
+                v.y_step = step(y_step, v.y_step);
                 if let Some(w) = window {
                     // As `load` does: a fresh rig framing the window in the current mode.
                     self.rig = Rig::new(Window3::new(w.min, w.max), self.rig.mode());
@@ -831,6 +892,8 @@ impl App {
                     self.touch_input();
                 }
             }
+            // A locked 2D / 1D view ignores zoom and pan; 3D can still be orbited.
+            Command::Wheel { .. } if self.doc.view.lock && self.rig.mode() != Mode::D3 => {}
             Command::Wheel { x, y, dy } => {
                 let factor = (-dy * 0.0015).exp();
                 self.rig.zoom_at((x, y), factor, vp);
@@ -1500,7 +1563,7 @@ impl App {
                 let orbit = self.rig.mode() == Mode::D3 && button == 0 && !shift;
                 if orbit {
                     self.rig.orbit(-dx * 0.008, dy * 0.008);
-                } else {
+                } else if !(self.doc.view.lock && self.rig.mode() != Mode::D3) {
                     self.rig.pan_pixels(dx, dy, vp);
                     self.dirty = true;
                 }
@@ -1642,6 +1705,13 @@ impl App {
             grid: self.doc.view.grid,
             axes: self.doc.view.axes,
             axis_numbers: self.doc.view.axis_numbers,
+            minor_grid: self.doc.view.minor_grid,
+            arrows: self.doc.view.arrows,
+            lock: self.doc.view.lock,
+            x_label: self.doc.view.x_label.clone(),
+            y_label: self.doc.view.y_label.clone(),
+            x_step: self.doc.view.x_step,
+            y_step: self.doc.view.y_step,
         });
         self.outbox.push(Event::Labels {
             labels: geometry
@@ -1916,6 +1986,16 @@ impl App {
     }
 }
 
+/// `Some(None)` for an explicit JSON `null` and `Some(Some(v))` for a value, so a command can tell
+/// "clear this" from "leave it" (`#[serde(default)]` gives `None` when the field is absent).
+fn opt_opt<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2179,6 +2259,67 @@ mod tests {
             w1.max[0] - w1.min[0] < w0.max[0] - w0.min[0],
             "negative dy zooms in"
         );
+    }
+
+    #[test]
+    fn locked_view_ignores_wheel_and_pan_but_not_set_view_window() {
+        let mut a = app();
+        let ev = cmd(&mut a, r#"{"t":"setView","lock":true}"#);
+        assert!(error_msg(&ev).is_none(), "{ev:?}");
+        let w0 = a.rig.window();
+        cmd(&mut a, r#"{"t":"wheel","x":400,"y":300,"dy":-300}"#);
+        cmd(&mut a, r#"{"t":"pointer","phase":"down","x":400,"y":300}"#);
+        cmd(&mut a, r#"{"t":"pointer","phase":"move","x":460,"y":340}"#);
+        cmd(&mut a, r#"{"t":"pointer","phase":"up","x":460,"y":340}"#);
+        assert_eq!(a.rig.window(), w0, "locked: window unchanged");
+        cmd(
+            &mut a,
+            r#"{"t":"setView","window":{"min":[-2,-2,-1],"max":[2,2,1]}}"#,
+        );
+        assert_eq!(a.doc.view.window.max[0], 2.0, "the window can still be set");
+        cmd(&mut a, r#"{"t":"setView","lock":false}"#);
+        let w1 = a.rig.window();
+        cmd(&mut a, r#"{"t":"wheel","x":400,"y":300,"dy":-300}"#);
+        assert!(a.rig.window() != w1, "unlocked zooms again");
+    }
+
+    #[test]
+    fn set_view_axis_names_steps_minor_grid_and_arrows() {
+        let mut a = app();
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"setView","minorGrid":false,"arrows":true,"xLabel":"time","yLabel":"  h ","xStep":2,"yStep":5}"#,
+        );
+        assert!(error_msg(&ev).is_none(), "{ev:?}");
+        let v = &a.doc.view;
+        assert!(!v.minor_grid && v.arrows);
+        assert_eq!(
+            (v.x_label.as_deref(), v.y_label.as_deref()),
+            (Some("time"), Some("h"))
+        );
+        assert_eq!((v.x_step, v.y_step), (Some(2.0), Some(5.0)));
+        // The view event reports them, and omitted fields keep their values.
+        let ev = cmd(&mut a, r#"{"t":"setView","grid":true}"#);
+        let view = ev.iter().find(|e| e["t"] == "view").unwrap();
+        assert_eq!(view["xLabel"], "time");
+        assert_eq!(view["xStep"], 2.0);
+        assert_eq!(view["minorGrid"], false);
+        // Round trip through export.
+        let json = doc::to_json(&a.doc);
+        let back = doc::from_json(&json).unwrap();
+        assert_eq!(back.view.x_step, Some(2.0));
+        assert_eq!(back.view.y_label.as_deref(), Some("h"));
+        // null, empty and 0 clear; a negative step is an error and changes nothing.
+        cmd(
+            &mut a,
+            r#"{"t":"setView","xLabel":null,"yLabel":"","xStep":0,"yStep":null}"#,
+        );
+        let v = &a.doc.view;
+        assert!(v.x_label.is_none() && v.y_label.is_none());
+        assert!(v.x_step.is_none() && v.y_step.is_none());
+        let ev = cmd(&mut a, r#"{"t":"setView","xStep":-1,"arrows":false}"#);
+        assert!(error_msg(&ev).is_some());
+        assert!(a.doc.view.arrows, "a rejected command changes nothing");
     }
 
     #[test]

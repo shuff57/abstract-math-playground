@@ -79,6 +79,25 @@ pub struct ViewState {
     /// Tick numbers along the axes (additive field; saved only when false).
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub axis_numbers: bool,
+    /// Minor grid lines between the major ones (additive field; saved only when false).
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub minor_grid: bool,
+    /// Arrowheads at the ends of the 2D axes (additive field; saved only when true).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub arrows: bool,
+    /// Names written at the ends of the x and y axes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y_label: Option<String>,
+    /// Fixed spacing of the major grid lines and tick numbers (`None`: automatic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_step: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y_step: Option<f64>,
+    /// Pan and zoom are ignored while set (additive field; saved only when true).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub lock: bool,
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -477,6 +496,13 @@ impl Doc {
                 grid: true,
                 axes: true,
                 axis_numbers: true,
+                minor_grid: true,
+                arrows: false,
+                x_label: None,
+                y_label: None,
+                x_step: None,
+                y_step: None,
+                lock: false,
             },
             items: Vec::new(),
             sliders: BTreeMap::new(),
@@ -494,6 +520,16 @@ impl Doc {
         if let Err(m) = self.view.window.validate() {
             for part in m.split("; ") {
                 e.push(part.to_string());
+            }
+        }
+        for (n, v) in [("x", self.view.x_step), ("y", self.view.y_step)] {
+            if v.is_some_and(|v| !(v.is_finite() && v > 0.0)) {
+                e.push(format!("view.{n}Step must be a positive number"));
+            }
+        }
+        for (n, v) in [("x", &self.view.x_label), ("y", &self.view.y_label)] {
+            if v.as_ref().is_some_and(|t| t.chars().count() > 64) {
+                e.push(format!("view.{n}Label is longer than 64 characters"));
             }
         }
         if self.items.len() > MAX_ITEMS {

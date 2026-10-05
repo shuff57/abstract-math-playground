@@ -89,6 +89,8 @@ const BARB_ANGLE: f64 = 0.45;
 /// `fillOpacity` is divided by it so that it becomes the effective opacity of the shading.
 const FILL_SHADER_ALPHA: f32 = 0.22;
 /// Most dash pieces one polyline may produce; the rest of a longer one is drawn solid.
+/// Length in pixels of an axis arrowhead.
+const ARROW_PX: f64 = 10.0;
 const MAX_DASH_PIECES: usize = 50_000;
 /// Most `showLabel` point labels per item.
 const MAX_POINT_LABELS: usize = 100;
@@ -291,6 +293,11 @@ struct BuildExt {
     grid: bool,
     axes: bool,
     axis_numbers: bool,
+    minor_grid: bool,
+    arrows: bool,
+    /// Axis names (x, y) and fixed major steps (x, y) from the view.
+    axis_names: [Option<String>; 2],
+    fixed_steps: [Option<f64>; 2],
     /// `showLabel` of the item being drawn: custom text (or `None` for coordinates) and how many
     /// labels it may still place.
     labels: Option<(Option<String>, usize)>,
@@ -303,6 +310,10 @@ impl Default for BuildExt {
             grid: true,
             axes: true,
             axis_numbers: true,
+            minor_grid: true,
+            arrows: false,
+            axis_names: [None, None],
+            fixed_steps: [None, None],
             labels: None,
         }
     }
@@ -665,6 +676,16 @@ impl<'a> Builder<'a> {
     // ----- grid and axes ------------------------------------------------------------------
 
     /// Per-axis major steps for the mode.
+    /// The view's fixed major step for axis `a`, unless it would draw an unreadable number of
+    /// lines (then the automatic step is used).
+    fn fixed_step(&self, a: usize) -> Option<f64> {
+        let step = self.ext.fixed_steps[a]?;
+        let (vw, vh) = self.px();
+        let px = if a == 0 { vw } else { vh };
+        let span = self.win.max[a] - self.win.min[a];
+        (step > 0.0 && span / step <= px / 6.0).then_some(step)
+    }
+
     fn steps(&self, mode: Mode) -> [f64; 3] {
         let (vw, vh) = self.px();
         let span = |a: usize| self.win.max[a] - self.win.min[a];
@@ -674,8 +695,10 @@ impl<'a> Builder<'a> {
                 [s, s, s]
             }
             Mode::D2 => [
-                nice_step(span(0), vw, TARGET_MAJOR_PX),
-                nice_step(span(1), vh, TARGET_MAJOR_PX),
+                self.fixed_step(0)
+                    .unwrap_or_else(|| nice_step(span(0), vw, TARGET_MAJOR_PX)),
+                self.fixed_step(1)
+                    .unwrap_or_else(|| nice_step(span(1), vh, TARGET_MAJOR_PX)),
                 1.0,
             ],
             Mode::D3 => {
@@ -736,7 +759,7 @@ impl<'a> Builder<'a> {
                 let minor = steps[axis] / div as f64;
                 for (k, v) in multiples(lo[axis], hi[axis], minor) {
                     let is_major = k % div == 0;
-                    if is_major != pass_major {
+                    if is_major != pass_major || (!is_major && !self.ext.minor_grid) {
                         continue;
                     }
                     let mut a = [0.0; 3];
@@ -781,6 +804,27 @@ impl<'a> Builder<'a> {
         }
         self.axis_labels(0, steps[0], [cx, cy, 0.0], false);
         self.axis_labels(1, steps[1], [cx, cy, 0.0], true);
+        if self.ext.arrows {
+            // Open arrowheads, 10 px long, at the positive end of each visible axis.
+            let (ax, ay) = (ARROW_PX * (hi[0] - lo[0]) / vw, ARROW_PX * (hi[1] - lo[1]) / vh);
+            if x_visible {
+                for s in [-1.0, 1.0] {
+                    self.seg([hi[0], 0.0, 0.0], [hi[0] - ax, s * ay * 0.4, 0.0], AXIS_W, axis_c);
+                }
+            }
+            if y_visible {
+                for s in [-1.0, 1.0] {
+                    self.seg([0.0, hi[1], 0.0], [s * ax * 0.4, hi[1] - ay, 0.0], AXIS_W, axis_c);
+                }
+            }
+        }
+        // Axis names sit just inside the positive end of their axis.
+        if let Some(n) = self.ext.axis_names[0].clone() {
+            self.label([hi[0] - 0.02 * (hi[0] - lo[0]), cy, 0.0], n, 0);
+        }
+        if let Some(n) = self.ext.axis_names[1].clone() {
+            self.label([cx, hi[1] - 0.02 * (hi[1] - lo[1]), 0.0], n, 1);
+        }
     }
 
     fn axes_1d(&mut self, step: f64) {
@@ -2200,6 +2244,10 @@ pub fn build_scene(
             grid: doc.view.grid,
             axes: doc.view.axes,
             axis_numbers: doc.view.axis_numbers,
+            minor_grid: doc.view.minor_grid,
+            arrows: doc.view.arrows,
+            axis_names: [doc.view.x_label.clone(), doc.view.y_label.clone()],
+            fixed_steps: [doc.view.x_step, doc.view.y_step],
             labels: None,
         },
     };
@@ -3980,6 +4028,33 @@ mod tests {
         }
         let g = build(&styled("y=2", |_| {}), Mode::D2);
         assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
+    }
+
+    #[test]
+    fn view_minor_grid_arrows_names_and_steps_shape_the_scene() {
+        let seg_count = |d: &Doc| build(d, Mode::D2).segments.len();
+        let base = Doc::new_default();
+        let mut no_minor = base.clone();
+        no_minor.view.minor_grid = false;
+        assert!(seg_count(&no_minor) < seg_count(&base), "minor lines dropped");
+        let mut arrows = base.clone();
+        arrows.view.arrows = true;
+        assert_eq!(seg_count(&arrows), seg_count(&base) + 4, "two heads of two strokes");
+        let mut named = base.clone();
+        named.view.x_label = Some("time".into());
+        named.view.y_label = Some("h".into());
+        let g = build(&named, Mode::D2);
+        assert!(g.labels.iter().any(|l| l.axis == 0 && l.text == "time"));
+        assert!(g.labels.iter().any(|l| l.axis == 1 && l.text == "h"));
+        // A fixed x step of 1 labels every integer; the auto step for [-10, 10] is 2.
+        let mut stepped = base.clone();
+        stepped.view.x_step = Some(1.0);
+        let has = |d: &Doc, t: &str| build(d, Mode::D2).labels.iter().any(|l| l.axis == 0 && l.text == t);
+        assert!(!has(&base, "3") && has(&stepped, "3"));
+        // A step that would draw hundreds of lines falls back to the automatic one.
+        let mut tiny = base.clone();
+        tiny.view.x_step = Some(1e-6);
+        assert!(seg_count(&tiny) < 2000);
     }
 
     #[test]
