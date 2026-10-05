@@ -166,7 +166,7 @@ mod tests {
         rig.set_aspect(size.0 as f64 / size.1 as f64);
         let g = build_scene(&doc, Mode::D2, rig.window(), rig.render_origin(), size, &theme);
         assert_eq!(g.fields.len(), 1);
-        let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin() }];
+        let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin(), lift: 1.0 }];
         let img = gpu.render_rgba(size, &rig, &layers, theme.background);
         let bg = [255u8, 255, 255, 255];
         // (100, 453): left of the cup, y < x^2 (filled). (441, 200): inside the cup (empty).
@@ -200,7 +200,7 @@ mod tests {
         });
         let mut rig = Rig::new(Window3::new([-10.0; 3], [10.0; 3]), Mode::D2);
         rig.set_aspect(1.0);
-        let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin() }];
+        let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin(), lift: 1.0 }];
         let img = gpu.render_rgba(size, &rig, &layers, theme.background);
         assert!(img.chunks(4).all(|p| p == [255, 255, 255, 255]), "failed field must draw nothing");
     }
@@ -223,7 +223,7 @@ mod tests {
         let g = build_scene(&doc, Mode::D2, rig.window(), rig.render_origin(), size, &theme);
         assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
         assert_eq!(g.fields.len(), 1);
-        let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin() }];
+        let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin(), lift: 1.0 }];
         let img = gpu.render_rgba(size, &rig, &layers, theme.background);
         let rgb = |x: u32, y: u32| {
             let p = px(&img, size.0, x, y);
@@ -288,7 +288,7 @@ mod tests {
         let rig = rig_2d(size);
         let g = build_scene(&doc, Mode::D2, rig.window(), rig.render_origin(), size, &theme);
         assert_eq!(g.flat_indices.len(), 36);
-        let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin() }];
+        let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin(), lift: 1.0 }];
         let img = gpu.render_rgba(size, &rig, &layers, theme.background);
         let bg = [255u8, 255, 255, 255];
         // 45 px per unit (the window fits x), origin at (450, 300). The [3,4) bar has height 3:
@@ -306,7 +306,7 @@ mod tests {
         };
         assert!(mostly_bg(217, 67) && mostly_bg(757, 247) && mostly_bg(599, 112));
         // A fading layer fades the bars too.
-        let faded = [Layer { geometry: &g, fade: 0.3, origin: rig.render_origin() }];
+        let faded = [Layer { geometry: &g, fade: 0.3, origin: rig.render_origin(), lift: 1.0 }];
         let img2 = gpu.render_rgba(size, &rig, &faded, theme.background);
         let p2 = px(&img2, size.0, 607, 232);
         assert!(diff(p2, bg) > 5 && diff(p2, bg) < diff(inside, bg), "{p2:?} vs {inside:?}");
@@ -334,7 +334,7 @@ mod tests {
                 doc.sliders.insert("a".into(), SliderCfg { min: -5.0, max: 5.0, step: None, value: a });
                 let g = build_scene(&doc, Mode::D2, rig.window(), rig.render_origin(), size, &theme);
                 assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
-                let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin() }];
+                let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin(), lift: 1.0 }];
                 frames.push((g.fields[0].wgsl.clone(), gpu.render_rgba(size, &rig, &layers, theme.background)));
             }
             assert!(frames.iter().all(|f| f.0 == frames[0].0), "{latex}: shader text must not change");
@@ -349,7 +349,7 @@ mod tests {
         let mut at = |a: f64| {
             doc.sliders.insert("a".into(), SliderCfg { min: -5.0, max: 5.0, step: None, value: a });
             let g = build_scene(&doc, Mode::D2, rig.window(), rig.render_origin(), size, &theme);
-            let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin() }];
+            let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin(), lift: 1.0 }];
             px(&gpu.render_rgba(size, &rig, &layers, theme.background), size.0, 600, 330)
         };
         // Pixel (600, 330) is world (3.3, -0.7): below y = 2x yes; below y = -2x no.
@@ -383,9 +383,9 @@ mod tests {
         let inset = Inset {
             rect: p.rect,
             rig: &p.rig,
-            layers: vec![Layer { geometry: &p.geometry, fade: 1.0, origin: p.origin }],
+            layers: vec![Layer { geometry: &p.geometry, fade: 1.0, origin: p.origin, lift: 1.0 }],
         };
-        let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin() }];
+        let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin(), lift: 1.0 }];
         let with = gpu.render_rgba_with_inset(size, &rig, &layers, theme.background, Some(&inset));
         let without = gpu.render_rgba(size, &rig, &layers, theme.background);
         let [rx, ry, rw, rh] = p.rect;

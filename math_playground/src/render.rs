@@ -3,7 +3,7 @@
 //! into a swapchain frame or an offscreen texture alike.
 
 use crate::geometry::{FieldKind, FieldSpec, MeshVertex, SceneGeometry, SegmentInstance};
-use math_core::view::{CameraUniform, Rig};
+use math_core::view::{CameraUniform, Mode, Rig};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -38,6 +38,20 @@ pub struct Layer<'a> {
     /// The render origin the geometry was built against (the window centre at build time).
     /// May differ from the rig's current origin while a rebuild is pending.
     pub origin: [f64; 3],
+    /// Scale of z about the plane z = 0 (1 = as built). A 3D scene is drawn with the rig's
+    /// [`Rig::lift`] during a switch to or from 3D, so it grows out of / flattens into the plane
+    /// the 2D scene lies in; see [`layer_lift`].
+    pub lift: f32,
+}
+
+/// [`Layer::lift`] for a scene built in `built` mode, given the rig's current lift: only 3D
+/// scenes are scaled (1D/2D geometry is flat already).
+pub fn layer_lift(built: Mode, rig_lift: f64) -> f32 {
+    if built == Mode::D3 && rig_lift.is_finite() {
+        rig_lift.clamp(0.0, 1.0) as f32
+    } else {
+        1.0
+    }
 }
 
 /// Opacity multipliers `(outgoing, incoming)` for the two layers of a mode switch at tween
@@ -452,7 +466,8 @@ impl Renderer {
                 (l.origin[1] - o[1]) as f32,
                 (l.origin[2] - o[2]) as f32,
             ];
-            let frame = [size.0 as f32, size.1 as f32, l.fade, 0.0, off[0], off[1], off[2], 0.0];
+            // offset.w: where world z = 0 is, relative to the current origin (the lift plane).
+            let frame = [size.0 as f32, size.1 as f32, l.fade, l.lift, off[0], off[1], off[2], -o[2] as f32];
             let frame_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("frame"),
                 contents: bytemuck::cast_slice(&frame),
@@ -723,5 +738,29 @@ impl Renderer {
             self.draw_prepared(&mut pass, ip, &i.layers);
         }
         queue.submit(Some(encoder.finish()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_3d_scenes_are_lifted() {
+        assert_eq!(layer_lift(Mode::D3, 0.25), 0.25);
+        assert_eq!(layer_lift(Mode::D3, 1.0), 1.0);
+        assert_eq!(layer_lift(Mode::D3, -1.0), 0.0);
+        assert_eq!(layer_lift(Mode::D3, f64::NAN), 1.0);
+        assert_eq!(layer_lift(Mode::D2, 0.0), 1.0);
+        assert_eq!(layer_lift(Mode::D1, 0.5), 1.0);
+    }
+
+    #[test]
+    fn crossfade_ends_and_staggers() {
+        assert_eq!(crossfade(0.0), (1.0, 0.0));
+        assert_eq!(crossfade(1.0), (0.0, 1.0));
+        // The incoming scene is opaque before the outgoing one has faded much.
+        let (out, inc) = crossfade(0.55);
+        assert!(inc > 0.99 && out > 0.7);
     }
 }

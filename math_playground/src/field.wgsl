@@ -36,7 +36,7 @@ fn vs_field(@builtin(vertex_index) vi: u32) -> FieldOut {
     );
     let w = mix(fp.rect_min, fp.rect_max, corners[vi]);
     var out: FieldOut;
-    out.pos = cam.view_proj * vec4<f32>(w.x + frame.offset.x, w.y + frame.offset.y, frame.offset.z, 1.0);
+    out.pos = cam.view_proj * vec4<f32>(placed(vec3<f32>(w, 0.0)), 1.0);
     out.w = w;
     return out;
 }

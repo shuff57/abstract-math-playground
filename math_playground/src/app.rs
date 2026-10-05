@@ -4,8 +4,8 @@
 //! front ends cannot drift apart. No GPU or window types here; fully unit-testable.
 
 use crate::geometry::{ItemInfo, SceneGeometry, Theme};
-use crate::render::{crossfade, Inset, Layer};
-use crate::scene::{build_scene, build_slice_panel_view, label_box_inside, point_handles, CoordSrc, PointHandle, SlicePanel, ViewReq};
+use crate::render::{crossfade, layer_lift, Inset, Layer};
+use crate::scene::{build_scene, build_scene_preview, build_slice_panel_view, label_box_inside, point_handles, CoordSrc, PointHandle, SlicePanel, ViewReq};
 use math_core::actions;
 use math_core::doc::{self, AngleMode, Doc, Item, ItemKind, SliderCfg, TickerCfg};
 use math_core::table::{Column, Table, TableStyle};
@@ -49,6 +49,9 @@ pub enum Command {
     RemoveSlider { name: String },
     SetMode { mode: String },
     SetOrtho { ortho: bool },
+    /// Reduced motion (the user's `prefers-reduced-motion`): mode switches and the ortho toggle
+    /// jump straight to the end instead of animating.
+    SetReducedMotion { on: bool },
     SetTheme { dark: bool },
     SetAngle { angle: String },
     Resize { width: u32, height: u32 },
@@ -296,6 +299,9 @@ pub struct App {
     /// The inset view changed and its geometry must be re-sampled (throttled like the scene).
     panel_dirty: bool,
     last_panel_ms: f64,
+    /// The current scene is a preview (coarser surfaces, built so a mode switch starts moving
+    /// at once); it is rebuilt at full quality when the switch has finished.
+    refine: bool,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -365,6 +371,7 @@ impl App {
             last_inset_press: None,
             panel_dirty: false,
             last_panel_ms: 0.0,
+            refine: false,
         };
         app.rebuild();
         app
@@ -545,6 +552,7 @@ impl App {
                 self.rig.set_ortho3(ortho, self.now_ms);
                 self.touch_input();
             }
+            Command::SetReducedMotion { on } => self.rig.reduced_motion = on,
             Command::SetTheme { dark } => {
                 self.theme = if dark { Theme::dark() } else { Theme::light() };
                 self.outbox.push(Event::Theme { dark });
@@ -988,9 +996,14 @@ impl App {
         self.slice_view = None;
         // The outgoing scene keeps drawing (fading) while the camera tweens to the new mode.
         self.prev = self.current.take();
+        // The tween's clock starts at the next frame (see `Tween::start_ms`), so the time spent
+        // building below is not taken out of the animation.
         self.rig.set_mode(mode, self.now_ms);
         self.dirty = true;
-        self.rebuild();
+        // A preview build keeps the gap between the command and the first moving frame short;
+        // the full-quality scene follows when the switch has finished.
+        let preview = self.rig.is_animating();
+        self.rebuild_with(preview);
         self.redraw = true;
     }
 
@@ -1068,11 +1081,18 @@ impl App {
         if was_animating && !animating {
             self.prev = None;
             self.redraw = true;
+        } else if self.refine && !animating {
+            // From the frame after the switch ended, so its final pose is shown on time.
+            self.dirty = true;
         }
         if self.dirty {
             let idle = now_ms - self.last_input_ms >= IDLE_REBUILD_MS;
-            if idle || self.last_build_ms < CHEAP_BUILD_MS {
-                self.rebuild();
+            // `last_build_ms` is not known for a scene only built as a preview yet: wait for a
+            // pause in the input (an orbit right after the switch) before the full build.
+            let cheap = self.last_build_ms < CHEAP_BUILD_MS && !self.refine;
+            if idle || cheap {
+                // Mid-switch (a slider ticking, say) only a preview fits in a frame.
+                self.rebuild_with(animating);
             }
         }
         if self.panel_dirty && !self.dirty {
@@ -1105,11 +1125,27 @@ impl App {
     }
 
     fn rebuild(&mut self) {
+        self.rebuild_with(false);
+    }
+
+    /// Rebuilds the scene; `preview` meshes surfaces coarser (see [`build_scene_preview`]) and
+    /// leaves `refine` set when that made a difference.
+    fn rebuild_with(&mut self, preview: bool) {
         let t0 = instant::Instant::now();
         let mode = self.rig.mode();
         let origin = self.rig.render_origin();
-        let geometry = build_scene(&self.doc, mode, self.scene_window(), origin, self.size, &self.theme);
-        self.last_build_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let window = self.scene_window();
+        let geometry = if preview {
+            let (g, coarse) = build_scene_preview(&self.doc, mode, window, origin, self.size, &self.theme);
+            self.refine = coarse;
+            g
+        } else {
+            self.refine = false;
+            let g = build_scene(&self.doc, mode, window, origin, self.size, &self.theme);
+            // Only full builds tell how expensive live rebuilds of this scene are.
+            self.last_build_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            g
+        };
 
         let diags: Vec<DiagItem> = geometry
             .diagnostics
@@ -1257,7 +1293,7 @@ impl App {
         Some(Inset {
             rect: p.rect,
             rig: &p.rig,
-            layers: vec![Layer { geometry: &p.geometry, fade: 1.0, origin: p.origin }],
+            layers: vec![Layer { geometry: &p.geometry, fade: 1.0, origin: p.origin, lift: 1.0 }],
         })
     }
 
@@ -1267,10 +1303,14 @@ impl App {
         match (&self.prev, &self.current) {
             (Some(p), Some(c)) if self.rig.is_animating() => {
                 let (fa, fb) = crossfade(self.rig.progress() as f32);
-                out.push(Layer { geometry: &p.geometry, fade: fa, origin: p.origin });
-                out.push(Layer { geometry: &c.geometry, fade: fb, origin: c.origin });
+                let lift = self.rig.lift();
+                out.push(Layer { geometry: &p.geometry, fade: fa, origin: p.origin, lift: layer_lift(p.mode, lift) });
+                out.push(Layer { geometry: &c.geometry, fade: fb, origin: c.origin, lift: layer_lift(c.mode, lift) });
             }
-            (_, Some(c)) => out.push(Layer { geometry: &c.geometry, fade: 1.0, origin: c.origin }),
+            (_, Some(c)) => {
+                let lift = layer_lift(c.mode, self.rig.lift());
+                out.push(Layer { geometry: &c.geometry, fade: 1.0, origin: c.origin, lift })
+            }
             _ => {}
         }
         out
@@ -1284,12 +1324,14 @@ impl App {
         let aspect = self.size.0 as f64 / self.size.1.max(1) as f64;
         let (w, h) = (self.size.0 as f64, self.size.1 as f64);
         let rect = self.inset_rect();
+        // Labels of a 3D scene ride the switch lift with its geometry.
+        let lift = layer_lift(c.mode, self.rig.lift()) as f64;
         let mut out: Vec<ScreenLabel> = c
             .geometry
             .labels
             .iter()
             .map(|l| {
-                let ndc = self.rig.project_ndc(l.pos, aspect);
+                let ndc = self.rig.project_ndc([l.pos[0], l.pos[1], l.pos[2] * lift], aspect);
                 let (x, y) = ((ndc[0] * 0.5 + 0.5) * w, (1.0 - (ndc[1] * 0.5 + 0.5)) * h);
                 let mut visible = ndc[0].abs() <= 1.0 && ndc[1].abs() <= 1.0 && (0.0..=1.0).contains(&ndc[2]);
                 // Labels under the inset would show through it.
@@ -1428,6 +1470,106 @@ mod tests {
         a.frame(10_000.0);
         assert_eq!(a.mode(), Mode::D2);
         assert_eq!(a.layers().len(), 1);
+    }
+
+    #[test]
+    fn switch_after_a_long_idle_still_animates_from_the_first_frame() {
+        // Native and viSHual stop calling `frame` while idle, so the command sees an old clock.
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=x^2"}"#);
+        a.frame(100.0);
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        assert!(a.frame(60_000.0));
+        assert!(a.rig.is_animating(), "the whole tween is still ahead");
+        assert_eq!(a.rig.progress(), 0.0);
+        let l = a.layers();
+        assert_eq!(l.len(), 2);
+        assert_eq!((l[0].fade, l[1].fade), crossfade(0.0));
+        assert_eq!(l[1].lift, 0.0, "the 3D scene starts flat in the plane");
+        let mut t = 60_000.0;
+        let mut frames = 0;
+        while a.rig.is_animating() {
+            t += 1000.0 / 60.0;
+            a.frame(t);
+            frames += 1;
+        }
+        assert!(frames >= 29, "{frames} frames");
+    }
+
+    #[test]
+    fn switch_to_3d_previews_then_refines_at_full_quality() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"z=\\sin(x)\\cos(y)"}"#);
+        a.frame(0.0);
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        let full = build_scene(&a.doc, Mode::D3, a.scene_window(), a.rig.render_origin(), a.size, &a.theme);
+        let preview = a.layers()[1].geometry.vertices.len();
+        assert!(a.refine);
+        assert!(preview > 0 && preview < full.vertices.len(), "{preview} vs {}", full.vertices.len());
+        // Mid-switch: the 3D scene is partly lifted, the outgoing 2D one is untouched.
+        a.frame(16.0);
+        a.frame(266.0);
+        let l = a.layers();
+        assert!(l[1].lift > 0.0 && l[1].lift < 1.0);
+        assert_eq!(l[0].lift, 1.0);
+        drop(l);
+        assert!(a.refine, "no full rebuild while moving");
+        a.frame(600.0);
+        assert!(!a.rig.is_animating());
+        assert!(a.refine, "the final pose is drawn first");
+        a.frame(616.0);
+        assert!(!a.refine);
+        let l = a.layers();
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].lift, 1.0);
+        assert_eq!(l[0].geometry.vertices.len(), full.vertices.len());
+        // Leaving 3D needs no preview (2D builds are cheap) and nothing to refine.
+        drop(l);
+        cmd(&mut a, r#"{"t":"setMode","mode":"2d"}"#);
+        assert!(!a.refine);
+    }
+
+    #[test]
+    fn refine_waits_for_a_pause_in_the_input() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"z=\\sin(x)\\cos(y)"}"#);
+        a.frame(0.0);
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        a.frame(10.0);
+        cmd(&mut a, r#"{"t":"pointer","phase":"down","x":400,"y":300}"#);
+        let mut t = 10.0;
+        while t < 800.0 {
+            t += 16.0;
+            a.now_ms = t;
+            cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"move","x":{},"y":300}}"#, 400.0 + t / 10.0));
+            a.frame(t);
+        }
+        assert!(!a.rig.is_animating());
+        assert!(a.refine, "no full build while the user is orbiting");
+        cmd(&mut a, r#"{"t":"pointer","phase":"up","x":480,"y":300}"#);
+        a.frame(t + 50.0);
+        assert!(a.refine);
+        a.frame(t + 200.0);
+        assert!(!a.refine);
+    }
+
+    #[test]
+    fn reduced_motion_switches_at_once_at_full_quality() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"z=\\sin(x)\\cos(y)"}"#);
+        cmd(&mut a, r#"{"t":"setReducedMotion","on":true}"#);
+        a.frame(0.0);
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        assert!(!a.rig.is_animating());
+        assert!(!a.refine);
+        a.frame(16.0);
+        let l = a.layers();
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].lift, 1.0);
+        drop(l);
+        cmd(&mut a, r#"{"t":"setReducedMotion","on":false}"#);
+        cmd(&mut a, r#"{"t":"setMode","mode":"2d"}"#);
+        assert!(a.rig.is_animating());
     }
 
     #[test]

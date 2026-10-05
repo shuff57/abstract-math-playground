@@ -801,7 +801,14 @@ impl<'a> Builder<'a> {
     fn surface(&mut self, f: &Expr, st: Style) -> Result<(), String> {
         let p = self.prog(f, &["x", "y", "z"])?;
         let m = self.px();
-        let depth = ((m.0.min(m.1) / 6.0).log2().round()).clamp(5.0, 8.0) as u32;
+        let full = ((m.0.min(m.1) / 6.0).log2().round()).clamp(5.0, 8.0) as u32;
+        let depth = match SURFACE_DEPTH_CAP.get() {
+            Some(cap) if cap < full => {
+                SURFACE_CAPPED.set(true);
+                cap
+            }
+            _ => full,
+        };
         let mesh = mesh::surface_3d(&p, self.win.min, self.win.max, depth, 300_000);
         let base = self.out.vertices.len() as u32;
         let mut col = st.color;
@@ -1694,6 +1701,42 @@ pub struct SliceOutcome {
     pub rs: ResolvedSlice,
 }
 
+/// Octree depth of implicit surfaces in a preview build: each level less is roughly 4x fewer
+/// cells, so a mode switch to 3D can start moving at once (see [`build_scene_preview`]).
+pub const PREVIEW_SURFACE_DEPTH: u32 = 5;
+
+thread_local! {
+    /// Depth cap for [`Builder::surface`] while a preview is being built.
+    static SURFACE_DEPTH_CAP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// Set when a surface of the current preview was meshed below full quality.
+    static SURFACE_CAPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`build_scene`] at preview quality: implicit surfaces are meshed at most
+/// [`PREVIEW_SURFACE_DEPTH`] deep (everything else is identical: grid, labels, curves, colours,
+/// diagnostics). Returns the geometry and whether anything was actually coarser than a full
+/// build, i.e. whether a full rebuild should follow once there is time for it.
+pub fn build_scene_preview(
+    doc: &Doc,
+    mode: Mode,
+    window: Window3,
+    origin: [f64; 3],
+    viewport_px: (u32, u32),
+    theme: &Theme,
+) -> (SceneGeometry, bool) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SURFACE_DEPTH_CAP.set(None);
+        }
+    }
+    SURFACE_DEPTH_CAP.set(Some(PREVIEW_SURFACE_DEPTH));
+    SURFACE_CAPPED.set(false);
+    let _reset = Reset;
+    let g = build_scene(doc, mode, window, origin, viewport_px, theme);
+    (g, SURFACE_CAPPED.get())
+}
+
 /// Builds the secondary inset for the document's slice, if it has one. `Err` carries why the
 /// slice cannot be shown in this mode (shown by the app, never a panic). `window` is the visible
 /// window (as given to [`build_scene`]); `main_px` the canvas size.
@@ -1905,6 +1948,24 @@ mod tests {
         }
         assert!(zmin < -9.0 && zmax > 9.0);
         assert!(g.indices.iter().all(|&i| (i as usize) < g.vertices.len()));
+    }
+
+    #[test]
+    fn preview_meshes_surfaces_coarser_and_keeps_everything_else() {
+        let d = doc_with(&[("s", "z=\\sin(x)\\cos(y)"), ("p", "(1,2,3)")]);
+        let full = build(&d, Mode::D3);
+        let (pre, coarse) = build_scene_preview(&d, Mode::D3, Window3::default(), [0.0; 3], (800, 600), &Theme::light());
+        assert!(coarse);
+        assert!(!pre.vertices.is_empty() && pre.vertices.len() * 4 < full.vertices.len());
+        assert_eq!(pre.segments, full.segments, "grid, axes and the point are identical");
+        assert_eq!(pre.labels, full.labels);
+        assert_eq!(pre.item_colors, full.item_colors);
+        // The cap is scoped to the preview call.
+        assert_eq!(build(&d, Mode::D3).vertices.len(), full.vertices.len());
+        // Nothing to coarsen: not coarse, and identical to a full build.
+        let (flat, coarse) = build_scene_preview(&d, Mode::D2, Window3::default(), [0.0; 3], (800, 600), &Theme::light());
+        assert!(!coarse);
+        assert_eq!(flat, build(&d, Mode::D2));
     }
 
     #[test]

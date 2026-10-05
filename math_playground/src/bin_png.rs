@@ -21,7 +21,7 @@ use math_core::doc::{Doc, Item, ItemKind, SliderCfg};
 use math_core::view::{Mode, Rig, Window3};
 use math_playground_lib::geometry::{SceneGeometry, Theme};
 use math_playground_lib::headless::{save_png, Headless};
-use math_playground_lib::render::{crossfade, Inset, Layer};
+use math_playground_lib::render::{crossfade, layer_lift, Inset, Layer};
 use math_playground_lib::scene::{build_scene, build_slice_panel_view, ViewReq};
 use std::path::PathBuf;
 
@@ -165,12 +165,12 @@ fn main() -> Result<(), String> {
             let inset = panel.as_ref().map(|o| Inset {
                 rect: o.panel.rect,
                 rig: &o.panel.rig,
-                layers: vec![Layer { geometry: &o.panel.geometry, fade: 1.0, origin: o.panel.origin }],
+                layers: vec![Layer { geometry: &o.panel.geometry, fade: 1.0, origin: o.panel.origin, lift: 1.0 }],
             });
             let rgba = gpu.render_rgba_with_inset(
                 size,
                 &rig,
-                &[Layer { geometry: &g, fade: 1.0, origin: rig.render_origin() }],
+                &[Layer { geometry: &g, fade: 1.0, origin: rig.render_origin(), lift: 1.0 }],
                 theme.background,
                 inset.as_ref(),
             );
@@ -214,8 +214,8 @@ fn main() -> Result<(), String> {
             let (fa, fb) = crossfade(p);
             let o = rig.render_origin();
             let layers = [
-                Layer { geometry: &ga, fade: fa, origin: o },
-                Layer { geometry: &gb, fade: fb, origin: o },
+                Layer { geometry: &ga, fade: fa, origin: o, lift: layer_lift(from, rig.lift()) },
+                Layer { geometry: &gb, fade: fb, origin: o, lift: layer_lift(to, rig.lift()) },
             ];
             let rgba = gpu.render_rgba(size, &rig, &layers, theme.background);
             let path = dir.join(format!("frame_{i:02}.png"));
@@ -255,12 +255,12 @@ fn main() -> Result<(), String> {
     let inset = panel.as_ref().map(|o| Inset {
         rect: o.panel.rect,
         rig: &o.panel.rig,
-        layers: vec![Layer { geometry: &o.panel.geometry, fade: 1.0, origin: o.panel.origin }],
+        layers: vec![Layer { geometry: &o.panel.geometry, fade: 1.0, origin: o.panel.origin, lift: 1.0 }],
     });
     let rgba = gpu.render_rgba_with_inset(
         size,
         &rig,
-        &[Layer { geometry: &g, fade: 1.0, origin: rig.render_origin() }],
+        &[Layer { geometry: &g, fade: 1.0, origin: rig.render_origin(), lift: 1.0 }],
         theme.background,
         inset.as_ref(),
     );

@@ -14,14 +14,23 @@ struct Camera {
 struct Frame {
     viewport: vec2<f32>,
     fade: f32,
-    _pad: f32,
-    // geometry_origin - current_origin (computed in f64 on the CPU), so geometry built for an
-    // older window keeps drawing correctly while a new one is rebuilt.
+    // z scale about world z = 0 (offset.w): a 3D scene rises out of / settles into the plane
+    // during a 2D <-> 3D switch. 1 otherwise.
+    lift: f32,
+    // xyz: geometry_origin - current_origin (computed in f64 on the CPU), so geometry built for
+    // an older window keeps drawing correctly while a new one is rebuilt. w: world z = 0 relative
+    // to the current origin.
     offset: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(0) @binding(1) var<uniform> frame: Frame;
+
+// Geometry position -> current-origin-relative position, with the switch lift applied.
+fn placed(p: vec3<f32>) -> vec3<f32> {
+    let q = p + frame.offset.xyz;
+    return vec3<f32>(q.xy, frame.offset.w + (q.z - frame.offset.w) * frame.lift);
+}
 
 // ---------------------------------------------------------------- thick segments / dots
 
@@ -50,8 +59,8 @@ fn vs_seg(in: SegIn) -> SegOut {
         vec2<f32>(0.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0),
     );
     let q = corners[in.vi];
-    let c0 = cam.view_proj * vec4<f32>(in.p0 + frame.offset.xyz, 1.0);
-    let c1 = cam.view_proj * vec4<f32>(in.p1 + frame.offset.xyz, 1.0);
+    let c0 = cam.view_proj * vec4<f32>(placed(in.p0), 1.0);
+    let c1 = cam.view_proj * vec4<f32>(placed(in.p1), 1.0);
 
     var out: SegOut;
     out.color = in.color;
@@ -117,8 +126,10 @@ struct MeshOut {
 @vertex
 fn vs_mesh(in: MeshIn) -> MeshOut {
     var out: MeshOut;
-    out.pos = cam.view_proj * vec4<f32>(in.pos + frame.offset.xyz, 1.0);
-    out.normal = in.normal;
+    out.pos = cam.view_proj * vec4<f32>(placed(in.pos), 1.0);
+    // Normals of the z-scaled surface (inverse transpose of diag(1, 1, lift)); a zero normal
+    // still marks unlit flat geometry, so the scale never reaches exactly 0.
+    out.normal = vec3<f32>(in.normal.xy * max(frame.lift, 1.0e-3), in.normal.z);
     out.color = in.color;
     return out;
 }
