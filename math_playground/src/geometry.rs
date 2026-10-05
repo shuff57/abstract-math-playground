@@ -149,6 +149,21 @@ pub struct ItemInfo {
     pub rmse: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n: Option<usize>,
+    /// Regressions: Pearson's correlation `r` (straight-line fits only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r: Option<f64>,
+    /// Regressions: the [`math_core::reg_family::Family`] key when the text is a panel template.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    /// Regressions: `y = 1.5 x - 0.6667` (LaTeX), when the model uses one data list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equation: Option<String>,
+    /// Plain-text version of `equation`.
+    #[serde(rename = "equationText", skip_serializing_if = "Option::is_none")]
+    pub equation_text: Option<String>,
+    /// Regressions: the residuals `y - fit`, one per data point (4 significant digits).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub residuals: Vec<f64>,
 }
 
 /// Colours for one theme. The page chrome and the canvas read the same theme so they cannot

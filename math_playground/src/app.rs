@@ -203,10 +203,17 @@ pub enum Command {
         col: usize,
         name: String,
     },
-    /// `style` is `points`, `line` or `hidden`.
+    /// Legacy table-wide style, applied to every column: `points`, `line` or `hidden`.
     SetTableStyle {
         id: String,
         style: String,
+    },
+    /// Merges `style` into column `col`'s [`math_core::table::ColumnStyle`] (`color`, `hidden`,
+    /// `points`, `lines`, `pointStyle`, `pointSize`, `opacity`, `outline`; `null` resets a key).
+    SetTableColumnStyle {
+        id: String,
+        col: usize,
+        style: serde_json::Map<String, serde_json::Value>,
     },
     /// Evaluates action item `id` once (`a -> a+1, b -> 2b`) and applies the result.
     RunAction {
@@ -1017,13 +1024,16 @@ impl App {
             }
             Command::SetTableStyle { id, style } => match TableStyle::parse(&style) {
                 Some(st) => self.edit_table(&id, |t| {
-                    t.style = st;
+                    t.apply_table_style(st);
                     Ok(())
                 }),
                 None => self.outbox.push(Event::Error {
                     message: format!("unknown table style '{style}'"),
                 }),
             },
+            Command::SetTableColumnStyle { id, col, style } => {
+                self.edit_table(&id, |t| t.set_column_style(col, &style))
+            }
             Command::RunAction { id } => match self.step_action(&id) {
                 Ok(()) => self.mark_doc_changed(),
                 Err(message) => self.outbox.push(Event::Error { message }),
@@ -1066,7 +1076,7 @@ impl App {
         id: &str,
         patch: serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), String> {
-        const KEYS: [&str; 9] = [
+        const KEYS: [&str; 10] = [
             "lineWidth",
             "lineStyle",
             "pointStyle",
@@ -1076,6 +1086,7 @@ impl App {
             "pointSize",
             "fillOpacity",
             "showLabel",
+            "residualPlot",
         ];
         let Some(item) = self.doc.items.iter_mut().find(|i| i.id == id) else {
             return Err(format!("no item with id '{id}'"));
@@ -1377,7 +1388,7 @@ impl App {
                 id: id.to_string(),
                 columns: t.columns.clone(),
                 rows: t.rows(),
-                style: t.style.name().to_string(),
+                style: t.summary_style().name().to_string(),
             });
         }
     }
@@ -2638,6 +2649,91 @@ mod tests {
             assert!(has(&cmd(&mut a, bad), "error"), "{bad}");
         }
         assert_eq!(a.doc, before);
+    }
+
+    #[test]
+    fn table_columns_have_their_own_styles() {
+        let mut a = app();
+        let dots = |a: &App, w: f32| {
+            a.layers()[0]
+                .geometry
+                .segments
+                .iter()
+                .filter(|s| s.p0 == s.p1 && s.width == w)
+                .count()
+        };
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"addTable","id":"t","columns":["x_1","y_1","y_2"],"data":[[1,1,5],[2,2,6],[3,4,7]]}"#,
+        );
+        // Every y column is its own point set, each with its own palette colour.
+        assert_eq!(dots(&a, 9.0), 6);
+        let colors = ev.iter().find(|e| e["t"] == "colors").expect("colors event");
+        let color_of = |id: &str| {
+            colors["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == id)
+                .map(|c| c["color"].as_str().unwrap().to_string())
+        };
+        let (c1, c2) = (color_of("t").unwrap(), color_of("t#2").unwrap());
+        assert_ne!(c1, c2);
+        assert_eq!(color_of("t#1"), None, "the first y column uses the item's colour");
+
+        let ev = cmd(
+            &mut a,
+            r##"{"t":"setTableColumnStyle","id":"t","col":2,"style":{"color":"#c74440","pointSize":14,"lines":true,"pointStyle":"square"}}"##,
+        );
+        let t = ev.iter().find(|e| e["t"] == "table").expect("table event");
+        assert_eq!(t["columns"][2]["style"]["color"], "#c74440");
+        assert_eq!(t["columns"][2]["style"]["lines"], true);
+        assert!(t["columns"][1].get("style").is_none(), "defaults are not echoed");
+        let segs = a.layers()[0].geometry.segments.clone();
+        let red = |s: &&crate::geometry::SegmentInstance| (s.color[0] - 0.78).abs() < 0.01 && s.color[1] < 0.3;
+        assert!(segs.iter().filter(red).any(|s| s.width == 2.5 && s.p0 != s.p1), "lines between the y_2 points");
+        assert!(segs.iter().filter(red).any(|s| s.p0 != s.p1 && s.width != 2.5), "square markers");
+        assert_eq!(dots(&a, 9.0), 3, "y_1 keeps its dots");
+        // Points off for y_1; an outline ring for y_2 (drawn as a larger background dot).
+        cmd(&mut a, r#"{"t":"setTableColumnStyle","id":"t","col":1,"style":{"points":false}}"#);
+        assert_eq!(dots(&a, 9.0), 0);
+        cmd(&mut a, r#"{"t":"setTableColumnStyle","id":"t","col":2,"style":{"outline":true,"pointStyle":null}}"#);
+        assert_eq!(dots(&a, 14.0), 3);
+        assert_eq!(dots(&a, 18.0), 3);
+        // Hidden draws nothing for that column; the lists stay defined.
+        cmd(&mut a, r#"{"t":"setTableColumnStyle","id":"t","col":2,"style":{"hidden":true}}"#);
+        assert_eq!(dots(&a, 14.0), 0);
+        cmd(&mut a, r#"{"t":"setTableColumnStyle","id":"t","col":2,"style":{"hidden":null}}"#);
+
+        // Errors change nothing.
+        let before = a.doc.clone();
+        for bad in [
+            r#"{"t":"setTableColumnStyle","id":"t","col":2,"style":{"color":"red"}}"#,
+            r#"{"t":"setTableColumnStyle","id":"t","col":2,"style":{"glow":true}}"#,
+            r#"{"t":"setTableColumnStyle","id":"t","col":2,"style":{"opacity":3}}"#,
+            r#"{"t":"setTableColumnStyle","id":"t","col":9,"style":{"lines":true}}"#,
+            r#"{"t":"setTableColumnStyle","id":"nope","col":1,"style":{"lines":true}}"#,
+        ] {
+            assert!(has(&cmd(&mut a, bad), "error"), "{bad}");
+        }
+        assert_eq!(a.doc, before);
+
+        // Export and reload keep every column's style.
+        let ev = cmd(&mut a, r#"{"t":"export"}"#);
+        let hash = ev.iter().find(|e| e["t"] == "hash").unwrap()["hash"].as_str().unwrap().to_string();
+        let mut b = app();
+        cmd(&mut b, &serde_json::json!({"t":"loadHash","hash":hash}).to_string());
+        assert_eq!(b.doc.items[0].table, a.doc.items[0].table);
+        assert_eq!(dots(&b, 14.0), 3);
+
+        // A legacy document with the table-wide "line" style loads as lines on every column.
+        let legacy = r#"{"v":1,"view":{"mode":"2d","window":{"min":[-10,-10,-10],"max":[10,10,10]},"angle":"rad"},"items":[{"id":"t","kind":"table","latex":"","table":{"columns":[{"name":"x_1","cells":["1","2"]},{"name":"y_1","cells":["1","4"]}],"style":"line"}}]}"#;
+        let mut c = app();
+        let ev = cmd(&mut c, &serde_json::json!({"t":"loadDoc","json":legacy}).to_string());
+        let t = ev.iter().find(|e| e["t"] == "table").expect("table event on load");
+        assert_eq!(t["columns"][1]["style"]["lines"], true);
+        assert_eq!(t["style"], "line", "legacy summary for old shells");
+        assert!(c.layers()[0].geometry.segments.iter().any(|s| s.p0 != s.p1 && s.width == 2.5 && s.color[3] > 0.9 && s.color[0] > 0.7));
     }
 
     #[test]

@@ -163,6 +163,10 @@ pub struct ItemStyle {
     /// Draw a text label next to the item's points (the `label` text, else the coordinates).
     #[serde(default, skip_serializing_if = "is_false")]
     pub show_label: bool,
+    /// Regression items: plot the residual of each data point against its x value (the
+    /// regression panel's "plot" button).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub residual_plot: bool,
 }
 
 /// Valid range of [`ItemStyle::point_size`].
@@ -426,7 +430,7 @@ fn migrate_1_to_2(value: serde_json::Value) -> Result<serde_json::Value, DocErro
 
 // ------------------------------------------------------------------- Doc API
 
-fn is_hex_color(s: &str) -> bool {
+pub(crate) fn is_hex_color(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 7 && b[0] == b'#' && b[1..].iter().all(|c| c.is_ascii_hexdigit())
 }
@@ -476,6 +480,16 @@ fn check_item_fields(it: &Item, ctx: &str, e: &mut Errs) {
     if let Err(m) = it.style.validate() {
         for part in m.split("; ") {
             e.push(format!("{ctx}: {part}"));
+        }
+    }
+}
+
+impl Doc {
+    /// Moves every table's legacy table-wide style into its columns (see
+    /// [`crate::table::Table::migrate_style`]); [`from_json`] does this on load.
+    pub fn migrate_table_styles(&mut self) {
+        for t in self.items.iter_mut().filter_map(|i| i.table.as_mut()) {
+            t.migrate_style();
         }
     }
 }
@@ -679,7 +693,8 @@ pub fn from_json(s: &str) -> Result<Doc, DocError> {
     let value: serde_json::Value =
         serde_json::from_str(s).map_err(|e| DocError::Json(e.to_string()))?;
     let value = migrate(value)?;
-    let doc: Doc = serde_json::from_value(value).map_err(|e| DocError::Json(e.to_string()))?;
+    let mut doc: Doc = serde_json::from_value(value).map_err(|e| DocError::Json(e.to_string()))?;
+    doc.migrate_table_styles();
     doc.validate()?;
     Ok(doc)
 }
@@ -752,6 +767,7 @@ mod tests {
                     point_size: Some(12.0),
                     fill_opacity: Some(0.4),
                     show_label: true,
+                    residual_plot: i % 4 == 0,
                 };
             }
             d.add_item(it).unwrap();
@@ -1058,6 +1074,33 @@ mod tests {
         // Hostile table data is rejected.
         let mut bad = d.clone();
         bad.items[0].table.as_mut().unwrap().columns[0].name = "not a name".into();
+        assert!(from_json(&to_json(&bad)).is_err());
+    }
+
+    #[test]
+    fn column_styles_round_trip_and_legacy_table_style_migrates() {
+        let mut d = Doc::new_default();
+        let mut it = Item::new("t1", ItemKind::Table, "");
+        let mut t = crate::table::Table::new(&["x_1".into(), "y_1".into(), "y_2".into()], 1);
+        t.columns[2].style.color = Some("#6042a6".into());
+        t.columns[2].style.lines = true;
+        it.table = Some(t);
+        d.add_item(it).unwrap();
+        assert_eq!(from_json(&to_json(&d)).unwrap(), d);
+        assert_eq!(decode_hash(&encode_hash(&d)).unwrap(), d);
+        // A document saved with the old table-wide "line" style loads with lines on every column
+        // (so it draws as before) and re-saves without the legacy key.
+        let old = r#"{"v":1,"view":{"mode":"2d","window":{"min":[-1,-1,-1],"max":[1,1,1]},"angle":"rad"},"items":[{"id":"t","kind":"table","latex":"","table":{"columns":[{"name":"x_1","cells":["1","2"]},{"name":"y_1","cells":["1","4"]}],"style":"line"}}]}"#;
+        let got = from_json(old).unwrap();
+        let tb = got.items[0].table.as_ref().unwrap();
+        assert_eq!(tb.style, crate::table::TableStyle::Points);
+        assert!(tb.columns.iter().all(|c| c.style.lines && !c.style.hidden));
+        let again = to_json(&got);
+        assert!(!again.contains(r#""style":"line""#), "{again}");
+        assert_eq!(from_json(&again).unwrap(), got);
+        // Hostile column styles are rejected.
+        let mut bad = d.clone();
+        bad.items[0].table.as_mut().unwrap().columns[1].style.color = Some("javascript:".into());
         assert!(from_json(&to_json(&bad)).is_err());
     }
 
