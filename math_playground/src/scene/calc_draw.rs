@@ -270,6 +270,12 @@ fn tidy_signs(e: Expr) -> Expr {
             match (op, &b) {
                 (BinOp::Add, Expr::Num(c)) if *c < 0.0 => Expr::bin(BinOp::Sub, a, Expr::Num(-*c)),
                 (BinOp::Sub, Expr::Num(c)) if *c < 0.0 => Expr::bin(BinOp::Add, a, Expr::Num(-*c)),
+                // `a + (-0.5) x` reads `a - 0.5 x` (a fitted negative coefficient of a term).
+                (BinOp::Add | BinOp::Sub, Expr::Bin(BinOp::Mul, k, rest)) if matches!(**k, Expr::Num(c) if c < 0.0) => {
+                    let Expr::Num(c) = **k else { unreachable!() };
+                    let flipped = if op == BinOp::Add { BinOp::Sub } else { BinOp::Add };
+                    Expr::bin(flipped, a, Expr::bin(BinOp::Mul, Expr::Num(-c), (**rest).clone()))
+                }
                 _ => Expr::bin(op, a, b),
             }
         }
@@ -419,6 +425,12 @@ mod tests {
         use super::tidy_signs;
         let e = Expr::bin(BinOp::Add, Expr::var("x"), Expr::Num(-3.0));
         assert_eq!(math_core::print::to_text(&tidy_signs(e)), "x - 3");
+        let e = Expr::bin(
+            BinOp::Add,
+            Expr::bin(BinOp::Mul, Expr::Num(0.5), Expr::bin(BinOp::Pow, Expr::var("x"), Expr::Num(2.0))),
+            Expr::bin(BinOp::Mul, Expr::Num(-0.5), Expr::var("x")),
+        );
+        assert_eq!(math_core::print::to_text(&tidy_signs(e)), "0.5 * x^2 - 0.5 * x");
     }
 
     use crate::geometry::{SceneGeometry, Theme};
