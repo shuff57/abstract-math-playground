@@ -127,13 +127,32 @@ pub struct CamState {
     pub ortho_t: f64,
     /// 0 = normal, 1 = 1D strip (view centred on y=0).
     pub strip: f64,
+    /// Height of 3D geometry: 1 in 3D, 0 in 1D/2D. Mid-switch the renderer scales the z of the
+    /// 3D scene about z = 0 by this, so a surface rises out of (or settles into) the plane
+    /// together with the camera instead of only crossfading.
+    pub lift: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Tween {
     pub from: CamState,
-    pub start_ms: f64,
+    /// `None` until the first [`Rig::update`] after the tween was requested: the clock starts on
+    /// the first frame that can show it, not at the command. A command handled after a long idle
+    /// (the frame loop sleeps) or followed by a slow scene build would otherwise find most or
+    /// all of the tween already elapsed on its first frame, and the switch would jump or pop.
+    pub start_ms: Option<f64>,
     pub duration_ms: f64,
+}
+
+impl Tween {
+    /// Linear time progress in [0, 1] at `now_ms` (0 while the clock has not started).
+    pub fn progress(&self, now_ms: f64) -> f64 {
+        match self.start_ms {
+            Some(s) if self.duration_ms > 0.0 => ((now_ms - s) / self.duration_ms).clamp(0.0, 1.0),
+            Some(_) => 1.0,
+            None => 0.0,
+        }
+    }
 }
 
 /// Ease-in-out cubic. Clamped; ease(0)=0, ease(1)=1, zero slope at both ends.
@@ -273,6 +292,7 @@ fn lerp_state(a: &CamState, b: &CamState, e: f64) -> CamState {
         h: if ratio.is_finite() && ratio > 0.0 { a.h * ratio.powf(e) } else { a.h },
         ortho_t: a.ortho_t + (b.ortho_t - a.ortho_t) * e,
         strip: a.strip + (b.strip - a.strip) * e,
+        lift: a.lift + (b.lift - a.lift) * e,
     }
 }
 
@@ -350,24 +370,32 @@ impl Rig {
     pub fn is_animating(&self) -> bool {
         self.tween.is_some()
     }
-    /// Linear time progress of the running tween in [0,1] (1 when idle).
+    /// Linear time progress of the running tween in [0,1] (1 when idle, 0 until the first
+    /// `update` after the switch).
     pub fn progress(&self) -> f64 {
         match &self.tween {
-            Some(t) => ((self.now_ms - t.start_ms) / t.duration_ms).clamp(0.0, 1.0),
+            Some(t) => t.progress(self.now_ms),
             None => 1.0,
         }
+    }
+    /// Current height of 3D geometry (see [`CamState::lift`]).
+    pub fn lift(&self) -> f64 {
+        self.current_state(self.aspect).lift
     }
     pub fn ortho_t(&self, aspect: f64) -> f64 {
         self.current_state(clamp_aspect(aspect)).ortho_t
     }
 
-    /// Advance the clock; finishes the tween when its time is up.
+    /// Advance the clock; starts a requested tween's clock (see [`Tween::start_ms`]) and
+    /// finishes the tween when its time is up.
     pub fn update(&mut self, now_ms: f64) {
         if now_ms.is_finite() {
             self.now_ms = now_ms;
         }
-        if let Some(t) = &self.tween {
-            if self.now_ms - t.start_ms >= t.duration_ms {
+        let now = self.now_ms;
+        if let Some(t) = &mut self.tween {
+            let start = *t.start_ms.get_or_insert(now);
+            if now - start >= t.duration_ms {
                 self.tween = None;
             }
         }
@@ -381,6 +409,7 @@ impl Rig {
                 h: (hw[0] / aspect).max(MIN_HALF),
                 ortho_t: 1.0,
                 strip: if mode == Mode::D1 { 1.0 } else { 0.0 },
+                lift: 0.0,
             },
             Mode::D3 => {
                 let r = (hw[0] * hw[0] + hw[1] * hw[1] + hw[2] * hw[2]).sqrt();
@@ -390,6 +419,7 @@ impl Rig {
                     h: (self.dist * r / half_fov.cos()).max(MIN_HALF),
                     ortho_t: if self.ortho3 { 1.0 } else { 0.0 },
                     strip: 0.0,
+                    lift: 1.0,
                 }
             }
         }
@@ -400,15 +430,14 @@ impl Rig {
         let aspect = clamp_aspect(aspect);
         let to = self.target_state(self.mode, aspect);
         match &self.tween {
-            Some(t) => {
-                let p = ((self.now_ms - t.start_ms) / t.duration_ms).clamp(0.0, 1.0);
-                lerp_state(&t.from, &to, ease(p))
-            }
+            Some(t) => lerp_state(&t.from, &to, ease(t.progress(self.now_ms))),
             None => to,
         }
     }
 
     /// Capture the current state, apply `f`, then tween from the captured state to the new target.
+    /// `now_ms` only advances the clock of a tween already running (the captured state is what is
+    /// on screen); the new tween's clock starts at the next `update`.
     fn retarget(&mut self, now_ms: f64, f: impl FnOnce(&mut Self)) {
         self.update(now_ms);
         let from = self.current_state(self.aspect);
@@ -416,7 +445,7 @@ impl Rig {
         if self.reduced_motion || !self.duration_ms.is_finite() || self.duration_ms <= 0.0 {
             self.tween = None;
         } else {
-            self.tween = Some(Tween { from, start_ms: self.now_ms, duration_ms: self.duration_ms });
+            self.tween = Some(Tween { from, start_ms: None, duration_ms: self.duration_ms });
         }
     }
 
@@ -741,21 +770,108 @@ mod tests {
     fn retarget_is_continuous() {
         let mut r = Rig::new(win(), Mode::D2);
         r.set_aspect(1.5);
+        // Each `update` right after a switch is the first frame, which starts its clock.
         r.set_mode(Mode::D3, 0.0);
+        r.update(0.0);
         r.update(180.0);
+        assert!(r.progress() > 0.3 && r.progress() < 0.4);
         let before = r.view_proj(1.5);
         r.set_mode(Mode::D1, 180.0);
         assert!(mat_close(&before, &r.view_proj(1.5), 1e-9));
+        r.update(180.0);
         r.update(300.0);
         let before = r.view_proj(1.5);
         r.set_mode(Mode::D3, 300.0);
         assert!(mat_close(&before, &r.view_proj(1.5), 1e-9));
         r.update(300.0);
         r.set_ortho3(true, 400.0);
+        r.update(400.0);
         r.update(450.0);
         let before = r.view_proj(1.5);
         r.set_ortho3(false, 450.0);
         assert!(mat_close(&before, &r.view_proj(1.5), 1e-9));
+        // A second switch before any frame: still continuous, and starts at the next frame.
+        let before = r.view_proj(1.5);
+        r.set_mode(Mode::D2, 450.0);
+        assert!(mat_close(&before, &r.view_proj(1.5), 1e-9));
+        r.update(9000.0);
+        assert!(mat_close(&before, &r.view_proj(1.5), 1e-9));
+        assert!(r.is_animating());
+    }
+
+    #[test]
+    fn tween_clock_starts_on_the_first_frame_after_the_switch() {
+        // The command is handled with a stale clock (the frame loop slept for seconds, or a slow
+        // scene build ran in between): the first frame still shows the start of the motion.
+        let mut r = Rig::new(win(), Mode::D2);
+        r.set_aspect(1.5);
+        r.update(100.0);
+        let shown = r.view_proj(1.5);
+        r.set_mode(Mode::D3, 100.0);
+        assert!(r.is_animating());
+        assert_eq!(r.progress(), 0.0);
+        r.update(5_000.0);
+        assert!(r.is_animating(), "a stale command time must not use up the tween");
+        assert_eq!(r.progress(), 0.0);
+        assert!(mat_close(&shown, &r.view_proj(1.5), 1e-12), "first frame = last shown pose");
+        // Then it runs for its full duration from that frame, a frame at a time.
+        let mut frames = 0;
+        let mut t = 5_000.0;
+        while r.is_animating() {
+            t += 1000.0 / 60.0;
+            r.update(t);
+            frames += 1;
+            assert!(frames < 100);
+        }
+        assert_eq!(frames, (r.duration_ms / (1000.0 / 60.0)).ceil() as usize);
+        assert!(mat_close(&r.view_proj(1.5), &Rig::new(win(), Mode::D3).view_proj(1.5), 1e-12));
+    }
+
+    #[test]
+    fn tween_progress_cases() {
+        let from = Rig::new(win(), Mode::D2).current_state(1.0);
+        let t = Tween { from, start_ms: None, duration_ms: 500.0 };
+        assert_eq!(t.progress(1e9), 0.0);
+        let t = Tween { start_ms: Some(1000.0), ..t };
+        assert_eq!(t.progress(900.0), 0.0);
+        assert_eq!(t.progress(1250.0), 0.5);
+        assert_eq!(t.progress(2000.0), 1.0);
+        assert_eq!(Tween { duration_ms: 0.0, ..t }.progress(1000.0), 1.0);
+    }
+
+    #[test]
+    fn lift_follows_the_switch_into_and_out_of_3d() {
+        let mut r = Rig::new(win(), Mode::D2);
+        r.set_aspect(1.5);
+        assert_eq!(r.lift(), 0.0);
+        r.set_mode(Mode::D3, 0.0);
+        r.update(0.0);
+        assert_eq!(r.lift(), 0.0);
+        let mut prev = 0.0;
+        for t in (0..=500).step_by(20) {
+            r.update(t as f64);
+            assert!(r.lift() >= prev && r.lift() <= 1.0);
+            prev = r.lift();
+        }
+        assert_eq!(r.lift(), 1.0);
+        // Reverse half way: no jump, then down to 0.
+        r.set_mode(Mode::D1, 500.0);
+        r.update(500.0);
+        r.update(750.0);
+        let mid = r.lift();
+        assert!(mid > 0.0 && mid < 1.0);
+        r.set_mode(Mode::D3, 750.0);
+        assert!((r.lift() - mid).abs() < 1e-12);
+        r.set_mode(Mode::D2, 750.0);
+        r.update(750.0);
+        r.update(2000.0);
+        assert_eq!(r.lift(), 0.0);
+        // 1D <-> 2D never lifts.
+        r.set_mode(Mode::D1, 2000.0);
+        for t in (2000..=2600).step_by(50) {
+            r.update(t as f64);
+            assert_eq!(r.lift(), 0.0);
+        }
     }
 
     #[test]
