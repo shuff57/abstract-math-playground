@@ -30,7 +30,7 @@ use math_core::parse::{parse_with, ParseCtx};
 use math_core::resolve::Defs;
 use math_core::slice::ResolvedSlice;
 use math_core::stats;
-use math_core::table::{ParsedColumn, TableStyle};
+use math_core::table::{ColumnStyle, ParsedColumn};
 use math_core::view::{Mode, Window3};
 use math_core::wgsl::emit_module;
 use math_core::wgsl_complex::{emit_complex_function, emit_domain_module, COMPLEX_PRELUDE};
@@ -54,6 +54,8 @@ const MAJOR_W: f32 = 1.5;
 const AXIS_W: f32 = 2.0;
 const CURVE_W: f32 = 2.5;
 const DOT_W: f32 = 9.0;
+/// Width of a table column's point outline ring (pixels on each side).
+const OUTLINE_W: f32 = 2.0;
 const TICK_PX: f64 = 4.0;
 const MESH_ALPHA: f32 = 0.92;
 /// Opacity of a domain-coloured complex plane in 3D (so surfaces/axes behind still read).
@@ -2011,17 +2013,20 @@ impl<'a> Builder<'a> {
 
     // ----- tables ----------------------------------------------------------------------------
 
-    /// Plots a table: columns 0 and 1 are x and y (a third column is z in 3D). Rows with a blank
-    /// or non-numeric cell are skipped. `Line` also joins consecutive rows.
+    /// Plots one y column of a table against column 0 (x): column `yc` is y (in 1D only x is
+    /// used; in 3D column `yc + 1`, when it exists, is z). Rows with a blank or non-numeric cell
+    /// are skipped. The column style decides points, lines and the point outline.
+    #[allow(clippy::too_many_arguments)]
     fn draw_table(
         &mut self,
         cols: &[ParsedColumn],
-        style: TableStyle,
+        yc: usize,
+        cs: &ColumnStyle,
         defs: &Defs,
         mode: Mode,
         st: Style,
     ) -> Result<(), String> {
-        if style == TableStyle::Hidden || cols.is_empty() {
+        if cs.hidden || cols.is_empty() {
             return Ok(());
         }
         let rows = cols.iter().map(|c| c.cells.len()).max().unwrap_or(0);
@@ -2053,10 +2058,10 @@ impl<'a> Builder<'a> {
             let y = if mode == Mode::D1 {
                 Some(0.0)
             } else {
-                value(self, 1, ri)
+                value(self, yc, ri)
             };
-            let z = if mode == Mode::D3 && cols.len() > 2 {
-                value(self, 2, ri)
+            let z = if mode == Mode::D3 && cols.len() > yc + 1 {
+                value(self, yc + 1, ri)
             } else {
                 Some(0.0)
             };
@@ -2069,14 +2074,20 @@ impl<'a> Builder<'a> {
             }
         }
         runs.push(run);
-        if style == TableStyle::Line && mode != Mode::D1 {
+        if cs.lines && mode != Mode::D1 {
             for r in &runs {
                 self.polyline(r, st);
             }
         }
-        for p in pts {
-            if mode != Mode::D1 || (p[0] >= self.win.min[0] && p[0] <= self.win.max[0]) {
-                self.point(p, st);
+        if cs.points {
+            let bg = self.theme.background;
+            for p in pts {
+                if mode != Mode::D1 || (p[0] >= self.win.min[0] && p[0] <= self.win.max[0]) {
+                    if cs.outline {
+                        self.seg(p, p, st.point_size + 2.0 * OUTLINE_W, bg);
+                    }
+                    self.point(p, st);
+                }
             }
         }
         if errors.is_empty() {
@@ -2751,12 +2762,19 @@ pub fn build_scene_mapped(
         if matches!(pr.kind, Kind::Definition { .. }) {
             continue;
         }
+        // A regression is drawn in ink (black on a light theme) unless it has a colour, as in
+        // Desmos; it still takes a palette slot so the rows after it keep their colours.
+        let auto = if matches!(pr.kind, Kind::Regression { .. }) {
+            [theme.axis[0], theme.axis[1], theme.axis[2], 1.0]
+        } else {
+            theme.color(visible_idx)
+        };
         let mut color = pr
             .item
             .color
             .as_deref()
             .and_then(parse_hex_color)
-            .unwrap_or_else(|| theme.color(visible_idx));
+            .unwrap_or(auto);
         visible_idx += 1;
         b.out.item_colors.push((pr.item.id.clone(), color));
         if let Some(o) = pr.item.style.opacity {
@@ -2809,27 +2827,68 @@ pub fn build_scene_mapped(
         b.end_item_labels(&pr.item.style, seg0);
     }
     for t in tables.iter().filter(|t| !t.item.hidden) {
-        let mut color = t
-            .item
-            .color
-            .as_deref()
-            .and_then(parse_hex_color)
-            .unwrap_or_else(|| theme.color(visible_idx));
-        visible_idx += 1;
-        b.out.item_colors.push((t.item.id.clone(), color));
-        if let Some(o) = t.item.style.opacity {
-            color[3] *= o.clamp(0.0, 1.0) as f32;
-        }
-        let st = Style::for_item(&t.item.style, color);
-        let style = t.item.table.as_ref().map(|x| x.style).unwrap_or_default();
+        // Every column after the first is its own point set against the first (Desmos). In 1D
+        // only x is drawn (with the first y column's style); in 3D the column after y is z.
+        let ncols = t.cols.len();
+        let ys: Vec<usize> = match mode {
+            _ if ncols < 2 => vec![0],
+            Mode::D2 => (1..ncols).collect(),
+            _ => vec![1],
+        };
+        let item_color = t.item.color.as_deref().and_then(parse_hex_color);
+        let default_cs = ColumnStyle::default();
+        let mut first = None;
+        let mut errs: Vec<String> = Vec::new();
         b.begin_item_labels(&t.item.style);
         // Table rows are world coordinates: mapped onto logarithmic axes as they are drawn.
         b.ext.world_in = true;
-        if let Err(msg) = b.draw_table(&t.cols, style, &defs, mode, st) {
-            diags.push((t.item.id.clone(), msg));
+        for (k, &yc) in ys.iter().enumerate() {
+            let cs = t
+                .item
+                .table
+                .as_ref()
+                .and_then(|x| x.columns.get(yc))
+                .map(|c| &c.style)
+                .unwrap_or(&default_cs);
+            let mut color = cs
+                .color
+                .as_deref()
+                .and_then(parse_hex_color)
+                .or(if k == 0 { item_color } else { None })
+                .unwrap_or_else(|| theme.color(visible_idx));
+            visible_idx += 1;
+            if k == 0 {
+                first = Some(color);
+            }
+            if k > 0 {
+                b.out
+                    .item_colors
+                    .push((format!("{}#{yc}", t.item.id), color));
+            }
+            if let Some(o) = cs.opacity.or(t.item.style.opacity) {
+                color[3] *= o.clamp(0.0, 1.0) as f32;
+            }
+            let mut st = Style::for_item(&t.item.style, color);
+            if let Some(ps) = cs.point_style {
+                st.point = ps;
+            }
+            if let Some(sz) = cs.point_size {
+                st.point_size = sz as f32;
+            }
+            if let Err(msg) = b.draw_table(&t.cols, yc, cs, &defs, mode, st) {
+                if !errs.contains(&msg) {
+                    errs.push(msg);
+                }
+            }
         }
         b.ext.world_in = false;
         b.ext.labels = None;
+        if let Some(c) = first {
+            b.out.item_colors.push((t.item.id.clone(), c));
+        }
+        if !errs.is_empty() {
+            diags.push((t.item.id.clone(), errs.join("; ")));
+        }
     }
     // Slice overlay (additive; a slice that does not fit the mode is simply not drawn here, the
     // app reports why).
@@ -3072,6 +3131,7 @@ pub fn point_handles(doc: &Doc) -> Vec<PointHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use math_core::table::TableStyle;
     use math_core::doc::SliderCfg;
 
     fn doc_with(items: &[(&str, &str)]) -> Doc {
@@ -4363,7 +4423,7 @@ mod tests {
                 t.set_cell(ri, ci, v).unwrap();
             }
         }
-        t.style = style;
+        t.apply_table_style(style);
         let mut it = Item::new("t", ItemKind::Table, "");
         it.table = Some(t);
         d.items.push(it);
@@ -4388,11 +4448,11 @@ mod tests {
         let dp = dots(&g, Mode::D2, [0.0; 3]);
         assert_eq!(dp.len(), 3);
         assert!(close(dp[2][0], 3.0) && close(dp[2][1], 9.0), "{dp:?}");
-        d.items[0].table.as_mut().unwrap().style = TableStyle::Line;
+        d.items[0].table.as_mut().unwrap().apply_table_style(TableStyle::Line);
         let g = build(&d, Mode::D2);
         let n_line = g.segments.len() - base_len(Mode::D2);
         assert_eq!(n_line, 3 + 2, "three dots and two joining segments");
-        d.items[0].table.as_mut().unwrap().style = TableStyle::Hidden;
+        d.items[0].table.as_mut().unwrap().apply_table_style(TableStyle::Hidden);
         assert!(content(&build(&d, Mode::D2), Mode::D2).is_empty());
     }
 

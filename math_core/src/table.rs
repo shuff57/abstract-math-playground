@@ -29,6 +29,10 @@ pub enum TableStyle {
 }
 
 impl TableStyle {
+    pub fn is_points(&self) -> bool {
+        *self == TableStyle::Points
+    }
+
     pub fn parse(s: &str) -> Option<TableStyle> {
         match s {
             "points" => Some(TableStyle::Points),
@@ -46,6 +50,126 @@ impl TableStyle {
     }
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// How one y column of a table is drawn (every column after the first is its own point set
+/// against the first column, as in Desmos). Every field is optional and serialised only when it
+/// differs from the default, so documents written before per-column styles load unchanged.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnStyle {
+    /// `#rrggbb`; absent: the next colour of the theme palette.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Not drawn at all (the column list is still defined).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
+    /// Draw the points (default on).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub points: bool,
+    /// Join the points with segments in row order.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub lines: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_style: Option<crate::doc::PointStyle>,
+    /// Point diameter in pixels, `1..=40` (absent: the item's, else the built-in size).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_size: Option<f64>,
+    /// `[0, 1]` (absent: the item's opacity, else opaque).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f64>,
+    /// A thin background-coloured ring around each point.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub outline: bool,
+    // TODO(drag): Desmos also has a per-column "Drag" toggle (move table points on the canvas,
+    // writing the new values back into the cells). Not implemented yet; it needs a drag handle
+    // per table point in `math_playground::app` and a `setCell` write-back.
+}
+
+impl Default for ColumnStyle {
+    fn default() -> Self {
+        ColumnStyle {
+            color: None,
+            hidden: false,
+            points: true,
+            lines: false,
+            point_style: None,
+            point_size: None,
+            opacity: None,
+            outline: false,
+        }
+    }
+}
+
+/// Keys accepted by [`ColumnStyle::merge`] (camelCase, as serialised).
+pub const COLUMN_STYLE_KEYS: [&str; 8] =
+    ["color", "hidden", "points", "lines", "pointStyle", "pointSize", "opacity", "outline"];
+
+impl ColumnStyle {
+    pub fn is_default(&self) -> bool {
+        *self == ColumnStyle::default()
+    }
+
+    /// Range and format checks: colour `#rrggbb`, opacity in `[0, 1]`, point size in `[1, 40]`.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut e = Vec::new();
+        if self.color.as_deref().is_some_and(|c| !crate::doc::is_hex_color(c)) {
+            e.push("color must match #rrggbb".to_string());
+        }
+        if self.opacity.is_some_and(|o| !(o.is_finite() && (0.0..=1.0).contains(&o))) {
+            e.push("opacity must be in [0,1]".to_string());
+        }
+        if self
+            .point_size
+            .is_some_and(|s| !(s.is_finite() && crate::doc::POINT_SIZE_RANGE.contains(&s)))
+        {
+            e.push("pointSize must be in [1,40]".to_string());
+        }
+        if e.is_empty() {
+            Ok(())
+        } else {
+            Err(e.join("; "))
+        }
+    }
+
+    /// This style with `patch` merged in (a `null` value resets that key to its default),
+    /// validated. Unknown keys are an error.
+    pub fn merge(&self, patch: &serde_json::Map<String, serde_json::Value>) -> Result<ColumnStyle, String> {
+        if let Some(k) = patch.keys().find(|k| !COLUMN_STYLE_KEYS.contains(&k.as_str())) {
+            return Err(format!(
+                "unknown column style key '{k}' (expected one of {})",
+                COLUMN_STYLE_KEYS.join(", ")
+            ));
+        }
+        let mut obj = match serde_json::to_value(self) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        for (k, v) in patch {
+            if v.is_null() {
+                obj.remove(k);
+            } else {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        let merged: ColumnStyle =
+            serde_json::from_value(serde_json::Value::Object(obj)).map_err(|e| format!("column style: {e}"))?;
+        merged.validate()?;
+        Ok(merged)
+    }
+}
+
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Column {
@@ -53,6 +177,16 @@ pub struct Column {
     pub name: String,
     /// Cell source text, one per row (empty string = blank cell).
     pub cells: Vec<String>,
+    /// How the column is drawn (ignored for the first, x, column). Additive field.
+    #[serde(default, skip_serializing_if = "ColumnStyle::is_default")]
+    pub style: ColumnStyle,
+}
+
+impl Column {
+    /// A column with the default style.
+    pub fn new(name: impl Into<String>, cells: Vec<String>) -> Column {
+        Column { name: name.into(), cells, style: ColumnStyle::default() }
+    }
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -60,7 +194,10 @@ pub struct Column {
 #[serde(rename_all = "camelCase")]
 pub struct Table {
     pub columns: Vec<Column>,
-    #[serde(default)]
+    /// Legacy table-wide style. Documents load with it moved into every column's
+    /// [`ColumnStyle`] (see [`Table::migrate_style`]), after which it is always `Points` and is
+    /// no longer serialised.
+    #[serde(default, skip_serializing_if = "TableStyle::is_points")]
     pub style: TableStyle,
 }
 
@@ -95,7 +232,7 @@ impl Table {
     pub fn new(names: &[String], rows: usize) -> Table {
         let names: Vec<String> = if names.is_empty() { vec!["x_1".into(), "y_1".into()] } else { names.to_vec() };
         Table {
-            columns: names.into_iter().map(|name| Column { name, cells: vec![String::new(); rows] }).collect(),
+            columns: names.into_iter().map(|name| Column::new(name, vec![String::new(); rows])).collect(),
             style: TableStyle::Points,
         }
     }
@@ -186,7 +323,7 @@ impl Table {
             return Err(format!("a column named '{name}' already exists"));
         }
         let rows = self.rows();
-        self.columns.push(Column { name, cells: vec![String::new(); rows] });
+        self.columns.push(Column::new(name, vec![String::new(); rows]));
         Ok(())
     }
 
@@ -212,6 +349,60 @@ impl Table {
         Ok(())
     }
 
+    /// Moves a legacy table-wide [`TableStyle`] into every column (`Line` turns lines on,
+    /// `Hidden` hides each column) and resets it to `Points`, so an old document draws exactly as
+    /// before. Returns whether anything changed. Idempotent.
+    pub fn migrate_style(&mut self) -> bool {
+        let old = std::mem::take(&mut self.style);
+        if old == TableStyle::Points {
+            return false;
+        }
+        self.apply_table_style(old);
+        true
+    }
+
+    /// Applies a table-wide style to every column (the legacy `setTableStyle` command).
+    pub fn apply_table_style(&mut self, st: TableStyle) {
+        self.style = TableStyle::Points;
+        for c in &mut self.columns {
+            match st {
+                TableStyle::Points => {
+                    c.style.hidden = false;
+                    c.style.lines = false;
+                }
+                TableStyle::Line => {
+                    c.style.hidden = false;
+                    c.style.lines = true;
+                }
+                TableStyle::Hidden => c.style.hidden = true,
+            }
+        }
+    }
+
+    /// The table-wide style the columns add up to, for shells that only know the legacy
+    /// control: `Hidden` when every y column is hidden, `Line` when every shown one has lines.
+    pub fn summary_style(&self) -> TableStyle {
+        let ys: Vec<&ColumnStyle> = self.columns.iter().skip(1).map(|c| &c.style).collect();
+        if !ys.is_empty() && ys.iter().all(|c| c.hidden) {
+            TableStyle::Hidden
+        } else if ys.iter().any(|c| !c.hidden) && ys.iter().filter(|c| !c.hidden).all(|c| c.lines) {
+            TableStyle::Line
+        } else {
+            TableStyle::Points
+        }
+    }
+
+    /// Merges a style patch into column `col` (see [`ColumnStyle::merge`]).
+    pub fn set_column_style(
+        &mut self,
+        col: usize,
+        patch: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        let c = self.columns.get_mut(col).ok_or_else(|| format!("no column {col}"))?;
+        c.style = c.style.merge(patch)?;
+        Ok(())
+    }
+
     /// Structural checks used by document validation.
     pub fn validate(&self) -> Result<(), String> {
         if self.columns.len() > MAX_COLUMNS {
@@ -231,6 +422,7 @@ impl Table {
             if c.cells.iter().any(|s| s.chars().count() > MAX_CELL_CHARS) {
                 return Err(format!("cell longer than {MAX_CELL_CHARS} characters"));
             }
+            c.style.validate().map_err(|m| format!("column {:?}: {m}", c.name))?;
         }
         Ok(())
     }
@@ -368,5 +560,96 @@ mod tests {
         assert!(t.validate().is_err());
         t.columns[1].name = "height".into();
         assert!(t.validate().is_err());
+    }
+
+    fn patch(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn default_column_style_is_not_serialised() {
+        let t = t();
+        let s = serde_json::to_string(&t).unwrap();
+        assert!(!s.contains("\"style\""), "{s}");
+        assert_eq!(s, r#"{"columns":[{"name":"x_1","cells":["",""]},{"name":"y_1","cells":["",""]}]}"#);
+    }
+
+    #[test]
+    fn column_style_round_trip() {
+        let mut t = t();
+        t.set_column_style(
+            1,
+            &patch(serde_json::json!({
+                "color": "#c74440", "lines": true, "points": false, "pointStyle": "cross",
+                "pointSize": 12, "opacity": 0.5, "outline": true, "hidden": true
+            })),
+        )
+        .unwrap();
+        let s = serde_json::to_string(&t).unwrap();
+        assert!(s.contains(r##""style":{"color":"#c74440","hidden":true,"points":false,"lines":true,"pointStyle":"cross","pointSize":12.0,"opacity":0.5,"outline":true}"##), "{s}");
+        let back: Table = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, t);
+        assert!(back.validate().is_ok());
+        // Null resets a key; the column returns to the default (and is not serialised again).
+        let all_null: serde_json::Map<_, _> =
+            COLUMN_STYLE_KEYS.iter().map(|k| (k.to_string(), serde_json::Value::Null)).collect();
+        t.set_column_style(1, &all_null).unwrap();
+        assert!(t.columns[1].style.is_default());
+    }
+
+    #[test]
+    fn column_style_rejects_bad_values_and_keys() {
+        let mut t = t();
+        for bad in [
+            serde_json::json!({"color": "red"}),
+            serde_json::json!({"opacity": 2}),
+            serde_json::json!({"pointSize": 0}),
+            serde_json::json!({"pointStyle": "star"}),
+            serde_json::json!({"lines": "yes"}),
+            serde_json::json!({"wobble": true}),
+        ] {
+            assert!(t.set_column_style(1, &patch(bad.clone())).is_err(), "{bad}");
+        }
+        assert!(t.columns[1].style.is_default(), "errors change nothing");
+        assert!(t.set_column_style(7, &patch(serde_json::json!({"lines": true}))).is_err());
+        // Hostile data in a loaded document fails validation.
+        t.columns[1].style.opacity = Some(f64::NAN);
+        assert!(t.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_table_style_moves_into_columns() {
+        for (old, hidden, lines) in [("points", false, false), ("line", false, true), ("hidden", true, false)] {
+            let json = format!(r#"{{"columns":[{{"name":"x_1","cells":["1"]}},{{"name":"y_1","cells":["2"]}}],"style":"{old}"}}"#);
+            let mut t: Table = serde_json::from_str(&json).unwrap();
+            assert_eq!(t.migrate_style(), old != "points");
+            assert_eq!(t.style, TableStyle::Points);
+            for c in &t.columns {
+                assert_eq!((c.style.hidden, c.style.lines), (hidden, lines), "{old}");
+            }
+            assert!(!t.migrate_style(), "idempotent");
+            assert!(!serde_json::to_string(&t).unwrap().contains(r#""style":""#));
+        }
+    }
+
+    #[test]
+    fn column_ops_keep_styles() {
+        let mut t = t();
+        t.set_column_style(1, &patch(serde_json::json!({"color": "#2d70b3"}))).unwrap();
+        t.add_column(None).unwrap();
+        assert!(t.columns[2].style.is_default());
+        t.rename_column(1, "w_1").unwrap();
+        assert_eq!(t.columns[1].style.color.as_deref(), Some("#2d70b3"));
+        t.remove_column(0).unwrap();
+        assert_eq!(t.columns[0].style.color.as_deref(), Some("#2d70b3"));
+        assert_eq!(t.summary_style(), TableStyle::Points);
+        t.apply_table_style(TableStyle::Line);
+        assert!(t.columns.iter().all(|c| c.style.lines && !c.style.hidden));
+        assert_eq!(t.summary_style(), TableStyle::Line);
+        t.apply_table_style(TableStyle::Hidden);
+        assert_eq!(t.summary_style(), TableStyle::Hidden);
+        t.columns[1].style.hidden = false;
+        assert_eq!(t.summary_style(), TableStyle::Line, "the shown column has lines");
+        assert_eq!(t.columns[0].style.color.as_deref(), Some("#2d70b3"), "colours survive");
     }
 }

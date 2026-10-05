@@ -23,6 +23,7 @@ use math_core::ast::Expr;
 use math_core::list::{eval_value, Bindings, Value};
 use math_core::mesh;
 use math_core::print::{to_latex, to_text};
+use math_core::reg_family::{self, Family};
 use math_core::regress::{self, FitResult};
 use math_core::resolve::Defs;
 use math_core::view::Mode;
@@ -194,7 +195,8 @@ impl<'a> Builder<'a> {
         let w = self.win;
         let lines = mesh::sample_explicit(&prog, w.min[0], w.max[0], self.vw.max(1.0) as usize, (w.min[1], w.max[1]));
         self.add_lines2(&lines, st);
-        if pr.item.style.residuals {
+        let style = &pr.item.style;
+        if style.residuals || style.residual_plot {
             let xs = fit.data_vars.first().and_then(|n| {
                 let body = defs.resolve(&Expr::var(n)).ok()?;
                 match eval_value(&body, &Bindings::new().with_angle(self.angle)).ok()? {
@@ -203,9 +205,19 @@ impl<'a> Builder<'a> {
                 }
             });
             if let Some(xs) = xs {
-                let col = [st.color[0], st.color[1], st.color[2], st.color[3] * 0.7];
-                for ((x, f), e) in xs.iter().zip(&fit.fitted).zip(&fit.residuals) {
-                    self.seg([*x, *f, 0.0], [*x, *f + *e, 0.0], RESIDUAL_W, col);
+                if style.residuals {
+                    let col = [st.color[0], st.color[1], st.color[2], st.color[3] * 0.7];
+                    for ((x, f), e) in xs.iter().zip(&fit.fitted).zip(&fit.residuals) {
+                        self.seg([*x, *f, 0.0], [*x, *f + *e, 0.0], RESIDUAL_W, col);
+                    }
+                }
+                if style.residual_plot {
+                    // The residual plot: (x_i, e_i), one point per data point.
+                    for (x, e) in xs.iter().zip(&fit.residuals) {
+                        if x.is_finite() && e.is_finite() {
+                            self.point([*x, *e, 0.0], st);
+                        }
+                    }
                 }
             }
         }
@@ -229,7 +241,7 @@ pub(super) fn fit_regressions(
             .into_iter()
             .filter(|n| !matches!(n.as_str(), "x" | "y" | "z"))
             .collect();
-        match regress::fit_regression(&pr.expr, &base, Some(&params)) {
+        match reg_family::fit_detected(&pr.expr, &pr.item.latex, &base, Some(&params)) {
             Ok(f) => {
                 if f.params.iter().any(|(_, v)| !v.is_finite()) {
                     diags.push((pr.item.id.clone(), "regression: the fit did not produce finite parameters".into()));
@@ -258,6 +270,12 @@ fn tidy_signs(e: Expr) -> Expr {
             match (op, &b) {
                 (BinOp::Add, Expr::Num(c)) if *c < 0.0 => Expr::bin(BinOp::Sub, a, Expr::Num(-*c)),
                 (BinOp::Sub, Expr::Num(c)) if *c < 0.0 => Expr::bin(BinOp::Add, a, Expr::Num(-*c)),
+                // `a + (-0.5) x` reads `a - 0.5 x` (a fitted negative coefficient of a term).
+                (BinOp::Add | BinOp::Sub, Expr::Bin(BinOp::Mul, k, rest)) if matches!(**k, Expr::Num(c) if c < 0.0) => {
+                    let Expr::Num(c) = **k else { unreachable!() };
+                    let flipped = if op == BinOp::Add { BinOp::Sub } else { BinOp::Add };
+                    Expr::bin(flipped, a, Expr::bin(BinOp::Mul, Expr::Num(-c), (**rest).clone()))
+                }
                 _ => Expr::bin(op, a, b),
             }
         }
@@ -271,7 +289,23 @@ fn finite(v: f64) -> Option<f64> {
     v.is_finite().then_some(v)
 }
 
-fn regression_info(id: &str, lhs: &Expr, fit: &FitResult) -> ItemInfo {
+/// `y = <fitted curve in x>` with 4 significant digits (LaTeX, text), when the model uses one
+/// data list.
+fn regression_equation(fit: &FitResult) -> Option<(String, String)> {
+    let mut curve = fit.curve_expr("x")?;
+    for (n, v) in &fit.params {
+        curve = curve.subst(n, &Expr::Num(sig4(*v)));
+    }
+    let curve = tidy_signs(curve);
+    // `1.5x`, not `1.5 \cdot x` (a number times the variable reads as in Desmos).
+    let latex = to_latex(&curve).replace("\\cdot x", "x");
+    let text = to_text(&curve).replace(" * x", "x");
+    Some((format!("y = {latex}"), format!("y = {text}")))
+}
+
+fn regression_info(id: &str, latex: &str, lhs: &Expr, fit: &FitResult) -> ItemInfo {
+    let family = Family::detect(latex).map(|d| d.0);
+    let eq = regression_equation(fit);
     let mut model = fit.model.clone();
     for (n, v) in &fit.params {
         model = model.subst(n, &Expr::Num(sig4(*v)));
@@ -303,6 +337,11 @@ fn regression_info(id: &str, lhs: &Expr, fit: &FitResult) -> ItemInfo {
         r2: finite(fit.r2),
         rmse: finite(fit.rmse),
         n: Some(fit.n),
+        r: family.and_then(|f| reg_family::linear_r(f, fit)).and_then(finite),
+        family: family.map(|f| f.key().to_string()),
+        equation: eq.as_ref().map(|e| e.0.clone()),
+        equation_text: eq.map(|e| e.1),
+        residuals: fit.residuals.iter().map(|e| sig4(*e)).collect(),
     }
 }
 
@@ -319,7 +358,7 @@ pub(super) fn collect_infos(
         let id = &pr.item.id;
         if let Kind::Regression { lhs, .. } = &pr.kind {
             if let Some(f) = fits.get(id) {
-                out.push(regression_info(id, lhs, f));
+                out.push(regression_info(id, &pr.item.latex, lhs, f));
             }
             continue;
         }
@@ -386,6 +425,12 @@ mod tests {
         use super::tidy_signs;
         let e = Expr::bin(BinOp::Add, Expr::var("x"), Expr::Num(-3.0));
         assert_eq!(math_core::print::to_text(&tidy_signs(e)), "x - 3");
+        let e = Expr::bin(
+            BinOp::Add,
+            Expr::bin(BinOp::Mul, Expr::Num(0.5), Expr::bin(BinOp::Pow, Expr::var("x"), Expr::Num(2.0))),
+            Expr::bin(BinOp::Mul, Expr::Num(-0.5), Expr::var("x")),
+        );
+        assert_eq!(math_core::print::to_text(&tidy_signs(e)), "0.5 * x^2 - 0.5 * x");
     }
 
     use crate::geometry::{SceneGeometry, Theme};
@@ -672,5 +717,75 @@ mod tests {
         let all: Vec<_> = ev.iter().chain(&ev2).chain(&ev3).chain(&ev4).collect();
         let d = all.iter().rev().find(|e| e["t"] == "diagnostics").expect("diagnostics");
         assert!(d["items"][0]["message"].as_str().unwrap().starts_with("regression:"));
+    }
+
+    #[test]
+    fn panel_regression_info_has_equation_r_family_and_residuals() {
+        let mut a = crate::app::App::new((800, 600));
+        cmd(&mut a, r#"{"t":"addTable","id":"t","columns":["x_1","y_1"],"data":[[1,1],[2,2],[3,4]]}"#);
+        let ev = cmd(&mut a, r#"{"t":"setExpr","id":"r","latex":"y_1\\sim mx_1+b"}"#);
+        let info = ev.iter().find(|e| e["t"] == "info").expect("info event");
+        let r = &info["items"][0];
+        assert_eq!(r["family"], "linear");
+        assert_eq!(r["equation"], "y = 1.5x-0.6667", "{r}");
+        assert_eq!(r["equationText"], "y = 1.5x - 0.6667");
+        let rr = r["r"].as_f64().unwrap();
+        assert!((rr * rr - r["r2"].as_f64().unwrap()).abs() < 1e-12 && rr > 0.98);
+        let res: Vec<f64> = r["residuals"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        assert_eq!(res.len(), 3);
+        assert!((res[0] - 1.0 / 6.0).abs() < 1e-3 && (res[1] + 1.0 / 3.0).abs() < 1e-3);
+        // Changing the family refits live; r is only for straight lines.
+        let ev = cmd(&mut a, r#"{"t":"setExpr","id":"r","latex":"y_1\\sim ab^{x_1}"}"#);
+        let r = &ev.iter().find(|e| e["t"] == "info").expect("info")["items"][0];
+        assert_eq!(r["family"], "exponential");
+        assert!(r.get("r").is_none());
+        assert!((r["r2"].as_f64().unwrap() - 1.0).abs() < 1e-9, "{r}");
+        // A hand-typed regression has no family but still an equation.
+        let ev = cmd(&mut a, r#"{"t":"setExpr","id":"r","latex":"y_1 ~ k x_1"}"#);
+        let r = &ev.iter().find(|e| e["t"] == "info").expect("info")["items"][0];
+        assert!(r.get("family").is_none() && r["equation"].as_str().unwrap().starts_with("y = "));
+    }
+
+    #[test]
+    fn regression_is_ink_by_default_and_residual_plot_draws_points() {
+        let mut d = Doc::new_default();
+        add_table(&mut d, &[("x_1", &["1", "2", "3", "4"]), ("y_1", &["2", "5", "6", "9"])]);
+        d.items.push(Item::new("r", ItemKind::Equation, "y_1\\sim mx_1+b"));
+        let g = build(&d, Mode::D2);
+        let ink = Theme::light().axis;
+        let c = g.item_colors.iter().find(|c| c.0 == "r").unwrap().1;
+        assert_eq!(&c[..3], &ink[..3], "black regression line on a light theme");
+        assert!(g.segments.iter().any(|s| s.p0 != s.p1 && s.width == 2.5 && s.color[..3] == ink[..3]));
+        let dots = |g: &SceneGeometry| g.segments.iter().filter(|s| s.p0 == s.p1 && s.width == 9.0).count();
+        let before = dots(&g);
+        d.items.iter_mut().find(|i| i.id == "r").unwrap().style.residual_plot = true;
+        let g = build(&d, Mode::D2);
+        assert_eq!(dots(&g), before + 4, "one residual point per data point");
+        // The residual points sit at (x_i, e_i): their mean is 0 for a least-squares line.
+        let ys: Vec<f32> = g
+            .segments
+            .iter()
+            .filter(|s| s.p0 == s.p1 && s.width == 9.0 && s.color[..3] == ink[..3])
+            .map(|s| s.p0[1])
+            .collect();
+        assert_eq!(ys.len(), 4);
+        // An explicit colour still wins.
+        d.items.iter_mut().find(|i| i.id == "r").unwrap().color = Some("#c74440".into());
+        let g = build(&d, Mode::D2);
+        assert_ne!(&g.item_colors.iter().find(|c| c.0 == "r").unwrap().1[..3], &ink[..3]);
+    }
+
+    #[test]
+    fn residual_plot_is_a_style_key_that_survives_save() {
+        let mut a = crate::app::App::new((800, 600));
+        cmd(&mut a, r#"{"t":"addTable","id":"t","columns":["x_1","y_1"],"data":[[1,1],[2,2],[3,4]]}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"r","latex":"y_1\\sim mx_1+b"}"#);
+        let ev = cmd(&mut a, r#"{"t":"setStyle","id":"r","style":{"residualPlot":true}}"#);
+        assert!(!ev.iter().any(|e| e["t"] == "error"), "{ev:?}");
+        let text = math_core::doc::to_json(&a.doc);
+        assert!(text.contains("\"residualPlot\":true"));
+        assert!(math_core::doc::from_json(&text).unwrap().items.iter().any(|i| i.style.residual_plot));
+        cmd(&mut a, r#"{"t":"setStyle","id":"r","style":{"residualPlot":null}}"#);
+        assert!(!math_core::doc::to_json(&a.doc).contains("residualPlot"));
     }
 }

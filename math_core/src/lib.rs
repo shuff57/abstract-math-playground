@@ -15,6 +15,7 @@ pub mod list;
 pub mod mesh;
 pub mod parse;
 pub mod print;
+pub mod reg_family;
 pub mod regress;
 pub mod resolve;
 pub mod slice;
