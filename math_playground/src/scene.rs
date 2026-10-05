@@ -1072,7 +1072,12 @@ impl<'a> Builder<'a> {
     /// The curve `y = rhs(x)` over the window.
     fn explicit_y_2d(&mut self, rhs: &Expr, defs: &Defs, st: Style) -> Result<(), String> {
         let w = self.win;
-        let p = self.prog(&defs.resolve(rhs).map_err(|e| e.to_string())?, &["x"])?;
+        let resolved = defs.resolve(rhs).map_err(|e| e.to_string())?;
+        // A constant that is not a number (`y = 1/0`) has nothing to draw: say so.
+        if self.prog(&resolved, &[]).is_ok_and(|c| !c.eval(&[]).is_finite()) {
+            return Err("undefined".into());
+        }
+        let p = self.prog(&resolved, &["x"])?;
         let lines = mesh::sample_explicit(
             &p,
             w.min[0],
@@ -1111,7 +1116,17 @@ impl<'a> Builder<'a> {
             Kind::Inequality { rel, f } => {
                 self.inequality_field(*rel, f, defs, st)?;
                 let r = defs.resolve(f).map_err(|e| e.to_string())?;
-                self.contour(&r, st)
+                // A strict boundary (`<`, `>`) is not part of the region: draw it dashed unless
+                // the item picked a line style itself.
+                let mut bst = st;
+                if matches!(rel, Rel::Lt | Rel::Gt) && pr.item.style.line_style.is_none() {
+                    let dashed = ItemStyle {
+                        line_style: Some(LineStyle::Dashed),
+                        ..pr.item.style.clone()
+                    };
+                    bst.dash = Style::for_item(&dashed, st.color).dash;
+                }
+                self.contour(&r, bst)
             }
             Kind::Polar { rhs } => {
                 let r = defs.resolve(rhs).map_err(|e| e.to_string())?;
@@ -3935,6 +3950,36 @@ mod tests {
         // Geometric gap between consecutive dashes: 13 - 5.5 = 7.5 px (5 px visible).
         let gap = (dashes[1].p0[0] - dashes[0].p1[0]) as f64 * 40.0;
         assert!((gap - 7.5).abs() < 1e-3, "{gap}");
+    }
+
+    #[test]
+    fn strict_inequality_boundary_is_dashed() {
+        let len = |src: &str, f: &dyn Fn(&mut ItemStyle)| {
+            item_segs(&build(&styled(src, |s| f(s)), Mode::D2), Mode::D2).1
+        };
+        let solid = len("x\\ge 2", &|_| {});
+        assert!(solid > 0.0);
+        for src in ["x>2", "x<2"] {
+            let r = len(src, &|_| {}) / solid;
+            assert!(r > 0.25 && r < 0.75, "{src}: strict boundary dashed, ratio {r}");
+        }
+        // An explicit solid line style wins over the strict default.
+        let r = len("x>2", &|s| s.line_style = Some(LineStyle::Solid)) / solid;
+        assert!((r - 1.0).abs() < 0.05, "explicit solid: ratio {r}");
+    }
+
+    #[test]
+    fn constant_that_is_not_a_number_is_undefined() {
+        for src in ["y=1/0", "y=0/0"] {
+            let g = build(&styled(src, |_| {}), Mode::D2);
+            assert!(
+                g.diagnostics.iter().any(|d| d.1 == "undefined"),
+                "{src}: {:?}",
+                g.diagnostics
+            );
+        }
+        let g = build(&styled("y=2", |_| {}), Mode::D2);
+        assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
     }
 
     #[test]
