@@ -505,9 +505,9 @@ pub struct App {
     /// World -> display map of logarithmic 2D axes: the rig's window is in display coordinates
     /// while in 2D (see [`AxisMap`]); fixed between `load` / `setView` so pans stay smooth.
     map: AxisMap,
-    /// The world window before the axes became logarithmic and the rig window right after, so
-    /// switching back to linear without panning restores the exact previous view.
-    log_entry: Option<(doc::WindowBox, Window3)>,
+    /// The world window before the axes became logarithmic, so switching back to linear
+    /// restores the exact previous view.
+    log_entry: Option<doc::WindowBox>,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -829,18 +829,14 @@ impl App {
                 if scales_change || window.is_some() {
                     let was_linear =
                         self.doc.view.x_scale.is_linear() && self.doc.view.y_scale.is_linear();
-                    let shown = self.rig.window();
                     self.doc.view.x_scale = next.x_scale;
                     self.doc.view.y_scale = next.y_scale;
                     let now_linear = next.x_scale.is_linear() && next.y_scale.is_linear();
-                    // Back to linear without a pan since: the exact view from before.
+                    // Back to linear: the exact view from before the axes became logarithmic (a
+                    // linear view of a log window would be squashed into a sliver).
                     let entry = self.log_entry.take();
                     let restore = match &entry {
-                        Some((before, after))
-                            if now_linear && window.is_none() && *after == shown =>
-                        {
-                            Some(before.clone())
-                        }
+                        Some(before) if now_linear && window.is_none() => Some(before.clone()),
                         _ => None,
                     };
                     if !now_linear {
@@ -849,7 +845,7 @@ impl App {
                     let w = window.or(restore).unwrap_or(world_now.clone());
                     self.frame_world_window(w);
                     if was_linear && !now_linear {
-                        self.log_entry = Some((world_now, self.rig.window()));
+                        self.log_entry = Some(world_now);
                     }
                 }
                 self.mark_doc_changed();
@@ -2577,8 +2573,8 @@ mod tests {
             r#"{"t":"setView","xScale":"linear","yScale":"linear"}"#,
         );
         assert!(error_msg(&ev).is_none(), "{ev:?}");
-        // A window was set in between, so that one stays (in world coordinates).
-        assert!((a.doc.view.window.min[1] - 0.1).abs() < 1e-9);
+        // Windows set in between do not matter: the linear view from before comes back.
+        assert_eq!(a.rig.window(), w0);
         // Straight there and back: exactly the old view.
         cmd(
             &mut a,
@@ -2591,7 +2587,7 @@ mod tests {
         cmd(&mut a, r#"{"t":"setView","xScale":"linear"}"#);
         assert_eq!(a.rig.window(), w0);
         assert_eq!(a.doc.view.window, d0);
-        // After a pan the world region shown is kept instead.
+        // Also after a pan in log mode; a window sent with the switch wins.
         cmd(
             &mut a,
             r#"{"t":"setView","xScale":"log","window":{"min":[1,-7,-10],"max":[100,9,10]}}"#,
@@ -2602,7 +2598,11 @@ mod tests {
         let world = a.world_window();
         assert!(world.min[0] > 1.0, "panned right by decades: {world:?}");
         cmd(&mut a, r#"{"t":"setView","xScale":"linear"}"#);
-        assert!((a.rig.window().min[0] - world.min[0]).abs() < 1e-9);
+        assert_eq!(a.rig.window(), w0);
+        cmd(&mut a, r#"{"t":"setView","xScale":"log","window":{"min":[1,-7,-10],"max":[100,9,10]}}"#);
+        cmd(&mut a, r#"{"t":"setView","xScale":"linear","window":{"min":[-1,-7,-10],"max":[5,9,10]}}"#);
+        assert_eq!(a.doc.view.window.min[0], -1.0);
+        assert!(a.log_entry.is_none());
     }
 
     #[test]
