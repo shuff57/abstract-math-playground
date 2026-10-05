@@ -5,9 +5,10 @@
 
 use crate::geometry::{ItemInfo, SceneGeometry, Theme};
 use crate::render::{crossfade, layer_lift, Inset, Layer};
+use crate::axis_map::AxisMap;
 use crate::scene::{
-    build_scene, build_scene_preview, build_slice_panel_view, label_box_inside, point_handles,
-    CoordSrc, PointHandle, SlicePanel, ViewReq,
+    build_scene_mapped, build_scene_preview_mapped, build_slice_panel_view, label_box_inside,
+    point_handles, CoordSrc, PointHandle, SlicePanel, ViewReq,
 };
 use math_core::actions;
 use math_core::doc::{self, AngleMode, Doc, Item, ItemKind, SliderCfg, TickerCfg};
@@ -108,6 +109,16 @@ pub enum Command {
         x_step: Option<Option<f64>>,
         #[serde(default, rename = "yStep", deserialize_with = "opt_opt")]
         y_step: Option<Option<f64>>,
+        /// `"rect"` or `"polar"` 2D grid.
+        #[serde(default, rename = "gridKind", alias = "grid_kind")]
+        grid_kind: Option<doc::GridKind>,
+        /// `"linear"` or `"log"` 2D axes. A logarithmic axis needs a window minimum > 0 on that
+        /// axis (the current window, or `window` in the same command); otherwise the command is
+        /// rejected and nothing changes.
+        #[serde(default, rename = "xScale", alias = "x_scale")]
+        x_scale: Option<doc::AxisScale>,
+        #[serde(default, rename = "yScale", alias = "y_scale")]
+        y_scale: Option<doc::AxisScale>,
     },
     SetSlider {
         name: String,
@@ -334,6 +345,12 @@ pub enum Event {
         x_step: Option<f64>,
         #[serde(rename = "yStep")]
         y_step: Option<f64>,
+        #[serde(rename = "gridKind")]
+        grid_kind: doc::GridKind,
+        #[serde(rename = "xScale")]
+        x_scale: doc::AxisScale,
+        #[serde(rename = "yScale")]
+        y_scale: doc::AxisScale,
     },
     /// Tick labels for the current scene in world coordinates, for a text overlay to project.
     Labels {
@@ -485,6 +502,12 @@ pub struct App {
     refine: bool,
     /// `setReducedMotion`; kept here because loading a document replaces the rig.
     reduced_motion: bool,
+    /// World -> display map of logarithmic 2D axes: the rig's window is in display coordinates
+    /// while in 2D (see [`AxisMap`]); fixed between `load` / `setView` so pans stay smooth.
+    map: AxisMap,
+    /// The world window before the axes became logarithmic and the rig window right after, so
+    /// switching back to linear without panning restores the exact previous view.
+    log_entry: Option<(doc::WindowBox, Window3)>,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -556,6 +579,8 @@ impl App {
             last_panel_ms: 0.0,
             refine: false,
             reduced_motion: false,
+            map: AxisMap::LINEAR,
+            log_entry: None,
         };
         app.rebuild();
         app
@@ -744,6 +769,9 @@ impl App {
                 y_label,
                 x_step,
                 y_step,
+                grid_kind,
+                x_scale,
+                y_scale,
             } => {
                 if let Some(w) = &window {
                     if let Err(m) = w.validate() {
@@ -752,6 +780,19 @@ impl App {
                         });
                         return;
                     }
+                }
+                // Logarithmic axes need a positive window on that axis: check the result first.
+                let scales_change = x_scale.is_some_and(|s| s != self.doc.view.x_scale)
+                    || y_scale.is_some_and(|s| s != self.doc.view.y_scale);
+                let mut next = self.doc.view.clone();
+                next.x_scale = x_scale.unwrap_or(next.x_scale);
+                next.y_scale = y_scale.unwrap_or(next.y_scale);
+                let world_now = self.world_window();
+                if let Err(m) = next.check_log_window(Some(window.as_ref().unwrap_or(&world_now))) {
+                    self.outbox.push(Event::Error {
+                        message: format!("setView: {m}"),
+                    });
+                    return;
                 }
                 for (n, st) in [("xStep", x_step), ("yStep", y_step)] {
                     if let Some(Some(v)) = st {
@@ -784,13 +825,32 @@ impl App {
                 };
                 v.x_step = step(x_step, v.x_step);
                 v.y_step = step(y_step, v.y_step);
-                if let Some(w) = window {
-                    // As `load` does: a fresh rig framing the window in the current mode.
-                    self.rig = Rig::new(Window3::new(w.min, w.max), self.rig.mode());
-                    self.rig
-                        .set_aspect(self.size.0 as f64 / self.size.1.max(1) as f64);
-                    self.prev = None;
-                    self.doc.view.window = w;
+                v.grid_kind = grid_kind.unwrap_or(v.grid_kind);
+                if scales_change || window.is_some() {
+                    let was_linear =
+                        self.doc.view.x_scale.is_linear() && self.doc.view.y_scale.is_linear();
+                    let shown = self.rig.window();
+                    self.doc.view.x_scale = next.x_scale;
+                    self.doc.view.y_scale = next.y_scale;
+                    let now_linear = next.x_scale.is_linear() && next.y_scale.is_linear();
+                    // Back to linear without a pan since: the exact view from before.
+                    let entry = self.log_entry.take();
+                    let restore = match &entry {
+                        Some((before, after))
+                            if now_linear && window.is_none() && *after == shown =>
+                        {
+                            Some(before.clone())
+                        }
+                        _ => None,
+                    };
+                    if !now_linear {
+                        self.log_entry = entry;
+                    }
+                    let w = window.or(restore).unwrap_or(world_now.clone());
+                    self.frame_world_window(w);
+                    if was_linear && !now_linear {
+                        self.log_entry = Some((world_now, self.rig.window()));
+                    }
                 }
                 self.mark_doc_changed();
             }
@@ -1152,6 +1212,8 @@ impl App {
         self.rig = Rig::new(Window3::new(w.min, w.max), view_mode(d.view.mode));
         self.rig.set_aspect(self.size.0 as f64 / self.size.1 as f64);
         self.doc = d;
+        self.log_entry = None;
+        self.frame_world_window(w);
         self.prev = None;
         self.ticker_running = false;
         self.ticker_err = None;
@@ -1387,10 +1449,17 @@ impl App {
     fn drag_point(&mut self, h: &PointHandle, world: [f64; 2]) {
         let w = self.rig.window();
         let upp = ((w.max[0] - w.min[0]) / self.size.0.max(1) as f64).max(1e-300);
-        let decimals = (-upp.log10().floor()).clamp(0.0, 12.0) as usize;
+        let m = self.active_map();
         let mut pieces = [h.text[0].clone(), h.text[1].clone()];
         let mut literal = false;
         for k in 0..2 {
+            // World units per pixel at the point (on a log axis they grow with the value).
+            let upp = if m.log[k] {
+                (world[k].abs() * std::f64::consts::LN_10 / m.k[k] * upp).max(1e-300)
+            } else {
+                upp
+            };
+            let decimals = (-upp.log10().floor()).clamp(0.0, 12.0) as usize;
             let v = (world[k] * 10f64.powi(decimals as i32)).round() / 10f64.powi(decimals as i32);
             match &h.src[k] {
                 CoordSrc::Literal => {
@@ -1448,32 +1517,90 @@ impl App {
             return None;
         }
         let here = self.rig.pixel_to_world((x, y), vp);
+        let m = self.active_map();
         point_handles(&self.doc)
             .into_iter()
             .filter_map(|h| {
-                let (px, py) = self.rig.world_to_pixel([h.pos[0], h.pos[1], 0.0], vp);
+                // Handles are world positions; the rig works in display coordinates.
+                let d = m.fwd3([h.pos[0], h.pos[1], 0.0]);
+                let (px, py) = self.rig.world_to_pixel(d, vp);
                 let d = (px - x).hypot(py - y);
                 (d <= GRAB_PX).then_some((d, h))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, h)| PointGrab {
-                offset: [h.pos[0] - here[0], h.pos[1] - here[1]],
-                handle: h,
+            .map(|(_, h)| {
+                let d = m.fwd3([h.pos[0], h.pos[1], 0.0]);
+                PointGrab {
+                    offset: [d[0] - here[0], d[1] - here[1]],
+                    handle: h,
+                }
             })
     }
 
     fn sync_view_into_doc(&mut self) {
-        let w = self.rig.window();
+        let w = self.world_window();
         self.doc.view.mode = doc_mode(self.rig.mode());
-        self.doc.view.window.min = w.min;
-        self.doc.view.window.max = w.max;
+        let v = &mut self.doc.view;
+        for a in 0..3 {
+            // A logarithmic axis keeps its last valid range (a 3D pan may have crossed 0).
+            let log = a < 2 && [v.x_scale, v.y_scale][a].is_log();
+            if !log || (w.min[a] > 0.0 && w.max[a] > w.min[a] && w.max[a].is_finite()) {
+                v.window.min[a] = w.min[a];
+                v.window.max[a] = w.max[a];
+            }
+        }
     }
 
+    /// The axis map in effect: the logarithmic axes apply in 2D only.
+    fn active_map(&self) -> AxisMap {
+        if self.rig.mode() == Mode::D2 {
+            self.map
+        } else {
+            AxisMap::LINEAR
+        }
+    }
+
+    /// The rig's window in world coordinates.
+    fn world_window(&self) -> doc::WindowBox {
+        self.active_map().to_world(self.rig.window())
+    }
+
+    /// Sets the document's world window and a fresh rig framing it in the current mode (as
+    /// `load` does), recomputing the axis map for the view's scales and the canvas aspect.
+    fn frame_world_window(&mut self, w: doc::WindowBox) {
+        let aspect = self.size.0 as f64 / self.size.1.max(1) as f64;
+        self.doc.view.window = w.clone();
+        self.map = AxisMap::for_view(&self.doc.view, aspect);
+        let shown = if self.rig.mode() == Mode::D2 {
+            self.map.to_display(&w)
+        } else {
+            Window3::new(w.min, w.max)
+        };
+        self.rig = Rig::new(shown, self.rig.mode());
+        self.rig.set_aspect(aspect);
+        self.rig.reduced_motion = self.reduced_motion;
+        self.prev = None;
+    }
     fn set_mode(&mut self, mode: Mode) {
         if mode == self.rig.mode() {
             return;
         }
         self.slice_view = None;
+        // Logarithmic axes are 2D only: the shared window changes coordinates with the mode.
+        if !self.map.is_linear() {
+            let w = self.world_window();
+            let shown = if mode == Mode::D2 {
+                let d = self.map.to_display(&w);
+                if d.min.iter().chain(d.max.iter()).all(|v| v.is_finite()) {
+                    d
+                } else {
+                    self.map.to_display(&self.doc.view.window)
+                }
+            } else {
+                Window3::new(w.min, w.max)
+            };
+            self.rig.set_window(shown);
+        }
         // The outgoing scene keeps drawing (fading) while the camera tweens to the new mode.
         self.prev = self.current.take();
         // The tween's clock starts at the next frame (see `Tween::start_ms`), so the time spent
@@ -1546,15 +1673,14 @@ impl App {
                 self.inset_drag = None;
             }
             "move" => {
+                let m = self.active_map();
                 let Some(d) = self.drag.as_mut() else { return };
                 let (dx, dy) = (x - d.last.0, y - d.last.1);
                 d.last = (x, y);
                 if let Some(g) = &d.point {
                     let here = self.rig.pixel_to_world((x, y), vp);
-                    let (handle, to) = (
-                        g.handle.clone(),
-                        [here[0] + g.offset[0], here[1] + g.offset[1]],
-                    );
+                    let to = m.inv3([here[0] + g.offset[0], here[1] + g.offset[1], 0.0]);
+                    let (handle, to) = (g.handle.clone(), [to[0], to[1]]);
                     self.drag_point(&handle, to);
                     self.touch_input();
                     return;
@@ -1638,13 +1764,16 @@ impl App {
         let origin = self.rig.render_origin();
         let window = self.scene_window();
         let geometry = if preview {
-            let (g, coarse) =
-                build_scene_preview(&self.doc, mode, window, origin, self.size, &self.theme);
+            let (g, coarse) = build_scene_preview_mapped(
+                &self.doc, self.map, mode, window, origin, self.size, &self.theme,
+            );
             self.refine = coarse;
             g
         } else {
             self.refine = false;
-            let g = build_scene(&self.doc, mode, window, origin, self.size, &self.theme);
+            let g = build_scene_mapped(
+                &self.doc, self.map, mode, window, origin, self.size, &self.theme,
+            );
             // Only full builds tell how expensive live rebuilds of this scene are.
             self.last_build_ms = t0.elapsed().as_secs_f64() * 1000.0;
             g
@@ -1697,7 +1826,14 @@ impl App {
                 items: geometry.infos.clone(),
             });
         }
-        let w = self.rig.window();
+        // World coordinates; with logarithmic axes, the visible window (the y range is not
+        // derived from the aspect by the shell then).
+        let w = if self.active_map().is_linear() {
+            self.rig.window()
+        } else {
+            let v = self.active_map().to_world(self.scene_window());
+            Window3::new(v.min, v.max)
+        };
         self.outbox.push(Event::View {
             mode: mode_name(mode).into(),
             min: w.min,
@@ -1712,6 +1848,9 @@ impl App {
             y_label: self.doc.view.y_label.clone(),
             x_step: self.doc.view.x_step,
             y_step: self.doc.view.y_step,
+            grid_kind: self.doc.view.grid_kind,
+            x_scale: self.doc.view.x_scale,
+            y_scale: self.doc.view.y_scale,
         });
         self.outbox.push(Event::Labels {
             labels: geometry
@@ -1739,14 +1878,19 @@ impl App {
         let t0 = instant::Instant::now();
         self.panel_dirty = false;
         let window = self.scene_window();
-        let ev = match build_slice_panel_view(
-            &self.doc,
-            mode,
-            window,
-            self.size,
-            &self.theme,
-            self.slice_view.as_ref(),
-        ) {
+        let res = if self.doc.slice.is_some() && !self.active_map().is_linear() {
+            Some(Err(format!("a slice is {}", crate::scene::LOG_UNSUPPORTED)))
+        } else {
+            build_slice_panel_view(
+                &self.doc,
+                mode,
+                window,
+                self.size,
+                &self.theme,
+                self.slice_view.as_ref(),
+            )
+        };
+        let ev = match res {
             None => {
                 self.panel = None;
                 Event::Slice {
@@ -2129,7 +2273,7 @@ mod tests {
         );
         a.frame(0.0);
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
-        let full = build_scene(
+        let full = crate::scene::build_scene(
             &a.doc,
             Mode::D3,
             a.scene_window(),
@@ -2322,6 +2466,216 @@ mod tests {
         assert!(a.doc.view.arrows, "a rejected command changes nothing");
     }
 
+    #[test]
+    fn set_view_grid_kind_and_axis_scales_round_trip() {
+        let mut a = app();
+        let ev = cmd(&mut a, r#"{"t":"setView","gridKind":"polar"}"#);
+        assert!(error_msg(&ev).is_none(), "{ev:?}");
+        let view = ev.iter().rev().find(|e| e["t"] == "view").unwrap();
+        assert_eq!(view["gridKind"], "polar");
+        assert_eq!(view["xScale"], "linear");
+        assert!(a.layers()[0]
+            .geometry
+            .labels
+            .iter()
+            .any(|l| l.axis == crate::scene::POLAR_LABEL_AXIS));
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"setView","yScale":"log","window":{"min":[-10,0.01,-10],"max":[10,1000,10]}}"#,
+        );
+        assert!(error_msg(&ev).is_none(), "{ev:?}");
+        let view = ev.iter().find(|e| e["t"] == "view").unwrap();
+        assert_eq!(view["yScale"], "log");
+        // The view event reports the visible WORLD window: here exactly the one asked for.
+        assert!(
+            (view["min"][1].as_f64().unwrap() - 0.01).abs() < 1e-9,
+            "{view}"
+        );
+        assert!(
+            (view["max"][1].as_f64().unwrap() - 1000.0).abs() < 1e-6,
+            "{view}"
+        );
+        assert!(
+            (view["max"][0].as_f64().unwrap() - 10.0).abs() < 1e-9,
+            "{view}"
+        );
+        // Export and reload keep scales, grid and window.
+        let ev = cmd(&mut a, r#"{"t":"export"}"#);
+        let hash = ev.iter().find(|e| e["t"] == "hash").unwrap()["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let d = doc::decode_hash(&hash).unwrap();
+        assert!(d.view.y_scale.is_log() && d.view.grid_kind == doc::GridKind::Polar);
+        assert!((d.view.window.min[1] - 0.01).abs() < 1e-9);
+        let shown = a.rig.window();
+        let mut b = app();
+        cmd(
+            &mut b,
+            &serde_json::json!({ "t": "loadHash", "hash": hash }).to_string(),
+        );
+        let w = b.rig.window();
+        for i in 0..2 {
+            assert!(
+                (w.min[i] - shown.min[i]).abs() < 1e-9 && (w.max[i] - shown.max[i]).abs() < 1e-9
+            );
+        }
+    }
+
+    #[test]
+    fn log_axis_needs_a_positive_window_and_rejects_without_changing_anything() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setView","gridKind":"polar"}"#);
+        let w0 = a.rig.window();
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"setView","xScale":"log","grid":false,"gridKind":"rect"}"#,
+        );
+        let m = error_msg(&ev).expect("x min is -10");
+        assert!(m.contains("logarithmic x axis"), "{m}");
+        assert!(a.doc.view.x_scale.is_linear() && a.doc.view.grid);
+        assert_eq!(a.doc.view.grid_kind, doc::GridKind::Polar);
+        assert_eq!(a.rig.window(), w0);
+        // A window with min <= 0 on an axis that is already logarithmic is refused as well.
+        cmd(
+            &mut a,
+            r#"{"t":"setView","xScale":"log","window":{"min":[1,-5,-5],"max":[100,5,5]}}"#,
+        );
+        assert!(a.doc.view.x_scale.is_log());
+        let w1 = a.rig.window();
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"setView","window":{"min":[0,-5,-5],"max":[100,5,5]}}"#,
+        );
+        assert!(error_msg(&ev).is_some());
+        assert_eq!(a.rig.window(), w1);
+        assert_eq!(a.doc.view.window.min[0], 1.0);
+        // Unknown scale names are malformed commands.
+        let ev = cmd(&mut a, r#"{"t":"setView","yScale":"ln"}"#);
+        assert!(error_msg(&ev).is_some_and(|m| m.contains("bad command")));
+    }
+
+    #[test]
+    fn switching_back_to_linear_restores_the_exact_view() {
+        let mut a = app();
+        cmd(
+            &mut a,
+            r#"{"t":"setView","window":{"min":[-3.25,-7,-10],"max":[17.5,9,10]}}"#,
+        );
+        let (w0, d0) = (a.rig.window(), a.doc.view.window.clone());
+        cmd(
+            &mut a,
+            r#"{"t":"setView","xScale":"log","window":{"min":[0.01,-7,-10],"max":[17.5,9,10]}}"#,
+        );
+        assert!(a.rig.window() != w0);
+        cmd(
+            &mut a,
+            r#"{"t":"setView","yScale":"log","window":{"min":[0.01,0.1,-10],"max":[17.5,9,10]}}"#,
+        );
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"setView","xScale":"linear","yScale":"linear"}"#,
+        );
+        assert!(error_msg(&ev).is_none(), "{ev:?}");
+        // A window was set in between, so that one stays (in world coordinates).
+        assert!((a.doc.view.window.min[1] - 0.1).abs() < 1e-9);
+        // Straight there and back: exactly the old view.
+        cmd(
+            &mut a,
+            r#"{"t":"setView","window":{"min":[-3.25,-7,-10],"max":[17.5,9,10]}}"#,
+        );
+        cmd(
+            &mut a,
+            r#"{"t":"setView","xScale":"log","window":{"min":[0.01,-7,-10],"max":[17.5,9,10]}}"#,
+        );
+        cmd(&mut a, r#"{"t":"setView","xScale":"linear"}"#);
+        assert_eq!(a.rig.window(), w0);
+        assert_eq!(a.doc.view.window, d0);
+        // After a pan the world region shown is kept instead.
+        cmd(
+            &mut a,
+            r#"{"t":"setView","xScale":"log","window":{"min":[1,-7,-10],"max":[100,9,10]}}"#,
+        );
+        cmd(&mut a, r#"{"t":"pointer","phase":"down","x":400,"y":300}"#);
+        cmd(&mut a, r#"{"t":"pointer","phase":"move","x":300,"y":300}"#);
+        cmd(&mut a, r#"{"t":"pointer","phase":"up","x":300,"y":300}"#);
+        let world = a.world_window();
+        assert!(world.min[0] > 1.0, "panned right by decades: {world:?}");
+        cmd(&mut a, r#"{"t":"setView","xScale":"linear"}"#);
+        assert!((a.rig.window().min[0] - world.min[0]).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dragging_a_point_on_a_log_axis_maps_back_to_world_values() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"p","latex":"(10,5)"}"#);
+        cmd(
+            &mut a,
+            r#"{"t":"setView","xScale":"log","window":{"min":[0.1,-10,-10],"max":[1000,10,10]}}"#,
+        );
+        let vp = (800.0, 600.0);
+        let at = |a: &App, x: f64, y: f64| a.rig.world_to_pixel(a.map.fwd3([x, y, 0.0]), vp);
+        let (px, py) = at(&a, 10.0, 5.0);
+        let (tx, ty) = at(&a, 100.0, 5.0);
+        cmd(
+            &mut a,
+            &format!(r#"{{"t":"pointer","phase":"down","x":{px},"y":{py}}}"#),
+        );
+        let ev = cmd(
+            &mut a,
+            &format!(r#"{{"t":"pointer","phase":"move","x":{tx},"y":{ty}}}"#),
+        );
+        cmd(
+            &mut a,
+            &format!(r#"{{"t":"pointer","phase":"up","x":{tx},"y":{ty}}}"#),
+        );
+        let edited = ev
+            .iter()
+            .find(|e| e["t"] == "itemEdited")
+            .expect("the point moved");
+        let latex = edited["latex"].as_str().unwrap();
+        let inner = latex.trim_start_matches('(').trim_end_matches(')');
+        let (x, y) = inner.split_once(',').unwrap();
+        let (x, y): (f64, f64) = (x.trim().parse().unwrap(), y.trim().parse().unwrap());
+        assert!((x - 100.0).abs() < 1.0, "{latex}");
+        assert!((y - 5.0).abs() < 0.05, "{latex}");
+        // The rig was not panned by the drag.
+        let w = a.world_window();
+        assert!((w.min[0] - 0.1).abs() < 1e-9 && (w.max[0] - 1000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn log_axes_are_2d_only_and_survive_a_mode_round_trip() {
+        let mut a = app();
+        cmd(
+            &mut a,
+            r#"{"t":"setView","xScale":"log","window":{"min":[0.1,-10,-10],"max":[1000,10,10]}}"#,
+        );
+        let shown = a.rig.window();
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        let w3 = a.rig.window();
+        assert!(
+            (w3.min[0] - 0.1).abs() < 1e-9 && (w3.max[0] - 1000.0).abs() < 1e-6,
+            "3D uses world x"
+        );
+        cmd(&mut a, r#"{"t":"setMode","mode":"2d"}"#);
+        let back = a.rig.window();
+        assert!(
+            (back.min[0] - shown.min[0]).abs() < 1e-9 && (back.max[0] - shown.max[0]).abs() < 1e-9
+        );
+        // A slice cannot be shown on log axes and says so.
+        cmd(&mut a, r#"{"t":"setExpr","id":"s","latex":"y=x"}"#);
+        let ev = cmd(&mut a, r#"{"t":"setSlice","dim":1,"fixed":{"y":1}}"#);
+        let sl = ev
+            .iter()
+            .rev()
+            .find(|e| e["t"] == "slice")
+            .expect("a slice event");
+        assert!(
+            sl["error"].as_str().unwrap_or("").contains("logarithmic"),
+            "{sl}"
+        );
+    }
     #[test]
     fn orbit_in_3d_does_not_dirty_the_scene() {
         let mut a = app();

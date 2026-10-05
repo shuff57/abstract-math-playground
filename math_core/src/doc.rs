@@ -98,6 +98,67 @@ pub struct ViewState {
     /// Pan and zoom are ignored while set (additive field; saved only when true).
     #[serde(default, skip_serializing_if = "is_false")]
     pub lock: bool,
+    /// Rectangular or polar 2D grid (additive field; saved only when polar).
+    #[serde(default, skip_serializing_if = "GridKind::is_rect")]
+    pub grid_kind: GridKind,
+    /// Linear or logarithmic 2D axes (additive fields; saved only when logarithmic). A
+    /// logarithmic axis needs a window whose minimum on that axis is greater than 0.
+    #[serde(default, skip_serializing_if = "AxisScale::is_linear")]
+    pub x_scale: AxisScale,
+    #[serde(default, skip_serializing_if = "AxisScale::is_linear")]
+    pub y_scale: AxisScale,
+}
+
+/// The 2D grid: lines parallel to the axes, or circles and spokes around the origin.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GridKind {
+    #[default]
+    Rect,
+    Polar,
+}
+
+impl GridKind {
+    pub fn is_rect(&self) -> bool {
+        *self == GridKind::Rect
+    }
+}
+
+/// How a 2D axis maps numbers to positions.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AxisScale {
+    #[default]
+    Linear,
+    Log,
+}
+
+impl AxisScale {
+    pub fn is_linear(&self) -> bool {
+        *self == AxisScale::Linear
+    }
+    pub fn is_log(&self) -> bool {
+        *self == AxisScale::Log
+    }
+}
+
+impl ViewState {
+    /// Checks that every logarithmic axis has a window minimum greater than 0 (`w`, or the
+    /// view's own window). The message names the axis.
+    pub fn check_log_window(&self, w: Option<&WindowBox>) -> Result<(), String> {
+        let w = w.unwrap_or(&self.window);
+        for (a, n, sc) in [(0, "x", self.x_scale), (1, "y", self.y_scale)] {
+            if sc.is_log() && !(w.min[a] > 0.0 && w.max[a] > w.min[a]) {
+                return Err(format!(
+                    "a logarithmic {n} axis needs {n} min > 0 (the window has {n} from {} to {})",
+                    w.min[a], w.max[a]
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -503,6 +564,9 @@ impl Doc {
                 x_step: None,
                 y_step: None,
                 lock: false,
+                grid_kind: GridKind::Rect,
+                x_scale: AxisScale::Linear,
+                y_scale: AxisScale::Linear,
             },
             items: Vec::new(),
             sliders: BTreeMap::new(),
@@ -526,6 +590,9 @@ impl Doc {
             if v.is_some_and(|v| !(v.is_finite() && v > 0.0)) {
                 e.push(format!("view.{n}Step must be a positive number"));
             }
+        }
+        if let Err(m) = self.view.check_log_window(None) {
+            e.push(format!("view: {m}"));
         }
         for (n, v) in [("x", &self.view.x_label), ("y", &self.view.y_label)] {
             if v.as_ref().is_some_and(|t| t.chars().count() > 64) {
@@ -785,6 +852,29 @@ mod tests {
         // Bad values are rejected.
         let bad = j.replace("125.0", "-1.0");
         assert!(matches!(from_json(&bad), Err(DocError::Invalid(_))));
+    }
+
+    #[test]
+    fn grid_kind_and_axis_scales_round_trip_and_default_quietly() {
+        // Defaults are not written, so older documents stay byte-identical.
+        let j = to_json(&Doc::new_default());
+        assert!(!j.contains("gridKind") && !j.contains("xScale") && !j.contains("yScale"));
+        let mut d = rich_doc();
+        d.view.grid_kind = GridKind::Polar;
+        d.view.y_scale = AxisScale::Log;
+        d.view.window.min[1] = 0.01;
+        d.view.window.max[1] = 1000.0;
+        let j = to_json(&d);
+        assert!(j.contains(r#""gridKind":"polar""#) && j.contains(r#""yScale":"log""#), "{j}");
+        assert!(!j.contains("xScale"));
+        assert_eq!(from_json(&j).unwrap(), d);
+        assert_eq!(decode_hash(&encode_hash(&d)).unwrap(), d);
+        // A logarithmic axis whose window reaches 0 or below is rejected.
+        let mut bad = d.clone();
+        bad.view.window.min[1] = 0.0;
+        let err = from_json(&to_json(&bad)).unwrap_err().to_string();
+        assert!(err.contains("logarithmic y axis"), "{err}");
+        assert!(from_json(&j.replace(r#""yScale":"log""#, r#""yScale":"ln""#)).is_err());
     }
 
     #[test]

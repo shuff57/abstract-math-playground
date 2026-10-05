@@ -41,6 +41,7 @@ pub use slice_draw::{
     LABEL_GAP_Y, LABEL_H, SLICE_COLOR,
 };
 
+use crate::axis_map::AxisMap;
 use crate::geometry::{
     FieldKind, FieldSpec, Label, MeshVertex, SceneGeometry, SegmentInstance, Theme,
     MAX_FIELD_PARAMS,
@@ -98,6 +99,12 @@ const MAX_POINT_LABELS: usize = 100;
 pub const ITEM_LABEL_AXIS: u8 = 4;
 /// Segments of an open-circle point.
 const RING_SIDES: usize = 20;
+/// Label axis code of the angle labels of the polar grid's spokes.
+pub const POLAR_LABEL_AXIS: u8 = 5;
+/// Most circles of the polar grid (major and minor together).
+const MAX_CIRCLES: usize = 200;
+/// Message of an item that cannot be drawn on logarithmic axes.
+pub const LOG_UNSUPPORTED: &str = "not available on a logarithmic axis";
 
 // ---------------------------------------------------------------------------------------------
 // Nice spacing and number formatting
@@ -298,6 +305,12 @@ struct BuildExt {
     /// Axis names (x, y) and fixed major steps (x, y) from the view.
     axis_names: [Option<String>; 2],
     fixed_steps: [Option<f64>; 2],
+    /// Circles and spokes instead of the rectangular 2D grid.
+    polar: bool,
+    /// World -> display map of logarithmic 2D axes (linear outside 2D).
+    map: AxisMap,
+    /// `point` and `polyline` receive WORLD coordinates and map them (tables on log axes).
+    world_in: bool,
     /// `showLabel` of the item being drawn: custom text (or `None` for coordinates) and how many
     /// labels it may still place.
     labels: Option<(Option<String>, usize)>,
@@ -314,6 +327,9 @@ impl Default for BuildExt {
             arrows: false,
             axis_names: [None, None],
             fixed_steps: [None, None],
+            polar: false,
+            map: AxisMap::LINEAR,
+            world_in: false,
             labels: None,
         }
     }
@@ -489,6 +505,18 @@ impl<'a> Builder<'a> {
     }
 
     fn polyline(&mut self, pts: &[[f64; 3]], st: Style) {
+        if self.ext.world_in && !self.ext.map.is_linear() {
+            // World points on logarithmic axes: straight in display space between mapped points;
+            // a point that cannot be shown (<= 0 on a log axis) breaks the line.
+            let m = self.ext.map;
+            self.ext.world_in = false;
+            for run in pts.split(|p| !m.fwd3(*p).iter().all(|v| v.is_finite())) {
+                let mapped: Vec<[f64; 3]> = run.iter().map(|p| m.fwd3(*p)).collect();
+                self.polyline(&mapped, st);
+            }
+            self.ext.world_in = true;
+            return;
+        }
         if let Some((on, off)) = st.dash {
             return self.dashed(pts, st, on, off);
         }
@@ -560,8 +588,13 @@ impl<'a> Builder<'a> {
     }
 
     /// One point marker in the item's style (`pointStyle`, `pointSize`), plus its `showLabel`
-    /// label. Open shapes are sized in pixels; in 3D every style is a dot.
+    /// label. Open shapes are sized in pixels; in 3D every style is a dot. `p` is in WORLD
+    /// coordinates (mapped onto logarithmic axes; a point that cannot be shown there is skipped).
     fn point(&mut self, p: [f64; 3], st: Style) {
+        let p = self.ext.map.fwd3(p);
+        if !p.iter().all(|v| v.is_finite()) {
+            return;
+        }
         let size = st.point_size as f64;
         let k = self.px_per_unit();
         let off = |dx: f64, dy: f64| [p[0] + dx / k[0], p[1] + dy / k[1], p[2]];
@@ -612,7 +645,10 @@ impl<'a> Builder<'a> {
         let text = match (text, mode) {
             (Some(t), _) => t.clone(),
             (None, Mode::D1) => return,
-            (None, Mode::D2) => format!("({}, {})", format_value(p[0]), format_value(p[1])),
+            (None, Mode::D2) => {
+                let w = self.ext.map.inv3(p);
+                format!("({}, {})", format_value(w[0]), format_value(w[1]))
+            }
             (None, Mode::D3) => format!(
                 "({}, {}, {})",
                 format_value(p[0]),
@@ -723,6 +759,18 @@ impl<'a> Builder<'a> {
                     self.axes_1d(steps[0]);
                 }
             }
+            Mode::D2 if !self.ext.map.is_linear() => self.log_grid_and_axes(steps),
+            Mode::D2 if self.ext.polar => {
+                // One spacing for circles and ticks (the per-axis steps do not apply).
+                let (vw, _) = self.px();
+                let s = nice_step(self.win.max[0] - self.win.min[0], vw, TARGET_MAJOR_PX);
+                if grid {
+                    self.polar_grid(s);
+                }
+                if axes {
+                    self.axes_2d([s, s, 1.0]);
+                }
+            }
             Mode::D2 => {
                 if grid {
                     self.plane_grid(0.0, steps);
@@ -781,6 +829,319 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// The part of the segment `a`-`b` inside the 2D window (Liang-Barsky), if any.
+    fn clip_to_window(&self, a: [f64; 2], b: [f64; 2]) -> Option<([f64; 2], [f64; 2])> {
+        let (lo, hi) = (self.win.min, self.win.max);
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let (mut t0, mut t1) = (0.0f64, 1.0f64);
+        for k in 0..2 {
+            for (p, q) in [(-d[k], a[k] - lo[k]), (d[k], hi[k] - a[k])] {
+                if p == 0.0 {
+                    if q < 0.0 {
+                        return None;
+                    }
+                } else {
+                    let r = q / p;
+                    if p < 0.0 {
+                        t0 = t0.max(r);
+                    } else {
+                        t1 = t1.min(r);
+                    }
+                }
+            }
+        }
+        (t0 <= t1).then(|| {
+            let at = |t: f64| [a[0] + d[0] * t, a[1] + d[1] * t];
+            (at(t0), at(t1))
+        })
+    }
+
+    /// Polar grid: circles every `step` around the origin (minor circles between them when the
+    /// view has minor gridlines) and spokes every 30 degrees labelled with their angle. Only the
+    /// visible arcs of the circles are emitted.
+    fn polar_grid(&mut self, step: f64) {
+        let (minor_c, major_c) = (self.theme.grid_minor, self.theme.grid_major);
+        let (lo, hi) = (self.win.min, self.win.max);
+        let (vw, _) = self.px();
+        let upp = (hi[0] - lo[0]) / vw;
+        // Nearest and farthest distance of the window from the origin.
+        let near = [0.0f64.clamp(lo[0], hi[0]), 0.0f64.clamp(lo[1], hi[1])];
+        let r_near = near[0].hypot(near[1]);
+        let r_far = [lo[0].abs().max(hi[0].abs()), lo[1].abs().max(hi[1].abs())];
+        let r_far = r_far[0].hypot(r_far[1]);
+        // Angular range of the window as seen from the origin (all of it when it is inside).
+        let inside = r_near == 0.0;
+        let (th0, th1) = if inside {
+            (0.0, 2.0 * PI)
+        } else {
+            let mid = (0.5 * (lo[1] + hi[1])).atan2(0.5 * (lo[0] + hi[0]));
+            let rel = |x: f64, y: f64| {
+                let mut d = y.atan2(x) - mid;
+                while d > PI {
+                    d -= 2.0 * PI;
+                }
+                while d < -PI {
+                    d += 2.0 * PI;
+                }
+                d
+            };
+            let ds = [
+                rel(lo[0], lo[1]),
+                rel(hi[0], lo[1]),
+                rel(hi[0], hi[1]),
+                rel(lo[0], hi[1]),
+            ];
+            let (a, b) = ds
+                .iter()
+                .fold((0.0f64, 0.0f64), |(a, b), d| (a.min(*d), b.max(*d)));
+            (mid + a, mid + b)
+        };
+        let div = minor_divisions(step);
+        let minor = step / div as f64;
+        let ring_step = if self.ext.minor_grid { minor } else { step };
+        let k0 = (r_near / ring_step).ceil().max(1.0);
+        let k1 = (r_far / ring_step).floor();
+        if k1 - k0 < MAX_CIRCLES as f64 {
+            for pass_major in [false, true] {
+                let mut k = k0;
+                while k <= k1 {
+                    let r = k * ring_step;
+                    let is_major = !self.ext.minor_grid || (k as i64) % div == 0;
+                    k += 1.0;
+                    if is_major != pass_major {
+                        continue;
+                    }
+                    let (w, c) = if is_major {
+                        (MAJOR_W, major_c)
+                    } else {
+                        (MINOR_W, minor_c)
+                    };
+                    // Chords that stray at most ~0.3 px from the circle (at most 720 per circle).
+                    let dth = 2.0 * (0.6 / (r / upp).max(1.0)).sqrt();
+                    let n = ((th1 - th0) / dth).ceil().clamp(8.0, 720.0) as usize;
+                    let pt = |i: usize| {
+                        let t = th0 + (th1 - th0) * i as f64 / n as f64;
+                        [r * t.cos(), r * t.sin()]
+                    };
+                    let mut prev = pt(0);
+                    for i in 1..=n {
+                        let cur = pt(i);
+                        if let Some((a, b)) = self.clip_to_window(prev, cur) {
+                            self.seg([a[0], a[1], 0.0], [b[0], b[1], 0.0], w, c);
+                        }
+                        prev = cur;
+                    }
+                }
+            }
+        }
+        // Spokes every 30 degrees, from the origin to the window edge, labelled near the edge.
+        let deg = self.angle == Angle::Deg;
+        let labels = self.ext.axis_numbers;
+        let (pad_x, pad_y) = (22.0 * upp, 14.0 * upp);
+        for j in 0..12u32 {
+            let t = j as f64 * PI / 6.0;
+            let far = [r_far * 1.01 * t.cos(), r_far * 1.01 * t.sin()];
+            let Some((a, b)) = self.clip_to_window([0.0, 0.0], far) else {
+                continue;
+            };
+            self.seg([a[0], a[1], 0.0], [b[0], b[1], 0.0], MAJOR_W, major_c);
+            // The axes carry their own numbers; the other spokes get their angle.
+            if !labels || j % 3 == 0 {
+                continue;
+            }
+            let p = [
+                (b[0] - t.cos() * pad_x).clamp(lo[0] + pad_x, hi[0] - pad_x),
+                (b[1] - t.sin() * pad_y).clamp(lo[1] + pad_y, hi[1] - pad_y),
+            ];
+            if p[0] * t.cos() + p[1] * t.sin() > 0.0 {
+                self.label(
+                    [p[0], p[1], 0.0],
+                    polar_angle_text(j, deg),
+                    POLAR_LABEL_AXIS,
+                );
+            }
+        }
+    }
+
+    /// Grid, axes and numbers when at least one 2D axis is logarithmic (see [`AxisMap`]): a
+    /// logarithmic axis has major lines at powers of ten and minor lines at 2..9 times them; a
+    /// linear one keeps its steps. An axis line is drawn only where the other axis has a 0.
+    fn log_grid_and_axes(&mut self, steps: [f64; 3]) {
+        let (vw, vh) = self.px();
+        let (lo, hi) = (self.win.min, self.win.max);
+        let ticks = [
+            self.log_ticks(0, steps[0], vw),
+            self.log_ticks(1, steps[1], vh),
+        ];
+        let (minor_c, major_c, axis_c) = (
+            self.theme.grid_minor,
+            self.theme.grid_major,
+            self.theme.axis,
+        );
+        if self.ext.grid {
+            for pass_major in [false, true] {
+                for axis in 0..2usize {
+                    let other = 1 - axis;
+                    for t in &ticks[axis] {
+                        if t.major != pass_major || (!t.major && !self.ext.minor_grid) {
+                            continue;
+                        }
+                        let (mut a, mut b) = ([0.0; 3], [0.0; 3]);
+                        a[axis] = t.pos;
+                        b[axis] = t.pos;
+                        a[other] = lo[other];
+                        b[other] = hi[other];
+                        let (w, c) = if t.major {
+                            (MAJOR_W, major_c)
+                        } else {
+                            (MINOR_W, minor_c)
+                        };
+                        self.seg(a, b, w, c);
+                    }
+                }
+            }
+        }
+        if !self.ext.axes {
+            return;
+        }
+        let map = self.ext.map;
+        // Where world 0 of each axis is in display space (none on a logarithmic axis).
+        let zero = |a: usize| (!map.log[a] && lo[a] <= 0.0 && 0.0 <= hi[a]).then_some(0.0);
+        let upp = [(hi[0] - lo[0]) / vw, (hi[1] - lo[1]) / vh];
+        for axis in 0..2usize {
+            let other = 1 - axis;
+            // The axis line sits at the other axis's 0; without one its numbers hug the
+            // bottom / left edge.
+            let at = match zero(other) {
+                Some(z) => {
+                    let (mut a, mut b) = ([0.0; 3], [0.0; 3]);
+                    a[axis] = lo[axis];
+                    b[axis] = hi[axis];
+                    a[other] = z;
+                    b[other] = z;
+                    self.seg(a, b, AXIS_W, axis_c);
+                    for t in ticks[axis].iter().filter(|t| t.major) {
+                        let h = TICK_PX * upp[other];
+                        let (mut p, mut q) = ([0.0; 3], [0.0; 3]);
+                        p[axis] = t.pos;
+                        q[axis] = t.pos;
+                        p[other] = z - h;
+                        q[other] = z + h;
+                        self.seg(p, q, MINOR_W * 1.5, axis_c);
+                    }
+                    z
+                }
+                None if map.log[other] || lo[other] > 0.0 => {
+                    lo[other] + if axis == 0 { 22.0 } else { 46.0 } * upp[other]
+                }
+                None => self.clamp0(other),
+            };
+            if self.ext.axis_numbers {
+                let labels: Vec<(f64, String)> = ticks[axis]
+                    .iter()
+                    .filter_map(|t| t.text.clone().map(|s| (t.pos, s)))
+                    .collect();
+                for (pos, text) in labels {
+                    let mut p = [0.0; 3];
+                    p[axis] = pos;
+                    p[other] = at;
+                    self.label(p, text, axis as u8);
+                }
+            }
+            if let Some(n) = self.ext.axis_names[axis].clone() {
+                let mut p = [0.0; 3];
+                p[axis] = hi[axis] - 0.02 * (hi[axis] - lo[axis]);
+                p[other] = at;
+                self.label(p, n, axis as u8);
+            }
+        }
+    }
+
+    /// Grid lines and numbers along display axis `axis` (`px` pixels long) for the log-axes
+    /// grid: decades (every n-th when they are crowded) and their 2..9 multiples on a
+    /// logarithmic axis, plain multiples of `step` on a linear one.
+    fn log_ticks(&self, axis: usize, step: f64, px: f64) -> Vec<Tick> {
+        let (lo, hi) = (self.win.min[axis], self.win.max[axis]);
+        let map = self.ext.map;
+        let mut out = Vec::new();
+        if !map.log[axis] {
+            let div = minor_divisions(step);
+            for (k, v) in multiples(lo, hi, step / div as f64) {
+                let major = k % div == 0;
+                out.push(Tick {
+                    pos: v,
+                    major,
+                    text: major.then(|| format_tick(v, step)),
+                });
+            }
+            return out;
+        }
+        let k = map.k[axis];
+        // Pixels per decade, and the decades in view.
+        let ppd = k * px / (hi - lo).max(1e-300);
+        let (e0, e1) = ((lo / k).floor(), (hi / k).ceil());
+        if !(e0.is_finite() && e1.is_finite()) || e1 - e0 > 2.0 * MAX_LINES as f64 {
+            return out;
+        }
+        if ppd > 2500.0 {
+            // Less than a decade across: plain steps in world units, mapped.
+            let (w0, w1) = (map.inv(axis, lo), map.inv(axis, hi));
+            let s = nice_step(w1 - w0, px, TARGET_MAJOR_PX);
+            let div = minor_divisions(s);
+            for (j, v) in multiples(w0, w1, s / div as f64) {
+                let major = j % div == 0;
+                let pos = map.fwd(axis, v);
+                if pos.is_finite() {
+                    out.push(Tick {
+                        pos,
+                        major,
+                        text: major.then(|| format_tick(v, s)),
+                    });
+                }
+            }
+            return out;
+        }
+        // Label every n-th decade so numbers stay at least ~45 px apart.
+        let n = [1i64, 2, 3, 5, 10, 20, 50, 100]
+            .into_iter()
+            .find(|n| *n as f64 * ppd >= 45.0)
+            .unwrap_or(100);
+        let labelled_mantissas: &[i32] = if ppd >= 700.0 {
+            &[2, 3, 4, 5, 6, 7, 8, 9]
+        } else if ppd >= 300.0 {
+            &[2, 5]
+        } else {
+            &[]
+        };
+        for e in e0 as i64..=e1 as i64 {
+            let base = 10f64.powi(e as i32);
+            let pos = k * e as f64;
+            if pos >= lo && pos <= hi {
+                let major = e.rem_euclid(n) == 0;
+                out.push(Tick {
+                    pos,
+                    major,
+                    text: major.then(|| format_tick(base, base)),
+                });
+            }
+            if n == 1 && ppd >= 40.0 {
+                for m in 2..=9 {
+                    let pos = k * (e as f64 + (m as f64).log10());
+                    if pos >= lo && pos <= hi {
+                        let v = m as f64 * base;
+                        out.push(Tick {
+                            pos,
+                            major: false,
+                            text: labelled_mantissas
+                                .contains(&m)
+                                .then(|| format_tick(v, base)),
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
     fn axes_2d(&mut self, steps: [f64; 3]) {
         let (vw, vh) = self.px();
         let (lo, hi) = (self.win.min, self.win.max);
@@ -867,6 +1228,12 @@ impl<'a> Builder<'a> {
             }
             let mut p = anchor;
             p[a] = v;
+            // The polar grid numbers distances from the origin: positive on both sides.
+            let v = if self.ext.polar && self.ext.mode == Mode::D2 {
+                v.abs()
+            } else {
+                v
+            };
             self.label(p, format_tick(v, step), axis);
         }
     }
@@ -927,6 +1294,8 @@ impl<'a> Builder<'a> {
     }
 
     fn contour(&mut self, f: &Expr, st: Style) -> Result<(), String> {
+        // `f` is in world coordinates; on logarithmic axes its zero set is traced in display ones.
+        let f = &self.ext.map.display_expr(f);
         let p = self.prog(f, &["x", "y"])?;
         let (min_cell, depth) = self.contour_params();
         let w = self.win;
@@ -994,9 +1363,12 @@ impl<'a> Builder<'a> {
         if e.contains_var("z") {
             return Err("fields may only use x and y (z is not supported)".to_string());
         }
+        // The shader runs at display positions: on logarithmic axes it evaluates world ones.
+        let e = self.ext.map.display_expr(&e);
         if calc_draw::uses_reduce(&e) {
             // int/sum/prod have no WGSL form: raster on the CPU instead (sliders folded in).
             let folded = defs.resolve(raw).map_err(|e| e.to_string())?;
+            let folded = self.ext.map.display_expr(&folded);
             return self.field_cpu(&folded, kind, color);
         }
         let mut vars = vec!["x", "y"];
@@ -1121,6 +1493,13 @@ impl<'a> Builder<'a> {
         if self.prog(&resolved, &[]).is_ok_and(|c| !c.eval(&[]).is_finite()) {
             return Err("undefined".into());
         }
+        // On logarithmic axes: Y = map_y(f(world x of X)).
+        let m = self.ext.map;
+        let resolved = if m.is_linear() {
+            resolved
+        } else {
+            m.display_of(1, m.display_expr(&resolved))
+        };
         let p = self.prog(&resolved, &["x"])?;
         let lines = mesh::sample_explicit(
             &p,
@@ -1178,6 +1557,7 @@ impl<'a> Builder<'a> {
                 let th = || Expr::var("theta");
                 let xe = Expr::bin(BinOp::Mul, r.clone(), Expr::call("cos", vec![th()]));
                 let ye = Expr::bin(BinOp::Mul, r, Expr::call("sin", vec![th()]));
+                let (xe, ye) = (self.ext.map.display_of(0, xe), self.ext.map.display_of(1, ye));
                 let (px, py) = (self.prog(&xe, &["theta"])?, self.prog(&ye, &["theta"])?);
                 let lines = mesh::sample_parametric(&px, &py, 0.0, self.turn() * k, 4000);
                 self.add_lines2(&lines, st);
@@ -1185,8 +1565,9 @@ impl<'a> Builder<'a> {
             }
             Kind::Parametric { components } if components.len() == 2 => {
                 let mut ps = Vec::new();
-                for c in components {
+                for (a, c) in components.iter().enumerate() {
                     let r = defs.resolve(c).map_err(|e| e.to_string())?;
+                    let r = self.ext.map.display_of(a, r);
                     ps.push(self.prog(&r, &["t"])?);
                 }
                 let lines = mesh::sample_parametric(&ps[0], &ps[1], 0.0, self.turn(), 4000);
@@ -1213,6 +1594,40 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// A regression on logarithmic axes: its curve as `y = f(x)` (mapped like any explicit
+    /// curve) and its residual ticks between mapped points.
+    fn draw_regression_log(
+        &mut self,
+        pr: &Prepared,
+        fit: &math_core::regress::FitResult,
+        defs: &Defs,
+        st: Style,
+    ) -> Result<(), String> {
+        let Some(curve) = fit.curve_expr("x") else {
+            return Ok(()); // several data lists: no single curve to draw
+        };
+        self.explicit_y_2d(&curve, defs, st)?;
+        if pr.item.style.residuals {
+            let xs = fit.data_vars.first().and_then(|n| {
+                let body = defs.resolve(&Expr::var(n)).ok()?;
+                match eval_value(&body, &Bindings::new().with_angle(self.angle)).ok()? {
+                    Value::List(l) => Some(l),
+                    _ => None,
+                }
+            });
+            let m = self.ext.map;
+            let col = [st.color[0], st.color[1], st.color[2], st.color[3] * 0.7];
+            for ((x, f), e) in xs
+                .unwrap_or_default()
+                .iter()
+                .zip(&fit.fitted)
+                .zip(&fit.residuals)
+            {
+                self.seg(m.fwd3([*x, *f, 0.0]), m.fwd3([*x, *f + *e, 0.0]), 1.5, col);
+            }
+        }
+        Ok(())
+    }
     // ----- 3D -------------------------------------------------------------------------------
 
     fn surface(&mut self, f: &Expr, st: Style) -> Result<(), String> {
@@ -1920,6 +2335,39 @@ impl<'a> Builder<'a> {
 
 /// Joins unordered contour pieces into polylines by matching endpoints (snapped to a grid of
 /// `tol`), so a dash pattern can run along each curve. Every piece is used exactly once.
+/// One grid position of the log-axes grid (display coordinate) and its number, if labelled.
+struct Tick {
+    pos: f64,
+    major: bool,
+    text: Option<String>,
+}
+
+/// Angle label of spoke `j` (multiples of 30 degrees): `pi/6`, `2pi/3`, ... or `30°`, `120°`.
+fn polar_angle_text(j: u32, degrees: bool) -> String {
+    if degrees {
+        return format!("{}\u{b0}", j * 30);
+    }
+    let g = gcd(j, 6);
+    let (num, den) = (j / g, 6 / g);
+    let num = if num == 1 {
+        String::new()
+    } else {
+        num.to_string()
+    };
+    if den == 1 {
+        format!("{num}\u{3c0}")
+    } else {
+        format!("{num}\u{3c0}/{den}")
+    }
+}
+
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 {
+        a.max(1)
+    } else {
+        gcd(b, a % b)
+    }
+}
 fn chain_segments(segs: &[[[f64; 2]; 2]], tol: f64) -> Vec<Vec<[f64; 2]>> {
     use std::collections::HashMap;
     let tol = if tol.is_finite() && tol > 0.0 {
@@ -2040,6 +2488,19 @@ fn find_roots(p: &Program, x0: f64, x1: f64) -> Vec<f64> {
 // Document preparation and entry point
 // ---------------------------------------------------------------------------------------------
 
+/// Why an item cannot be drawn on logarithmic 2D axes (the start of its diagnostic), if so.
+fn log_unsupported(pr: &Prepared) -> Option<&'static str> {
+    if pr.complex.is_some() {
+        return Some("domain colouring is");
+    }
+    match &pr.kind {
+        Kind::VectorField { .. } => Some("a vector field is"),
+        _ if matches!(&pr.expr, Expr::Call(n, _) if STAT_PLOTS.contains(&n.as_str())) => {
+            Some("a statistical plot is")
+        }
+        _ => None,
+    }
+}
 fn is_drawable_kind(k: ItemKind) -> bool {
     !matches!(k, ItemKind::Folder | ItemKind::Note | ItemKind::Action)
 }
@@ -2212,7 +2673,8 @@ pub fn with_folders_applied(doc: &Doc) -> std::borrow::Cow<'_, Doc> {
 /// `window` is the visible box in world space, `origin` the render origin subtracted (in f64)
 /// from every position, `viewport_px` the canvas size in physical pixels. Never panics; bad
 /// items are reported in `SceneGeometry::diagnostics` and the rest still render. Segment order:
-/// grid, axes, content.
+/// grid, axes, content. With logarithmic 2D axes, `window` is in display coordinates of the
+/// map [`AxisMap::for_view`] gives for the document and the viewport (see [`build_scene_mapped`]).
 pub fn build_scene(
     doc: &Doc,
     mode: Mode,
@@ -2221,7 +2683,32 @@ pub fn build_scene(
     viewport_px: (u32, u32),
     theme: &Theme,
 ) -> SceneGeometry {
+    let map = doc_map(doc, mode, viewport_px);
+    build_scene_mapped(doc, map, mode, window, origin, viewport_px, theme)
+}
+
+/// The axis map [`build_scene`] uses: the document's logarithmic axes in 2D, linear otherwise.
+pub fn doc_map(doc: &Doc, mode: Mode, viewport_px: (u32, u32)) -> AxisMap {
+    if mode == Mode::D2 {
+        AxisMap::for_view(&doc.view, viewport_px.0 as f64 / viewport_px.1.max(1) as f64)
+    } else {
+        AxisMap::LINEAR
+    }
+}
+
+/// [`build_scene`] with an explicit world -> display map of the 2D axes (`window` and every
+/// position in the result are display coordinates). Ignored outside 2D.
+pub fn build_scene_mapped(
+    doc: &Doc,
+    map: AxisMap,
+    mode: Mode,
+    window: Window3,
+    origin: [f64; 3],
+    viewport_px: (u32, u32),
+    theme: &Theme,
+) -> SceneGeometry {
     let doc = &*with_folders_applied(doc);
+    let map = if mode == Mode::D2 { map } else { AxisMap::LINEAR };
     let mut b = Builder {
         out: SceneGeometry::default(),
         origin,
@@ -2248,6 +2735,9 @@ pub fn build_scene(
             arrows: doc.view.arrows,
             axis_names: [doc.view.x_label.clone(), doc.view.y_label.clone()],
             fixed_steps: [doc.view.x_step, doc.view.y_step],
+            polar: doc.view.grid_kind == math_core::doc::GridKind::Polar,
+            map,
+            world_in: false,
             labels: None,
         },
     };
@@ -2275,9 +2765,21 @@ pub fn build_scene(
         let st = Style::for_item(&pr.item.style, color);
         b.begin_item_labels(&pr.item.style);
         let seg0 = b.out.segments.len();
+        if !map.is_linear() {
+            if let Some(why) = log_unsupported(pr) {
+                diags.push((pr.item.id.clone(), format!("{why} {LOG_UNSUPPORTED}")));
+                b.end_item_labels(&pr.item.style, seg0);
+                continue;
+            }
+        }
         if matches!(pr.kind, Kind::Regression { .. }) {
             if let Some(fit) = fits.get(&pr.item.id) {
-                if let Err(msg) = b.draw_regression(pr, fit, &defs, mode, st) {
+                let r = if map.is_linear() {
+                    b.draw_regression(pr, fit, &defs, mode, st)
+                } else {
+                    b.draw_regression_log(pr, fit, &defs, st)
+                };
+                if let Err(msg) = r {
                     diags.push((pr.item.id.clone(), msg));
                 }
             }
@@ -2321,14 +2823,17 @@ pub fn build_scene(
         let st = Style::for_item(&t.item.style, color);
         let style = t.item.table.as_ref().map(|x| x.style).unwrap_or_default();
         b.begin_item_labels(&t.item.style);
+        // Table rows are world coordinates: mapped onto logarithmic axes as they are drawn.
+        b.ext.world_in = true;
         if let Err(msg) = b.draw_table(&t.cols, style, &defs, mode, st) {
             diags.push((t.item.id.clone(), msg));
         }
+        b.ext.world_in = false;
         b.ext.labels = None;
     }
     // Slice overlay (additive; a slice that does not fit the mode is simply not drawn here, the
     // app reports why).
-    if let Some(cfg) = &doc.slice {
+    if let Some(cfg) = doc.slice.as_ref().filter(|_| map.is_linear()) {
         if let Ok(rs) = ResolvedSlice::resolve(cfg, mode, &defs, b.angle) {
             let sitems = slice_draw::collect(&items, &defs, theme, b.angle, &rs, &b.win);
             let px = match mode {
@@ -2372,6 +2877,20 @@ pub fn build_scene_preview(
     viewport_px: (u32, u32),
     theme: &Theme,
 ) -> (SceneGeometry, bool) {
+    let map = doc_map(doc, mode, viewport_px);
+    build_scene_preview_mapped(doc, map, mode, window, origin, viewport_px, theme)
+}
+
+/// [`build_scene_preview`] with an explicit axis map (see [`build_scene_mapped`]).
+pub fn build_scene_preview_mapped(
+    doc: &Doc,
+    map: AxisMap,
+    mode: Mode,
+    window: Window3,
+    origin: [f64; 3],
+    viewport_px: (u32, u32),
+    theme: &Theme,
+) -> (SceneGeometry, bool) {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -2381,7 +2900,7 @@ pub fn build_scene_preview(
     SURFACE_DEPTH_CAP.set(Some(PREVIEW_SURFACE_DEPTH));
     SURFACE_CAPPED.set(false);
     let _reset = Reset;
-    let g = build_scene(doc, mode, window, origin, viewport_px, theme);
+    let g = build_scene_mapped(doc, map, mode, window, origin, viewport_px, theme);
     (g, SURFACE_CAPPED.get())
 }
 
@@ -4057,6 +4576,297 @@ mod tests {
         assert!(seg_count(&tiny) < 2000);
     }
 
+    /// A 2D build of `d` as the app does it: the document's axis map and its display window.
+    fn build_mapped(d: &Doc) -> (SceneGeometry, AxisMap) {
+        let size = (800, 600);
+        let map = doc_map(d, Mode::D2, size);
+        let mut win = map.to_display(&d.view.window);
+        // The camera derives y from the aspect, as `App::scene_window` does.
+        let (cy, hy) = (
+            0.5 * (win.min[1] + win.max[1]),
+            0.5 * (win.max[0] - win.min[0]) * 600.0 / 800.0,
+        );
+        win.min[1] = cy - hy;
+        win.max[1] = cy + hy;
+        let g = build_scene_mapped(d, map, Mode::D2, win, [0.0; 3], size, &Theme::light());
+        (g, map)
+    }
+
+    fn log_doc(items: &[(&str, &str)], x: Option<[f64; 2]>, y: Option<[f64; 2]>) -> Doc {
+        use math_core::doc::AxisScale;
+        let mut d = doc_with(items);
+        for (a, r) in [(0, x), (1, y)] {
+            if let Some([lo, hi]) = r {
+                d.view.window.min[a] = lo;
+                d.view.window.max[a] = hi;
+                if a == 0 {
+                    d.view.x_scale = AxisScale::Log;
+                } else {
+                    d.view.y_scale = AxisScale::Log;
+                }
+            }
+        }
+        d
+    }
+
+    /// The display points of the item's drawn segments (the grid and axes come first).
+    fn item_points(g: &SceneGeometry, grid: &SceneGeometry) -> Vec<[f64; 2]> {
+        g.segments[grid.segments.len()..]
+            .iter()
+            .flat_map(|s| [s.p0, s.p1])
+            .map(|p| [p[0] as f64, p[1] as f64])
+            .collect()
+    }
+
+    #[test]
+    fn log_axes_label_decades_and_draw_minor_lines() {
+        let d = log_doc(&[], Some([0.01, 1000.0]), None);
+        let (g, map) = build_mapped(&d);
+        assert!(!map.is_linear());
+        let xs: Vec<&str> = g
+            .labels
+            .iter()
+            .filter(|l| l.axis == 0)
+            .map(|l| l.text.as_str())
+            .collect();
+        for t in ["0.01", "0.1", "1", "10", "100", "1000"] {
+            assert!(xs.contains(&t), "{t} missing from {xs:?}");
+        }
+        // Decade labels sit at k * log10(v) in display space.
+        let ten = g
+            .labels
+            .iter()
+            .find(|l| l.axis == 0 && l.text == "10")
+            .unwrap();
+        assert!((ten.pos[0] - map.k[0]).abs() < 1e-9);
+        // Minor lines at 2..9 times each power.
+        let mut no_minor = d.clone();
+        no_minor.view.minor_grid = false;
+        assert!(build_mapped(&no_minor).0.segments.len() < g.segments.len());
+        // y stays linear with its usual numbers.
+        assert!(g.labels.iter().any(|l| l.axis == 1 && l.text == "5"));
+        // Tiny and huge decades use the tick format (1e-5, 1e6).
+        let wide = log_doc(&[], Some([1e-6, 1e7]), None);
+        let w: Vec<String> = build_mapped(&wide)
+            .0
+            .labels
+            .iter()
+            .filter(|l| l.axis == 0)
+            .map(|l| l.text.clone())
+            .collect();
+        assert!(w.iter().any(|t| t == "1e6" || t == "1e-5"), "{w:?}");
+    }
+
+    #[test]
+    fn log_y_axis_makes_exponentials_straight_and_bends_lines() {
+        let grid = build_mapped(&log_doc(&[], None, Some([0.01, 1000.0]))).0;
+        // y = 2^x on a logarithmic y axis: Y = k log10(2) x, a straight line.
+        let (g, map) = build_mapped(&log_doc(&[("e", "y=2^x")], None, Some([0.01, 1000.0])));
+        let pts = item_points(&g, &grid);
+        assert!(
+            pts.len() > 10 && g.diagnostics.is_empty(),
+            "{:?}",
+            g.diagnostics
+        );
+        let slope = map.k[1] * 2f64.log10();
+        for p in &pts {
+            assert!(
+                (p[1] - slope * p[0]).abs() < 1e-3 * map.k[1],
+                "{p:?} off the line"
+            );
+        }
+        // y = x is a curve there (and is not drawn for x <= 0).
+        let (g, map) = build_mapped(&log_doc(&[("l", "y=x")], None, Some([0.01, 1000.0])));
+        let pts = item_points(&g, &grid);
+        assert!(pts.iter().all(|p| p[0] > 0.0));
+        let off = pts
+            .iter()
+            .map(|p| (p[1] - map.fwd(1, p[0])).abs())
+            .fold(0.0, f64::max);
+        assert!(off < 1e-3 * map.k[1]);
+        let (a, b) = (
+            pts.iter().find(|p| p[0] > 0.5).unwrap(),
+            pts.iter().find(|p| p[0] > 5.0).unwrap(),
+        );
+        let mid = pts.iter().find(|p| p[0] > 0.5 * (a[0] + b[0])).unwrap();
+        let chord = a[1] + (b[1] - a[1]) * (mid[0] - a[0]) / (b[0] - a[0]);
+        assert!(
+            (mid[1] - chord).abs() > 0.05 * map.k[1],
+            "y = x should bend on a log y axis"
+        );
+    }
+
+    #[test]
+    fn log_log_axes_draw_power_laws_straight_and_implicit_curves() {
+        let grid = build_mapped(&log_doc(&[], Some([0.01, 1000.0]), Some([0.01, 1000.0]))).0;
+        // y = x^2 on log-log axes: Y = 2 (k_y / k_x) X.
+        let (g, map) = build_mapped(&log_doc(
+            &[("p", "y=x^2")],
+            Some([0.01, 1000.0]),
+            Some([0.01, 1000.0]),
+        ));
+        let pts = item_points(&g, &grid);
+        assert!(pts.len() > 10);
+        for p in &pts {
+            assert!((p[1] - 2.0 * map.k[1] / map.k[0] * p[0]).abs() < 1e-3 * map.k[1].max(1.0));
+        }
+        // An implicit curve (xy = 10) is traced through the map too: Y = k_y (1 - X / k_x).
+        let (g, map) = build_mapped(&log_doc(
+            &[("h", "xy=10")],
+            Some([0.01, 1000.0]),
+            Some([0.01, 1000.0]),
+        ));
+        assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
+        let pts = item_points(&g, &grid);
+        assert!(pts.len() > 4);
+        for p in &pts {
+            let want = map.k[1] * (1.0 - p[0] / map.k[0]);
+            assert!((p[1] - want).abs() < 0.05 * map.k[1], "{p:?} vs {want}");
+        }
+    }
+
+    #[test]
+    fn log_axes_map_points_tables_and_report_what_they_cannot_draw() {
+        let d = log_doc(
+            &[("p", "(10,100)"), ("q", "(-1,5)")],
+            Some([0.1, 1000.0]),
+            Some([0.1, 1000.0]),
+        );
+        let (g, map) = build_mapped(&d);
+        let dots: Vec<[f32; 3]> = g
+            .segments
+            .iter()
+            .filter(|s| s.p0 == s.p1)
+            .map(|s| s.p0)
+            .collect();
+        let want = map.fwd3([10.0, 100.0, 0.0]);
+        assert!(dots
+            .iter()
+            .any(|p| (p[0] as f64 - want[0]).abs() < 1e-4 && (p[1] as f64 - want[1]).abs() < 1e-4));
+        assert_eq!(dots.len(), 1, "a point at x <= 0 cannot be shown");
+        // A table's points are mapped the same way.
+        let mut t = table_doc(
+            &[("x_1", &["1", "10", "100"]), ("y_1", &["1", "10", "100"])],
+            TableStyle::Line,
+        );
+        t.view = log_doc(&[], Some([0.1, 1000.0]), Some([0.1, 1000.0])).view;
+        let (g, map) = build_mapped(&t);
+        let dots: Vec<[f32; 3]> = g
+            .segments
+            .iter()
+            .filter(|s| s.p0 == s.p1)
+            .map(|s| s.p0)
+            .collect();
+        for v in [1.0, 10.0, 100.0] {
+            let w = map.fwd3([v, v, 0.0]);
+            let near = |p: &&[f32; 3]| {
+                (p[0] as f64 - w[0]).abs() < 1e-4 && (p[1] as f64 - w[1]).abs() < 1e-4
+            };
+            assert!(dots.iter().any(|p| near(&p)), "{v}");
+        }
+        // Items that have no meaning on log axes say so instead of drawing a wrong picture.
+        let bad = log_doc(
+            &[("v", "(-y, x)"), ("h", "histogram([1,2,2,3])")],
+            Some([0.1, 1000.0]),
+            Some([0.1, 1000.0]),
+        );
+        let (g, _) = build_mapped(&bad);
+        for id in ["v", "h"] {
+            let m = g
+                .diagnostics
+                .iter()
+                .find(|(i, _)| i == id)
+                .map(|(_, m)| m.as_str())
+                .unwrap_or("");
+            assert!(m.contains(LOG_UNSUPPORTED), "{id}: {m:?}");
+        }
+        // Inequalities still shade (the field evaluates world coordinates).
+        let (g, _) = build_mapped(&log_doc(
+            &[("i", "y>x")],
+            Some([0.1, 1000.0]),
+            Some([0.1, 1000.0]),
+        ));
+        assert_eq!(g.fields.len(), 1);
+        assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
+        // 1D and 3D ignore the scales.
+        let mut d3 = log_doc(&[("e", "y=x")], Some([0.1, 1000.0]), None);
+        d3.view.mode = math_core::doc::Mode::D3;
+        assert!(build(&d3, Mode::D3).diagnostics.is_empty());
+    }
+
+    #[test]
+    fn polar_grid_draws_circles_spokes_and_angle_labels() {
+        let mut d = Doc::new_default();
+        d.view.grid_kind = math_core::doc::GridKind::Polar;
+        let g = build(&d, Mode::D2);
+        let rect = build(&Doc::new_default(), Mode::D2);
+        assert!(
+            g.segments.len() > rect.segments.len(),
+            "circles are many chords"
+        );
+        // Every grid chord of a major circle lies at a multiple of the step (2) from the origin.
+        let major = Theme::light().grid_major;
+        let radii: Vec<f64> = g
+            .segments
+            .iter()
+            .filter(|s| s.color == major && s.p0 != s.p1)
+            .map(|s| (s.p0[0] as f64).hypot(s.p0[1] as f64))
+            .collect();
+        for r in [2.0, 4.0, 6.0] {
+            assert!(radii.iter().any(|v| (v - r).abs() < 1e-3), "circle r = {r}");
+        }
+        let angles: Vec<&str> = g
+            .labels
+            .iter()
+            .filter(|l| l.axis == POLAR_LABEL_AXIS)
+            .map(|l| l.text.as_str())
+            .collect();
+        for t in [
+            "\u{3c0}/6",
+            "\u{3c0}/3",
+            "2\u{3c0}/3",
+            "5\u{3c0}/6",
+            "7\u{3c0}/6",
+            "11\u{3c0}/6",
+        ] {
+            assert!(angles.contains(&t), "{t} missing from {angles:?}");
+        }
+        // Axis numbers are distances: positive on both sides.
+        assert!(g
+            .labels
+            .iter()
+            .any(|l| l.axis == 0 && l.pos[0] < 0.0 && l.text == "4"));
+        assert!(!g
+            .labels
+            .iter()
+            .any(|l| l.axis < 2 && l.text.starts_with('-')));
+        // Degrees label the spokes in degrees.
+        d.view.angle = AngleMode::Deg;
+        let g = build(&d, Mode::D2);
+        assert!(g
+            .labels
+            .iter()
+            .any(|l| l.axis == POLAR_LABEL_AXIS && l.text == "120\u{b0}"));
+        // Minor gridlines become minor circles; no minor gridlines drop them.
+        let mut plain = d.clone();
+        plain.view.minor_grid = false;
+        assert!(build(&plain, Mode::D2).segments.len() < g.segments.len());
+        // Far from the origin only the visible arcs are emitted.
+        let far = build_scene(
+            &d,
+            Mode::D2,
+            Window3::new([90.0, 90.0, -1.0], [110.0, 110.0, 1.0]),
+            [100.0, 100.0, 0.0],
+            (800, 600),
+            &Theme::light(),
+        );
+        assert!(far.segments.len() < 5000 && far.segments.len() > 10);
+        // 3D keeps its rectangular grid.
+        assert_eq!(
+            build(&d, Mode::D3).segments.len(),
+            build(&Doc::new_default(), Mode::D3).segments.len()
+        );
+    }
     #[test]
     fn dashed_off_screen_runs_are_bounded() {
         // A parametric curve that leaves the window by far still builds quickly.
