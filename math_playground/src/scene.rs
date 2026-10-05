@@ -945,8 +945,8 @@ impl<'a> Builder<'a> {
                 continue;
             };
             self.seg([a[0], a[1], 0.0], [b[0], b[1], 0.0], MAJOR_W, major_c);
-            // The axes carry their own numbers; the other spokes get their angle.
-            if !labels || j % 3 == 0 {
+            // Every spoke but 0 (the positive x axis) is labelled with its angle.
+            if !labels || j == 0 {
                 continue;
             }
             let p = [
@@ -4824,6 +4824,8 @@ mod tests {
         for t in [
             "\u{3c0}/6",
             "\u{3c0}/3",
+            "\u{3c0}/2",
+            "\u{3c0}",
             "2\u{3c0}/3",
             "5\u{3c0}/6",
             "7\u{3c0}/6",
