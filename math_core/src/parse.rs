@@ -263,6 +263,9 @@ fn transform(chars: &[char], i: &mut usize, _nested: bool) -> Result<String, Par
                     "ne" | "neq" => {
                         return Err(ParseError::new(*i, "'\u{2260}' (not equal) is not supported; use <, <=, > or >="))
                     }
+                    // MathLive writes a typed `[` and `]` as these (lists: `[(1,2),(3,4)]`).
+                    "lbrack" => out.push('['),
+                    "rbrack" => out.push(']'),
                     "lt" => out.push('<'),
                     "gt" => out.push('>'),
                     "cdot" | "times" => out.push('*'),
@@ -1419,6 +1422,14 @@ mod tests {
         let a = parse(latex).unwrap_or_else(|e| panic!("latex {latex:?}: {e}"));
         let b = parse(text).unwrap_or_else(|e| panic!("text {text:?}: {e}"));
         assert_eq!(a, b, "{latex:?} vs {text:?}");
+    }
+
+    #[test]
+    fn mathlive_square_brackets_are_lists() {
+        // MathLive writes a typed `[` / `]` as \lbrack / \rbrack
+        same(r"\lbrack(1,2),(3,4)\rbrack", "[(1,2),(3,4)]");
+        same(r"\lbrack1,2,3\rbrack", "[1,2,3]");
+        same(r"x\lbrack2\rbrack", "x[2]");
     }
 
     #[test]
