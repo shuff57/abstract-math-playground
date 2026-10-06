@@ -23,7 +23,9 @@ pub enum Kind {
     /// where every part holds, i.e. where `f < 0`, and `f = 0` traces exactly the region's
     /// edge, so the existing fill and boundary pipeline draws it unchanged.
     Inequality { rel: Rel, f: Expr },
-    /// A tuple that depends on `t`, such as `(cos(t), sin(t))`.
+    /// A tuple that depends on `t`, such as `(cos(t), sin(t))`: a parametric curve. A tuple of
+    /// three that uses both `u` and `v` (and no `t`), such as `(cos(u), sin(u), v)`, is a
+    /// parametric SURFACE: see [`Kind::is_param_surface`].
     Parametric { components: Vec<Expr> },
     /// A constant tuple such as `(1, 2)` or `(1, 2, 3)`.
     Point { components: Vec<Expr> },
@@ -49,6 +51,23 @@ pub struct Analysis {
     pub slider_candidates: BTreeSet<String>,
     /// Which of x, y, z appear.
     pub dims: [bool; 3],
+    /// The ranges of a trailing `{a<=t<=b, ...}` (see [`crate::param`]); empty without one.
+    pub domain: Vec<crate::param::Range>,
+}
+
+impl Kind {
+    /// A parametric tuple of three in `u` and `v` (no `t`): `(x(u,v), y(u,v), z(u,v))`.
+    pub fn is_param_surface(&self) -> bool {
+        match self {
+            Kind::Parametric { components } => is_surface_tuple(components),
+            _ => false,
+        }
+    }
+}
+
+fn is_surface_tuple(items: &[Expr]) -> bool {
+    let uses = |v: &str| items.iter().any(|i| i.contains_var(v));
+    items.len() == 3 && !uses("t") && uses("u") && uses("v")
 }
 
 pub const SPATIAL: [&str; 3] = ["x", "y", "z"];
@@ -69,8 +88,9 @@ fn single_var(e: &Expr) -> Option<&str> {
 /// `defined` are names (variables or functions) defined elsewhere in the document.
 pub fn analyze(e: &Expr, defined: &BTreeSet<String>) -> Analysis {
     let free = e.free_vars();
-    let dims = [e.contains_var("x"), e.contains_var("y"), e.contains_var("z")];
-    let kind = classify(e);
+    let (body, domain) = crate::param::unwrap_domain(e);
+    let dims = [body.contains_var("x"), body.contains_var("y"), body.contains_var("z")];
+    let kind = classify(body);
     let own: BTreeSet<String> = match &kind {
         Kind::Definition { name, params, .. } => {
             let mut s: BTreeSet<String> = params.iter().cloned().collect();
@@ -79,12 +99,15 @@ pub fn analyze(e: &Expr, defined: &BTreeSet<String>) -> Analysis {
         }
         _ => BTreeSet::new(),
     };
+    // `u` and `v` are the surface parameters of a parametric surface, never sliders.
+    let surface = kind.is_param_surface();
     let slider_candidates = free
         .iter()
+        .filter(|n| !(surface && (*n == "u" || *n == "v")))
         .filter(|n| !RESERVED.contains(&n.as_str()) && !defined.contains(*n) && !own.contains(*n))
         .cloned()
         .collect();
-    Analysis { kind, free, slider_candidates, dims }
+    Analysis { kind, free, slider_candidates, dims, domain }
 }
 
 fn classify(e: &Expr) -> Kind {
@@ -120,7 +143,7 @@ fn classify(e: &Expr) -> Kind {
         }
         Expr::Tuple(items) => {
             let uses = |v: &str| items.iter().any(|i| i.contains_var(v));
-            if uses("t") {
+            if uses("t") || is_surface_tuple(items) {
                 Kind::Parametric { components: items.clone() }
             } else if (1..=3).contains(&items.len())
                 && SPATIAL.iter().any(|v| uses(v))
@@ -301,6 +324,38 @@ mod tests {
         assert!(matches!(kind("y=normalpdf(x,0,1)"), Kind::ExplicitY { .. }));
         assert!(matches!(kind("y=tcdf(-10,x,5)"), Kind::ExplicitY { .. }));
         assert!(matches!(kind("normalpdf(x,0,1)"), Kind::Field { .. }));
+    }
+
+    #[test]
+    fn classifies_ranges_pairs_and_surfaces() {
+        let a = analyze(&parse("(t^2, 2t) {-3<=t<=3}").unwrap(), &BTreeSet::new());
+        assert!(matches!(a.kind, Kind::Parametric { ref components } if components.len() == 2));
+        assert_eq!(a.domain.len(), 1);
+        assert_eq!(a.domain[0].var, "t");
+        assert!(a.slider_candidates.is_empty());
+        // a slider in a bound is a slider candidate
+        let a = analyze(&parse("(cos(t), sin(t)) {0<=t<=a}").unwrap(), &BTreeSet::new());
+        assert_eq!(a.slider_candidates.iter().collect::<Vec<_>>(), vec!["a"]);
+        // polar with a range
+        let a = analyze(&parse("r=theta {0<=theta<=6pi}").unwrap(), &BTreeSet::new());
+        assert!(matches!(a.kind, Kind::Polar { .. }) && a.domain[0].var == "theta");
+        // pair in one item is the tuple of the right sides, any order, 2D or 3D
+        assert_eq!(parse("x=3cos(t), y=2sin(t)").unwrap(), parse("(3cos(t), 2sin(t))").unwrap());
+        assert_eq!(parse("y=2sin(t); x=3cos(t)").unwrap(), parse("(3cos(t), 2sin(t))").unwrap());
+        assert_eq!(parse("x=cos(t), y=sin(t), z=t/4").unwrap(), parse("(cos(t), sin(t), t/4)").unwrap());
+        assert!(matches!(kind("x=cos(t), y=sin(t) {0<=t<=pi}"), Kind::Parametric { .. }));
+        // not a pair: a repeated axis, an axis on the right, or just a stray comma
+        assert!(parse("x=1, x=2").is_err());
+        assert!(parse("x=y, y=2").is_err());
+        assert!(parse("y=2x, 3").is_err());
+        // surfaces
+        let a = analyze(&parse("(3cos(u)cos(v), 3cos(u)sin(v), 3sin(u))").unwrap(), &BTreeSet::new());
+        assert!(a.kind.is_param_surface() && a.slider_candidates.is_empty());
+        assert!(!kind("(cos(t), sin(t), t)").is_param_surface());
+        assert!(!kind("(u, 2)").is_param_surface() && matches!(kind("(u, 2)"), Kind::Point { .. }));
+        let a = analyze(&parse("(a u, v, 0) {0<=u<=1, 0<=v<=1}").unwrap(), &BTreeSet::new());
+        assert!(a.kind.is_param_surface() && a.domain.len() == 2);
+        assert_eq!(a.slider_candidates.iter().collect::<Vec<_>>(), vec!["a"]);
     }
 
     #[test]

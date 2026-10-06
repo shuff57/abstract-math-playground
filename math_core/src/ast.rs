@@ -58,6 +58,10 @@ pub const BUILTIN_FUNCS: &[&str] = &[
 /// function name, so the lexer never produces it from user text.
 pub const CHAIN_FN: &str = "and";
 
+/// The name of the call a trailing range restriction desugars to: `domain(body, clause, ...)`
+/// for `body {a<=t<=b, ...}` (see [`crate::param`]). Not a builtin function name.
+pub const DOMAIN_FN: &str = "domain";
+
 /// The comparisons of a chained-comparison node, if `e` is one.
 pub fn rel_chain(e: &Expr) -> Option<&[Expr]> {
     match e {

@@ -30,6 +30,21 @@ A plain list of what does not work yet or has not been checked. Items marked "fr
 - **Symbolic differentiation has gaps.** A term that cannot be differentiated becomes NaN or an error ("cannot differentiate ..."). Which functions are covered is defined in `calculus.rs`; this has not been listed here.
 - **Regression** supports one dependent list and the fit methods described in `regress.rs` (linear least squares, Levenberg-Marquardt). Other fit types, weights, and residual plots beyond ticks are not built.
 
+## Meshing and degenerate shapes
+
+- **Touches of higher order or without curvature are only found when lucky.** The degenerate-shape search (a damped Newton minimiser plus the zero set of `w . grad F`, see `mesh_touch.rs`, `mesh_contour.rs`, `mesh_surface.rs`) needs `F` to touch zero like a square. `x^4+y^4=0` converges slowly and may draw nothing, and a non-smooth touch such as `abs(x)+abs(y)=0` is drawn only when the minimum falls on a grid corner. Dimension mixes beyond a point, a line and a surface (a double curve in 3D that is not a line quadric, found by tracing, can lose a branch at a crossing) are not covered.
+- **A point or line quadric is drawn thicker than it is.** The ball and the tube have a fixed size of about 0.8 / 0.4 grid cells, so they are visible; they are not to scale when zoomed far in.
+- **Poles and jumps in implicit surfaces cost a ragged cell.** The break is decided on a grid edge (a function value that does not shrink with the bracket), so the cut edge is up to one cell off the true discontinuity. Explicit graphs `z=f(x,y)` break exactly (interval enclosure for poles, a jump test for steps). A steep but continuous cliff (a very sharp sigmoid) can be mistaken for a jump and shown as a gap.
+- **Implicit surfaces that end on a domain edge** (`sqrt`, `ln`, ...) still have a ragged rim of up to one cell, because a cell with an undefined corner is skipped. Only explicit height fields are trimmed to the exact edge.
+- **A height field is one value per grid point.** A surface that folds back over itself in `z` (a graph cannot) is not what `z=f(x,y)` means anyway; thin features narrower than a cell (a sharp ridge) are smoothed, where the old implicit search would have kept them at cell resolution. Steep quads are refined (up to 8x), not everything.
+
+## Parametric forms
+
+- **Slices ignore parametric ranges.** The slice overlay (`slice_draw.rs`) finds where a parametric or polar curve crosses the slice plane over the default parameter span, not over a `{a<=t<=b}` range, and parametric surfaces are not cut by a slice plane at all.
+- **Parametric surface sampling is a uniform grid.** The resolution is chosen from the surface size in the window (96 to 640 cells per direction, about 180,000 vertices at most) but is not adaptive per region, so a very fast-varying surface can still alias, and an asymptote is only caught by the long-edge guard.
+- **A full `[0, 2pi]` range may cover a surface twice** (the sphere formula does), which draws two coincident sheets with opposite normals; write the range to cover it once.
+- **No intersection curves of two surfaces and no volume fills** (also in the 3D list above).
+
 ## Slices and modes
 
 - Slices exist for 3D (plane or line) and 2D (line). There is no slice for a 1D document.

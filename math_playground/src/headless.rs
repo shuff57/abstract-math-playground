@@ -150,6 +150,51 @@ mod tests {
     }
 
     #[test]
+    fn a_still_scene_uploads_once_and_draws_the_same() {
+        let mut gpu = match Headless::new() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED a_still_scene_uploads_once_and_draws_the_same: no GPU adapter ({e})");
+                return;
+            }
+        };
+        let size = (320u32, 240u32);
+        let theme = Theme::light();
+        let mut doc = Doc::new_default();
+        doc.add_item(Item::new("a", ItemKind::Equation, "x^2+y^2+z^2=9")).unwrap();
+        doc.add_item(Item::new("b", ItemKind::Equation, "y=x")).unwrap();
+        let mut rig = Rig::new(Window3::new([-6.0; 3], [6.0; 3]), Mode::D3);
+        rig.set_aspect(size.0 as f64 / size.1 as f64);
+        let g = build_scene(&doc, Mode::D3, rig.window(), rig.render_origin(), size, &theme);
+        let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin(), lift: 1.0 }];
+        let first = gpu.render_rgba(size, &rig, &layers, theme.background);
+        let uploads = gpu.renderer.geo_uploads();
+        assert_eq!(uploads, 1);
+        for _ in 0..5 {
+            // A different opacity / lift is only a uniform: still no upload, and it draws.
+            let l2 = [Layer { geometry: &g, fade: 0.5, origin: rig.render_origin(), lift: 0.5 }];
+            let _ = gpu.render_rgba(size, &rig, &l2, theme.background);
+        }
+        let again = gpu.render_rgba(size, &rig, &layers, theme.background);
+        assert_eq!(gpu.renderer.geo_uploads(), uploads, "geometry was re-uploaded");
+        assert_eq!(first, again, "a cached draw differs from the first one");
+        // A rebuilt scene (new content) is uploaded and shows the new picture.
+        let mut doc2 = Doc::new_default();
+        doc2.add_item(Item::new("a", ItemKind::Equation, "x^2+y^2+z^2=16")).unwrap();
+        let g2 = build_scene(&doc2, Mode::D3, rig.window(), rig.render_origin(), size, &theme);
+        let l3 = [Layer { geometry: &g2, fade: 1.0, origin: rig.render_origin(), lift: 1.0 }];
+        let other = gpu.render_rgba(size, &rig, &l3, theme.background);
+        assert_eq!(gpu.renderer.geo_uploads(), uploads + 1);
+        assert_ne!(first, other);
+        // Turning the cache off restores per-frame uploads (the measurement hook).
+        gpu.renderer.cache_geometry = false;
+        let n = gpu.renderer.geo_uploads();
+        let _ = gpu.render_rgba(size, &rig, &layers, theme.background);
+        let _ = gpu.render_rgba(size, &rig, &layers, theme.background);
+        assert_eq!(gpu.renderer.geo_uploads(), n + 2);
+    }
+
+    #[test]
     fn inequality_fill_renders_on_gpu() {
         let mut gpu = match Headless::new() {
             Ok(g) => g,

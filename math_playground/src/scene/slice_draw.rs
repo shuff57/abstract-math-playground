@@ -823,7 +823,18 @@ pub fn build_panel(
         angle,
         pdefs: ctx.pdefs.clone(),
         sliders,
-        ext: Default::default(),
+        // The inset follows the print weight like the main scene (lines, grid and point sizes).
+        ext: {
+            let (lm, gm, pm) = weight_mul(doc.view.weight);
+            let scale = RENDER_SCALE.get();
+            BuildExt {
+                line_mul: lm * scale,
+                grid_mul: gm * scale,
+                point_mul: pm * scale,
+                scale,
+                ..Default::default()
+            }
+        },
     };
     // y of a free-axis value `v` in panel coordinates.
     let ys = |v: f64| if two_d { v } else { (v - vc) * k };
@@ -866,7 +877,7 @@ pub fn build_panel(
         }
         for it in items {
             for p in &it.points {
-                b.halo_dot([p[free[0]], p[free[1]], 0.0], it.color, 8.0);
+                b.halo_dot([p[free[0]], p[free[1]], 0.0], it.color, b.point_px(8.0));
             }
         }
     } else {
@@ -899,12 +910,12 @@ pub fn build_panel(
         }
         for (it, roots) in items.iter().zip(&geo.roots) {
             for r in roots {
-                b.halo_dot([*r, ys(0.0), 0.0], it.color, 8.0);
+                b.halo_dot([*r, ys(0.0), 0.0], it.color, b.point_px(8.0));
             }
         }
         for it in items {
             for p in &it.points {
-                b.halo_dot([p[u], ys(0.0), 0.0], it.color, 8.0);
+                b.halo_dot([p[u], ys(0.0), 0.0], it.color, b.point_px(8.0));
             }
         }
     }
@@ -1078,9 +1089,9 @@ fn panel_axes(
                     (MINOR_W, minor_c)
                 };
                 if axis == 0 {
-                    b.seg([val, y0, 0.0], [val, y1, 0.0], w, c);
+                    b.gseg([val, y0, 0.0], [val, y1, 0.0], w, c);
                 } else {
-                    b.seg([u0, sy(val), 0.0], [u1, sy(val), 0.0], w, c);
+                    b.gseg([u0, sy(val), 0.0], [u1, sy(val), 0.0], w, c);
                 }
             }
         }
@@ -1471,6 +1482,27 @@ mod tests {
         assert!(p.geometry.labels.iter().any(|l| l.text == "1"));
         // An opaque background quad so it reads over the 3D scene.
         assert_eq!(p.geometry.flat_indices.len(), 6);
+    }
+
+    #[test]
+    fn panel_follows_the_print_weight() {
+        let mut d = doc_with(&["x^2+y^2+z^2=4"], "z=1", Mode::D3);
+        let ring = |d: &Doc, m: f32| {
+            let out = build_slice_panel(d, Mode::D3, win(), (900, 600), &Theme::light())
+                .unwrap()
+                .unwrap();
+            let ws: Vec<f32> = out.panel.geometry.segments.iter().map(|s| s.width).collect();
+            (ws.iter().filter(|w| (**w - INSET_CURVE_W * m).abs() < 1e-4).count(), ws)
+        };
+        let (n1, w1) = ring(&d, 1.0);
+        assert!(n1 > 200);
+        d.view.weight = math_core::doc::Weight::Extra;
+        let (n2, w2) = ring(&d, 2.2);
+        assert_eq!(n1, n2, "the ring is drawn at the line multiplier");
+        assert!(w2.iter().any(|w| (*w - MINOR_W * 1.5).abs() < 1e-4), "grid uses the gentle one");
+        assert!(w2.iter().any(|w| (*w - AXIS_W * 2.2).abs() < 1e-4), "axes: full multiplier");
+        assert!(!w2.iter().any(|w| (*w - INSET_CURVE_W).abs() < 1e-4), "no unweighted curve");
+        assert!(w1.iter().any(|w| (*w - MINOR_W).abs() < 1e-4));
     }
 
     #[test]

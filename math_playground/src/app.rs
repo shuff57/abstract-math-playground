@@ -4,18 +4,23 @@
 //! front ends cannot drift apart. No GPU or window types here; fully unit-testable.
 
 use crate::geometry::{ItemInfo, SceneGeometry, Theme};
-use crate::render::{crossfade, layer_lift, Inset, Layer};
+use crate::render::{layer_lift, mode_fades, Inset, Layer, ModeFades};
 use crate::axis_map::AxisMap;
 use crate::scene::{
-    build_scene_mapped, build_scene_preview_mapped, build_slice_panel_view, label_box_inside,
+    build_scene_capped_mapped, build_scene_mapped, build_scene_progressive_mapped,
+    build_slice_panel_view, clear_surface_tiles, full_surface_depth, label_box_inside,
+    FIRST_PREVIEW_DEPTH,
     point_handles, CoordSrc, PointHandle, SlicePanel, ViewReq,
 };
 use math_core::actions;
 use math_core::doc::{self, AngleMode, Doc, Item, ItemKind, SliderCfg, TickerCfg};
 use math_core::table::{Column, Table, TableStyle};
-use math_core::view::{Mode, Rig, Window3};
+use math_core::view::{Mode, Rig, Window3, MAX_FRAME_DT_MS};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+#[path = "curve_grab.rs"]
+mod curve_grab;
 
 /// After the last input, wait this long before rebuilding an expensive scene.
 const IDLE_REBUILD_MS: f64 = 100.0;
@@ -25,6 +30,13 @@ pub const MAX_TICKER_STEPS_PER_FRAME: usize = 4;
 
 /// Scenes that build faster than this rebuild on every input (cheap 2D scenes track live).
 const CHEAP_BUILD_MS: f64 = 10.0;
+/// Milliseconds per frame the staged refinement of a 3D scene may spend meshing: while a switch
+/// or the user's input is running, and when the app is idle.
+const REFINE_BUDGET_BUSY_MS: f64 = 3.0;
+const REFINE_BUDGET_MS: f64 = 5.0;
+const REFINE_BUDGET_IDLE_MS: f64 = 9.0;
+/// A refined surface mesh replaces the coarser one over this long (see [`App::layers`]).
+const SWAP_BLEND_MS: f64 = 160.0;
 /// Two presses on the inset within this time and distance are a double-click (reset view).
 const DOUBLE_CLICK_MS: f64 = 400.0;
 const DOUBLE_CLICK_PX: f64 = 8.0;
@@ -119,6 +131,16 @@ pub enum Command {
         x_scale: Option<doc::AxisScale>,
         #[serde(default, rename = "yScale", alias = "y_scale")]
         y_scale: Option<doc::AxisScale>,
+        /// `"normal"`, `"bold"` or `"extra"` print weight (thicker lines and bigger points).
+        /// Any other value is rejected with an `error` and nothing changes.
+        #[serde(default)]
+        weight: Option<doc::Weight>,
+    },
+    /// Transient pixel scale of the drawn widths for an export rendered at a larger canvas size
+    /// (`scale` 2 draws lines twice as wide in pixels, so they keep their look). Not saved in
+    /// the document or the share link; 1 (the default) is the on-screen look.
+    SetRenderScale {
+        scale: f64,
     },
     SetSlider {
         name: String,
@@ -135,6 +157,12 @@ pub enum Command {
     },
     SetOrtho {
         ortho: bool,
+    },
+    /// Measurement hook: `on` restores the behaviour of mode switches from before the staged
+    /// refinement (blocking depth-5 preview and full rebuild, no frame clamp, no blend, plain
+    /// crossfade, no 2D split). Only for before/after timing; never set by the shells.
+    SetLegacyTransition {
+        on: bool,
     },
     /// Reduced motion (the user's `prefers-reduced-motion`): mode switches and the ortho toggle
     /// jump straight to the end instead of animating.
@@ -160,6 +188,15 @@ pub enum Command {
         #[serde(default)]
         shift: bool,
     },
+    /// A click (a press and release without a drag) at canvas pixel `(x, y)`: selects the curve
+    /// there, or nothing. See the `analysis` event.
+    Pick {
+        x: f64,
+        y: f64,
+    },
+    /// Abandons a curve drag in progress (the shell's Escape): the dragged parameters go back to
+    /// their values at the press. Does nothing when no curve is being dragged.
+    CancelDrag,
     Wheel {
         x: f64,
         y: f64,
@@ -305,6 +342,8 @@ pub struct ScreenLabel {
     pub x: f64,
     pub y: f64,
     pub visible: bool,
+    /// Opacity in [0, 1]: below 1 only while a mode switch fades the label in or out.
+    pub alpha: f64,
     /// True for a label of the slice inset (its `x`/`y` are already offset into the canvas);
     /// axis 0/1 are its tick labels and axis names, 3 is reserved for a title.
     #[serde(default)]
@@ -312,6 +351,25 @@ pub struct ScreenLabel {
     /// Rectangle `[x, y, w, h]` the label must stay inside (the inset's, for inset labels).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clip: Option<[f64; 4]>,
+}
+
+/// A curve parameter and its value (see [`Event::CurveDrag`]).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ParamValue {
+    pub name: String,
+    pub value: f64,
+}
+
+/// One special point of the selected curve.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AnalysisPoint {
+    /// `root`, `y-intercept`, `minimum`, `maximum` or `inflection`.
+    pub kind: &'static str,
+    pub x: f64,
+    pub y: f64,
+    /// The point on the canvas in pixels from the top-left.
+    pub px: f64,
+    pub py: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -358,6 +416,7 @@ pub enum Event {
         x_scale: doc::AxisScale,
         #[serde(rename = "yScale")]
         y_scale: doc::AxisScale,
+        weight: doc::Weight,
     },
     /// Tick labels for the current scene in world coordinates, for a text overlay to project.
     Labels {
@@ -375,6 +434,39 @@ pub enum Event {
         columns: Vec<Column>,
         rows: usize,
         style: String,
+    },
+    /// The pointer is over a curve `y = f(x)` (2D only): `item` is its id and `(x, y)` the point of
+    /// the curve nearest the pointer in world coordinates; `px`/`py` is that point on the canvas in
+    /// pixels from the top-left. `item` is null (and the numbers 0) when the pointer left every
+    /// curve. Sent only when the result changes.
+    Hover {
+        item: Option<String>,
+        x: f64,
+        y: f64,
+        px: f64,
+        py: f64,
+        /// The parameters a drag of this curve would change (names of sliders or numeric
+        /// definitions in its equation): non-empty only when the curve is the selected one and
+        /// has any, i.e. when a press here would drag it instead of panning.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        params: Vec<String>,
+    },
+    /// A curve drag started, moved or ended. `params` holds the dragged parameters' current
+    /// values; `(px, py)` is the pointer on the canvas. `active` is false on the last event of
+    /// the drag, with `cancelled` true when the values were restored.
+    CurveDrag {
+        item: String,
+        params: Vec<ParamValue>,
+        active: bool,
+        cancelled: bool,
+        px: f64,
+        py: f64,
+    },
+    /// The special points of the selected curve over the visible window (an empty list and a null
+    /// `item` when nothing is selected). Sent when the selection or the points change.
+    Analysis {
+        item: Option<String>,
+        points: Vec<AnalysisPoint>,
     },
     /// A drag rewrote an item's text (a point `(a, b)` or a definition `a=3`): the shell should
     /// put `latex` into that item's input.
@@ -424,6 +516,51 @@ struct Built {
     geometry: SceneGeometry,
     origin: [f64; 3],
     mode: Mode,
+    /// A flat (1D/2D) scene during a switch with 3D, split into its backdrop (grid, axes) and
+    /// its items (curves, regions), which fade on different schedules (see [`mode_fades`]).
+    parts: Option<Box<(SceneGeometry, SceneGeometry)>>,
+}
+
+/// `g` split at its backdrop: (grid and axes, everything else).
+fn split_flat(g: &SceneGeometry) -> (SceneGeometry, SceneGeometry) {
+    let n = g.backdrop_segments.min(g.segments.len());
+    let backdrop = SceneGeometry { segments: g.segments[..n].to_vec(), ..SceneGeometry::default() };
+    let items = SceneGeometry {
+        fields: g.fields.clone(),
+        segments: g.segments[n..].to_vec(),
+        overlay_segments: g.overlay_segments.clone(),
+        vertices: g.vertices.clone(),
+        indices: g.indices.clone(),
+        flat_indices: g.flat_indices.clone(),
+        ..SceneGeometry::default()
+    };
+    (backdrop, items)
+}
+
+/// A refined 3D scene is blending in over the coarser one it replaced.
+struct Swap {
+    old: Built,
+    start_ms: f64,
+}
+
+/// Octree depths a 3D scene's surfaces are built at, in order: a first look ([`FIRST_PREVIEW_DEPTH`],
+/// cheap enough to build between a click and the first moving frame), a middle one, then full
+/// quality. Returns the depth after `cap`, or `None` when `cap` is already `full`.
+pub fn next_refine_depth(cap: u32, full: u32) -> Option<u32> {
+    const MID: u32 = 5;
+    if cap >= full {
+        None
+    } else if cap < MID && MID < full {
+        Some(MID)
+    } else {
+        Some(full)
+    }
+}
+
+/// Smoothstep of how far a swap has progressed (`elapsed` ms into `SWAP_BLEND_MS`).
+pub fn swap_blend(elapsed_ms: f64) -> f32 {
+    let t = if elapsed_ms.is_finite() { (elapsed_ms / SWAP_BLEND_MS).clamp(0.0, 1.0) } else { 1.0 } as f32;
+    t * t * (3.0 - 2.0 * t)
 }
 
 struct Drag {
@@ -432,6 +569,8 @@ struct Drag {
     last: (f64, f64),
     /// Set when the press grabbed a point item: the move edits it instead of panning.
     point: Option<PointGrab>,
+    /// Set when the press grabbed the selected curve: the move changes its parameters.
+    curve: Option<curve_grab::CurveGrab>,
 }
 
 struct PointGrab {
@@ -442,6 +581,9 @@ struct PointGrab {
 
 /// Pointer distance (px) within which a press grabs a point.
 const GRAB_PX: f64 = 14.0;
+
+/// Pointer distance (px) within which a hover finds a curve.
+const HOVER_PX: f64 = 10.0;
 
 /// Formats `v` with `decimals` places, trailing zeros trimmed.
 fn fmt_coord(v: f64, decimals: usize) -> String {
@@ -484,6 +626,22 @@ pub struct App {
     infos: Vec<ItemInfo>,
     colors: Vec<ItemColor>,
     outbox: Vec<Event>,
+    /// Compiled `y = f(x)` curves for hover, with the `build_rev` they were made for.
+    hover_curves: Option<(u64, Vec<crate::scene::ExplicitCurve>)>,
+    /// Implicit, polar and parametric curves for hit-testing, with their polylines (display
+    /// coordinates) once a hover needed them.
+    hover_shapes: Option<(u64, Vec<(crate::scene::ShapeCurve, Option<Vec<Vec<[f64; 2]>>>)>)>,
+    /// Counts rebuilds; a hover cache older than this is stale.
+    build_rev: u64,
+    /// The curve a click selected (its item id), whose special points are sent as `analysis`.
+    selected: Option<String>,
+    /// The last `analysis` sent, to send changes only.
+    last_analysis: Option<(Option<String>, Vec<AnalysisPoint>)>,
+    /// The last hover result sent (item and rounded pixel), to send changes only.
+    last_hover: Option<(String, i64, i64, bool)>,
+    /// The parameter names a drag of the selected curve would change, for the document revision
+    /// and item they were worked out for.
+    grab_probe: Option<(u64, String, Vec<String>)>,
     ticker_running: bool,
     /// Time accumulated towards the next ticker step.
     ticker_acc_ms: f64,
@@ -507,6 +665,16 @@ pub struct App {
     /// The current scene is a preview (coarser surfaces, built so a mode switch starts moving
     /// at once); it is rebuilt at full quality when the switch has finished.
     refine: bool,
+    /// Longest time one frame advances a mode-switch tween (see [`Rig::max_frame_dt_ms`]).
+    pub max_frame_dt_ms: f64,
+    /// Surface depth the staged refinement is working towards next (valid while `refine`).
+    refine_cap: u32,
+    /// Meshing time spent on the running refinement, ms (it becomes `last_build_ms`).
+    refine_ms: f64,
+    /// A refined scene blending in over the one it replaced.
+    swap: Option<Swap>,
+    /// `setLegacyTransition` (measurement only).
+    legacy_transition: bool,
     /// `setReducedMotion`; kept here because loading a document replaces the rig.
     reduced_motion: bool,
     /// World -> display map of logarithmic 2D axes: the rig's window is in display coordinates
@@ -515,6 +683,8 @@ pub struct App {
     /// The world window before the axes became logarithmic, so switching back to linear
     /// restores the exact previous view.
     log_entry: Option<doc::WindowBox>,
+    /// Transient pixel scale of drawn widths (export at a larger size); never saved.
+    render_scale: f32,
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -556,7 +726,9 @@ impl App {
         let w = doc.view.window.clone();
         let mut rig = Rig::new(Window3::new(w.min, w.max), view_mode(doc.view.mode));
         rig.set_aspect(size.0 as f64 / size.1.max(1) as f64);
+        rig.max_frame_dt_ms = MAX_FRAME_DT_MS;
         let mut app = App {
+            max_frame_dt_ms: MAX_FRAME_DT_MS,
             doc,
             rig,
             theme: Theme::light(),
@@ -573,6 +745,13 @@ impl App {
             infos: Vec::new(),
             colors: Vec::new(),
             outbox: Vec::new(),
+            hover_curves: None,
+            hover_shapes: None,
+            selected: None,
+            last_analysis: None,
+            build_rev: 0,
+            last_hover: None,
+            grab_probe: None,
             ticker_running: false,
             ticker_acc_ms: 0.0,
             ticker_last_ms: None,
@@ -585,9 +764,14 @@ impl App {
             panel_dirty: false,
             last_panel_ms: 0.0,
             refine: false,
+            refine_cap: 0,
+            refine_ms: 0.0,
+            swap: None,
+            legacy_transition: false,
             reduced_motion: false,
             map: AxisMap::LINEAR,
             log_entry: None,
+            render_scale: 1.0,
         };
         app.rebuild();
         app
@@ -779,6 +963,7 @@ impl App {
                 grid_kind,
                 x_scale,
                 y_scale,
+                weight,
             } => {
                 if let Some(w) = &window {
                     if let Err(m) = w.validate() {
@@ -833,6 +1018,7 @@ impl App {
                 v.x_step = step(x_step, v.x_step);
                 v.y_step = step(y_step, v.y_step);
                 v.grid_kind = grid_kind.unwrap_or(v.grid_kind);
+                v.weight = weight.unwrap_or(v.weight);
                 if scales_change || window.is_some() {
                     let was_linear =
                         self.doc.view.x_scale.is_linear() && self.doc.view.y_scale.is_linear();
@@ -856,6 +1042,19 @@ impl App {
                     }
                 }
                 self.mark_doc_changed();
+            }
+            Command::SetRenderScale { scale } => {
+                let scale = if scale.is_finite() && scale > 0.0 {
+                    scale.min(8.0) as f32
+                } else {
+                    1.0
+                };
+                if scale != self.render_scale {
+                    self.render_scale = scale;
+                    self.dirty = true;
+                    self.redraw = true;
+                    self.rebuild();
+                }
             }
             Command::SetColor { id, color } => {
                 if let Some(i) = self.doc.items.iter_mut().find(|i| i.id == id) {
@@ -904,6 +1103,11 @@ impl App {
                 self.rig.set_ortho3(ortho, self.now_ms);
                 self.touch_input();
             }
+            Command::SetLegacyTransition { on } => {
+                self.legacy_transition = on;
+                self.max_frame_dt_ms = if on { f64::INFINITY } else { MAX_FRAME_DT_MS };
+                self.rig.max_frame_dt_ms = self.max_frame_dt_ms;
+            }
             Command::SetReducedMotion { on } => {
                 self.reduced_motion = on;
                 self.rig.reduced_motion = on;
@@ -926,7 +1130,13 @@ impl App {
                 self.rig.set_aspect(self.size.0 as f64 / self.size.1 as f64);
                 self.dirty = true;
                 self.touch_input();
-                self.rebuild();
+                // A resize right after a mode switch (the layout changes with the mode) must not
+                // block on the full 3D build: it restarts the staged refinement instead.
+                let staged = !self.legacy_transition
+                    && (self.rig.is_animating()
+                        || self.refine
+                        || (self.rig.mode() == Mode::D3 && self.last_build_ms >= CHEAP_BUILD_MS));
+                self.rebuild_with(staged);
             }
             Command::Pointer {
                 phase,
@@ -935,6 +1145,8 @@ impl App {
                 button,
                 shift,
             } => self.pointer(&phase, x, y, button.clamp(0, 255) as u8, shift, vp),
+            Command::Pick { x, y } => self.pick(x, y, vp),
+            Command::CancelDrag => self.cancel_curve_drag(),
             Command::Wheel { x, y, dy } if self.in_inset(x, y) => {
                 if let (Some(r), Some(base)) = (self.inset_rect(), self.current_inset_view()) {
                     let factor = (-dy * 0.0015).exp();
@@ -1218,10 +1430,12 @@ impl App {
         let w = d.view.window.clone();
         self.rig = Rig::new(Window3::new(w.min, w.max), view_mode(d.view.mode));
         self.rig.set_aspect(self.size.0 as f64 / self.size.1 as f64);
+        self.rig.max_frame_dt_ms = self.max_frame_dt_ms;
         self.doc = d;
         self.log_entry = None;
         self.frame_world_window(w);
         self.prev = None;
+        self.swap = None;
         self.ticker_running = false;
         self.ticker_err = None;
         self.mark_doc_changed();
@@ -1518,6 +1732,159 @@ impl App {
         self.mark_doc_changed();
     }
 
+    /// Finds the curve `y = f(x)` nearest the pointer (within `HOVER_PX`, 2D only) and sends a
+    /// `Hover` event when the result differs from the last one sent.
+    fn hover(&mut self, x: f64, y: f64, vp: (f64, f64)) {
+        let found = self.curve_under(x, y, vp);
+        let params = found.as_ref().map(|f| self.grab_params(&f.0)).unwrap_or_default();
+        let key = found
+            .as_ref()
+            .map(|(id, _, _, px, py)| (id.clone(), px.round() as i64, py.round() as i64, !params.is_empty()));
+        if key == self.last_hover {
+            return;
+        }
+        self.last_hover = key;
+        self.outbox.push(match found {
+            Some((id, wx, wy, px, py)) => Event::Hover { item: Some(id), x: wx, y: wy, px, py, params },
+            None => Event::Hover { item: None, x: 0.0, y: 0.0, px: 0.0, py: 0.0, params: Vec::new() },
+        });
+    }
+
+    /// Compiles the document's `y = f(x)` curves again if it was rebuilt since the last time.
+    fn ensure_curves(&mut self) {
+        let stale = self.hover_curves.as_ref().is_none_or(|(rev, _)| *rev != self.build_rev);
+        if stale {
+            self.hover_curves = Some((self.build_rev, crate::scene::explicit_curves(&self.doc)));
+        }
+        let stale = self.hover_shapes.as_ref().is_none_or(|(rev, _)| *rev != self.build_rev);
+        if stale {
+            let shapes = crate::scene::shape_curves(&self.doc, self.active_map());
+            self.hover_shapes = Some((self.build_rev, shapes.into_iter().map(|c| (c, None)).collect()));
+        }
+    }
+
+    /// A click: selects the curve under the pointer (or clears the selection) and sends its
+    /// special points.
+    fn pick(&mut self, x: f64, y: f64, vp: (f64, f64)) {
+        self.selected = self.curve_under(x, y, vp).map(|c| c.0);
+        self.refresh_analysis();
+        // The hover tip says whether a drag would grab the curve, which the click just changed.
+        self.last_hover = None;
+        self.hover(x, y, vp);
+    }
+
+    /// Sends `analysis` for the selected curve over the visible window if it differs from the
+    /// last one sent. A selection that no longer names a drawn curve (deleted, edited into
+    /// another kind, hidden, or not in 2D) is dropped.
+    fn refresh_analysis(&mut self) {
+        use math_core::special::analyze;
+        // Nothing selected and nothing to clear: no work (this runs after every rebuild).
+        if self.selected.is_none() && self.last_analysis.as_ref().is_none_or(|l| l.0.is_none()) {
+            return;
+        }
+        self.ensure_curves();
+        let vp = (self.size.0 as f64, self.size.1 as f64);
+        let m = self.active_map();
+        let mut points: Vec<AnalysisPoint> = Vec::new();
+        match (self.selected.clone(), self.rig.mode() == Mode::D2) {
+            (Some(id), true) => {
+                let curve = self.hover_curves.as_ref().and_then(|(_, cs)| cs.iter().find(|c| c.id == id));
+                match curve {
+                    Some(c) => {
+                        let w = self.world_window();
+                        let mut f = |x: f64| c.prog.eval(&[x]);
+                        let mut g1 = c.d1.as_ref().map(|p| move |x: f64| p.eval(&[x]));
+                        let mut g2 = c.d2.as_ref().map(|p| move |x: f64| p.eval(&[x]));
+                        let found = analyze(
+                            &mut f,
+                            g1.as_mut().map(|g| g as &mut dyn FnMut(f64) -> f64),
+                            g2.as_mut().map(|g| g as &mut dyn FnMut(f64) -> f64),
+                            w.min[0],
+                            w.max[0],
+                        );
+                        points = found
+                            .iter()
+                            .map(|s| {
+                                let (px, py) = self.rig.world_to_pixel(m.fwd3([s.x, s.y, 0.0]), vp);
+                                AnalysisPoint { kind: s.kind.name(), x: s.x, y: s.y, px, py }
+                            })
+                            .collect();
+                    }
+                    // Implicit, polar and parametric curves can be picked and dragged but have
+                    // no analysis (no special points).
+                    None if self.hover_shapes.as_ref().is_some_and(|(_, cs)| cs.iter().any(|(c, _)| c.id == id)) => {}
+                    None => self.selected = None,
+                }
+            }
+            (Some(_), false) => self.selected = None,
+            _ => {}
+        }
+        let now = (self.selected.clone(), points);
+        if self.last_analysis.as_ref() == Some(&now) {
+            return;
+        }
+        self.outbox.push(Event::Analysis { item: now.0.clone(), points: now.1.clone() });
+        self.last_analysis = Some(now);
+    }
+
+    /// `(item, world x, world y, pixel x, pixel y)` of the curve point nearest the pointer, looking
+    /// `HOVER_PX` to each side of it so steep curves are found too.
+    fn curve_under(&mut self, x: f64, y: f64, vp: (f64, f64)) -> Option<(String, f64, f64, f64, f64)> {
+        if self.rig.mode() != Mode::D2 || self.rig.is_animating() {
+            return None;
+        }
+        self.ensure_curves();
+        let m = self.active_map();
+        let mut best: Option<(f64, (String, f64, f64, f64, f64))> = None;
+        for c in &self.hover_curves.as_ref()?.1 {
+            for k in -(HOVER_PX as i32)..=(HOVER_PX as i32) {
+                let wx = m.inv3(self.rig.pixel_to_world((x + k as f64, y), vp))[0];
+                let wy = c.prog.eval(&[wx]);
+                if !wy.is_finite() {
+                    continue;
+                }
+                let (px, py) = self.rig.world_to_pixel(m.fwd3([wx, wy, 0.0]), vp);
+                let d = (px - x).hypot(py - y);
+                if d <= HOVER_PX && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                    best = Some((d, (c.id.clone(), wx, wy, px, py)));
+                }
+            }
+        }
+        // Implicit, polar and parametric curves: distance to the drawn polyline, in pixels.
+        let here = self.rig.pixel_to_world((x, y), vp);
+        let (bx, by) = (self.rig.pixel_to_world((x + 1.0, y), vp), self.rig.pixel_to_world((x, y + 1.0), vp));
+        let u = [(bx[0] - here[0]).abs().max(1e-300), (by[1] - here[1]).abs().max(1e-300)];
+        let win = self.scene_window();
+        let size = (self.size.0 as f64, self.size.1 as f64);
+        if let Some((_, shapes)) = self.hover_shapes.as_mut() {
+            for (c, lines) in shapes.iter_mut() {
+                let lines = lines.get_or_insert_with(|| crate::scene::shape_lines(c, win, size));
+                let mut found: Option<(f64, [f64; 2])> = None;
+                for l in lines.iter() {
+                    for seg in l.windows(2) {
+                        let (a, b) = ((seg[0][0] - here[0]) / u[0], (seg[0][1] - here[1]) / u[1]);
+                        let (c2, e) = ((seg[1][0] - seg[0][0]) / u[0], (seg[1][1] - seg[0][1]) / u[1]);
+                        let len2 = c2 * c2 + e * e;
+                        let t = if len2 > 0.0 { (-(a * c2 + b * e) / len2).clamp(0.0, 1.0) } else { 0.0 };
+                        let d = (a + t * c2).hypot(b + t * e);
+                        if d <= HOVER_PX && found.is_none_or(|(bd, _)| d < bd) {
+                            found = Some((d, [seg[0][0] + t * (seg[1][0] - seg[0][0]), seg[0][1] + t * (seg[1][1] - seg[0][1])]));
+                        }
+                    }
+                }
+                if let Some((d, q)) = found {
+                    if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                        let q = [q[0], q[1], 0.0];
+                        let w = m.inv3(q);
+                        let (px, py) = self.rig.world_to_pixel(q, vp);
+                        best = Some((d, (c.id.clone(), w[0], w[1], px, py)));
+                    }
+                }
+            }
+        }
+        best.map(|(_, r)| r)
+    }
+
     /// The point item (if any) under the pointer, in 2D only.
     fn grab_point(&self, x: f64, y: f64, vp: (f64, f64)) -> Option<PointGrab> {
         if self.rig.mode() != Mode::D2 || self.rig.is_animating() {
@@ -1586,6 +1953,7 @@ impl App {
         self.rig = Rig::new(shown, self.rig.mode());
         self.rig.set_aspect(aspect);
         self.rig.reduced_motion = self.reduced_motion;
+        self.rig.max_frame_dt_ms = self.max_frame_dt_ms;
         self.prev = None;
     }
     fn set_mode(&mut self, mode: Mode) {
@@ -1610,15 +1978,23 @@ impl App {
         }
         // The outgoing scene keeps drawing (fading) while the camera tweens to the new mode.
         self.prev = self.current.take();
+        self.swap = None;
+        if let Some(p) = &mut self.prev {
+            // A flat scene leaving for (or arriving from) 3D fades its grid and its curves on
+            // different schedules.
+            if p.mode != Mode::D3 && mode == Mode::D3 && !self.reduced_motion && !self.legacy_transition {
+                p.parts = Some(Box::new(split_flat(&p.geometry)));
+            }
+        }
         // The tween's clock starts at the next frame (see `Tween::start_ms`), so the time spent
         // building below is not taken out of the animation.
         self.rig.reduced_motion = self.reduced_motion;
         self.rig.set_mode(mode, self.now_ms);
         self.dirty = true;
-        // A preview build keeps the gap between the command and the first moving frame short;
-        // the full-quality scene follows when the switch has finished.
-        let preview = self.rig.is_animating();
-        self.rebuild_with(preview);
+        // A 3D scene starts as a cheap first look so the gap between the command and the first
+        // moving frame stays short (also without a tween: nothing blocks); its surfaces are then
+        // refined in time slices (see `refine_step`).
+        self.rebuild_with(mode == Mode::D3);
         self.redraw = true;
     }
 
@@ -1663,8 +2039,14 @@ impl App {
             }
             "down" => {
                 self.inset_drag = None;
+                self.last_hover = None;
                 let point = if button == 0 && !shift {
                     self.grab_point(x, y, vp)
+                } else {
+                    None
+                };
+                let curve = if button == 0 && !shift && point.is_none() {
+                    self.grab_curve(x, y, vp)
                 } else {
                     None
                 };
@@ -1673,17 +2055,28 @@ impl App {
                     shift,
                     last: (x, y),
                     point,
+                    curve,
                 });
             }
             "up" | "cancel" => {
+                self.end_curve_drag(phase == "cancel", x, y);
                 self.drag = None;
                 self.inset_drag = None;
             }
             "move" => {
                 let m = self.active_map();
+                if self.drag.is_none() {
+                    self.hover(x, y, vp);
+                    return;
+                }
                 let Some(d) = self.drag.as_mut() else { return };
                 let (dx, dy) = (x - d.last.0, y - d.last.1);
                 d.last = (x, y);
+                if d.curve.is_some() {
+                    self.drag_curve(x, y, vp);
+                    self.touch_input();
+                    return;
+                }
                 if let Some(g) = &d.point {
                     let here = self.rig.pixel_to_world((x, y), vp);
                     let to = m.inv3([here[0] + g.offset[0], here[1] + g.offset[1], 0.0]);
@@ -1715,10 +2108,10 @@ impl App {
         let animating = self.rig.is_animating();
         if was_animating && !animating {
             self.prev = None;
+            if let Some(c) = &mut self.current {
+                c.parts = None;
+            }
             self.redraw = true;
-        } else if self.refine && !animating {
-            // From the frame after the switch ended, so its final pose is shown on time.
-            self.dirty = true;
         }
         if self.dirty {
             let idle = now_ms - self.last_input_ms >= IDLE_REBUILD_MS;
@@ -1726,9 +2119,29 @@ impl App {
             // pause in the input (an orbit right after the switch) before the full build.
             let cheap = self.last_build_ms < CHEAP_BUILD_MS && !self.refine;
             if idle || cheap {
-                // Mid-switch (a slider ticking, say) only a preview fits in a frame.
-                self.rebuild_with(animating);
+                // An expensive 3D scene (and anything mid-switch) is rebuilt in stages.
+                let staged = animating || (!cheap && self.rig.mode() == Mode::D3);
+                self.rebuild_with(staged);
             }
+        } else if self.refine && self.legacy_transition {
+            // Before: the full scene is rebuilt in one go on the still picture after the switch.
+            if !animating && now_ms - self.last_input_ms >= IDLE_REBUILD_MS {
+                self.rebuild_with(false);
+            }
+        } else if self.refine {
+            let recent = now_ms - self.last_input_ms < IDLE_REBUILD_MS;
+            let budget = if recent {
+                REFINE_BUDGET_BUSY_MS
+            } else if animating {
+                REFINE_BUDGET_MS
+            } else {
+                REFINE_BUDGET_IDLE_MS
+            };
+            self.refine_step(budget);
+        }
+        if self.swap.as_ref().is_some_and(|s| now_ms - s.start_ms >= SWAP_BLEND_MS) {
+            self.swap = None;
+            self.redraw = true;
         }
         if self.panel_dirty && !self.dirty {
             let idle = now_ms - self.last_input_ms >= IDLE_REBUILD_MS;
@@ -1737,9 +2150,84 @@ impl App {
                 self.redraw = true;
             }
         }
-        let redraw = self.redraw || animating || self.dirty || self.panel_dirty;
+        let redraw = self.redraw || animating || self.dirty || self.panel_dirty || self.swap.is_some();
         self.redraw = false;
         redraw
+    }
+
+    /// True while the app has work that needs more frames even though nothing may need redrawing
+    /// yet (a 3D scene being refined): the shell must keep calling [`App::frame`].
+    pub fn busy(&self) -> bool {
+        self.refine || self.swap.is_some() || self.dirty || self.panel_dirty || self.rig.is_animating()
+    }
+
+    /// Finishes everything pending at full quality, right now (a PNG export must not capture a
+    /// first-look mesh): rebuilds a dirty scene in one go, or runs the refinement to the end
+    /// without a time limit, and drops any blend.
+    pub fn settle(&mut self) {
+        self.swap = None;
+        if self.dirty {
+            self.rebuild_with(false);
+        }
+        let mut guard = 0;
+        while self.refine && guard < 512 {
+            self.refine_step(f64::INFINITY);
+            self.swap = None;
+            guard += 1;
+        }
+        self.redraw = true;
+    }
+
+    /// One time slice of the staged refinement: meshes the current scene's surfaces at
+    /// `self.refine_cap` until `budget_ms` is used up. A finished stage replaces the scene
+    /// (blending in over the old one) and starts the next; an unfinished one changes nothing on
+    /// screen, the finished tiles are remembered for the next frame.
+    fn refine_step(&mut self, budget_ms: f64) {
+        let Some(cur) = &self.current else {
+            self.refine = false;
+            return;
+        };
+        let (mode, origin) = (cur.mode, cur.origin);
+        let t0 = instant::Instant::now();
+        let window = self.scene_window();
+        let full = full_surface_depth((self.size.0 as f64, self.size.1 as f64));
+        let cap = self.refine_cap.min(full);
+        crate::scene::set_render_scale(self.render_scale);
+        let r = build_scene_progressive_mapped(
+            &self.doc,
+            self.map,
+            mode,
+            window,
+            origin,
+            self.size,
+            &self.theme,
+            cap,
+            t0 + std::time::Duration::from_secs_f64(if budget_ms.is_finite() { budget_ms.max(0.0) / 1000.0 } else { 3600.0 }),
+            // Unsliceable work waits for the still picture after the tween.
+            self.rig.is_animating() && budget_ms.is_finite(),
+        );
+        crate::scene::set_render_scale(1.0);
+        self.refine_ms += t0.elapsed().as_secs_f64() * 1000.0;
+        if !r.done {
+            return;
+        }
+        let parts = None;
+        let old = self.current.replace(Built { geometry: r.geometry, origin, mode, parts });
+        self.redraw = true;
+        if !self.reduced_motion && !self.legacy_transition {
+            if let Some(old) = old {
+                self.swap = Some(Swap { old, start_ms: self.now_ms });
+            }
+        }
+        match next_refine_depth(cap, full).filter(|_| r.capped) {
+            Some(next) => self.refine_cap = next,
+            None => {
+                self.refine = false;
+                // What a full build costs, so live edits know whether to rebuild staged.
+                self.last_build_ms = self.refine_ms;
+                clear_surface_tiles();
+            }
+        }
     }
 
     /// The window the scene should cover. In 2D the camera shows the window's x range exactly and
@@ -1766,15 +2254,34 @@ impl App {
     /// Rebuilds the scene; `preview` meshes surfaces coarser (see [`build_scene_preview`]) and
     /// leaves `refine` set when that made a difference.
     fn rebuild_with(&mut self, preview: bool) {
+        self.build_rev += 1;
         let t0 = instant::Instant::now();
         let mode = self.rig.mode();
         let origin = self.rig.render_origin();
         let window = self.scene_window();
+        // The scale only lasts for this build, so direct `build_scene` callers on the thread
+        // always see 1.
+        struct ResetScale;
+        impl Drop for ResetScale {
+            fn drop(&mut self) {
+                crate::scene::set_render_scale(1.0);
+            }
+        }
+        crate::scene::set_render_scale(self.render_scale);
+        let _reset_scale = ResetScale;
         let geometry = if preview {
-            let (g, coarse) = build_scene_preview_mapped(
-                &self.doc, self.map, mode, window, origin, self.size, &self.theme,
+            let full = full_surface_depth((self.size.0 as f64, self.size.1 as f64));
+            let first = if self.legacy_transition { crate::scene::PREVIEW_SURFACE_DEPTH } else { FIRST_PREVIEW_DEPTH }.min(full);
+            let (g, coarse) = build_scene_capped_mapped(
+                &self.doc, self.map, mode, window, origin, self.size, &self.theme, first,
             );
             self.refine = coarse;
+            self.refine_cap = next_refine_depth(first, full).unwrap_or(full);
+            self.refine_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if !coarse {
+                // Nothing was coarser than a full build, so this IS the full cost.
+                self.last_build_ms = self.refine_ms;
+            }
             g
         } else {
             self.refine = false;
@@ -1858,7 +2365,9 @@ impl App {
             grid_kind: self.doc.view.grid_kind,
             x_scale: self.doc.view.x_scale,
             y_scale: self.doc.view.y_scale,
+            weight: self.doc.view.weight,
         });
+        self.refresh_analysis();
         self.outbox.push(Event::Labels {
             labels: geometry
                 .labels
@@ -1871,10 +2380,18 @@ impl App {
                 .collect(),
         });
         self.rebuild_panel(mode);
+        // A flat scene arriving from 3D fades its grid and curves on separate schedules.
+        let parts = (mode != Mode::D3
+            && !self.legacy_transition
+            && self.rig.is_animating()
+            && self.prev.as_ref().is_some_and(|p| p.mode == Mode::D3))
+        .then(|| Box::new(split_flat(&geometry)));
+        self.swap = None;
         self.current = Some(Built {
             geometry,
             origin,
             mode,
+            parts,
         });
         self.dirty = false;
         self.redraw = true;
@@ -2017,35 +2534,63 @@ impl App {
         })
     }
 
+    /// The opacities of the two scenes of a running mode switch (outgoing, incoming).
+    fn switch_fades(&self) -> Option<ModeFades> {
+        match (&self.prev, &self.current) {
+            (Some(p), Some(c)) if self.rig.is_animating() => {
+                let progress = self.rig.progress() as f32;
+                Some(if self.legacy_transition {
+                    let (o, i) = crate::render::crossfade(progress);
+                    ModeFades { from_backdrop: o, from_items: o, to_backdrop: i, to_items: i }
+                } else {
+                    mode_fades(p.mode, c.mode, progress, self.rig.lift() as f32)
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Appends the layers of one scene: `back` is the opacity of its grid and axes, `items` of
+    /// the rest. Layers that are invisible anyway are left out (they would only cost draw time).
+    fn push_built<'a>(
+        &'a self,
+        out: &mut Vec<Layer<'a>>,
+        b: &'a Built,
+        back: f32,
+        items: f32,
+        swap: Option<&'a Swap>,
+    ) {
+        const MIN_FADE: f32 = 0.003;
+        let lift = layer_lift(b.mode, self.rig.lift());
+        let mut push = |g: &'a SceneGeometry, origin: [f64; 3], fade: f32| {
+            if fade > MIN_FADE {
+                out.push(Layer { geometry: g, fade: fade.min(1.0), origin, lift });
+            }
+        };
+        if let Some(parts) = b.parts.as_deref().filter(|_| self.rig.is_animating()) {
+            push(&parts.0, b.origin, back);
+            push(&parts.1, b.origin, items);
+            return;
+        }
+        match swap {
+            // The coarser mesh stays opaque underneath while the refined one blends in on top.
+            Some(s) => {
+                push(&s.old.geometry, s.old.origin, items);
+                push(&b.geometry, b.origin, items * swap_blend(self.now_ms - s.start_ms));
+            }
+            None => push(&b.geometry, b.origin, items),
+        }
+    }
+
     /// Layers to draw this frame, oldest first.
     pub fn layers(&self) -> Vec<Layer<'_>> {
         let mut out = Vec::new();
-        match (&self.prev, &self.current) {
-            (Some(p), Some(c)) if self.rig.is_animating() => {
-                let (fa, fb) = crossfade(self.rig.progress() as f32);
-                let lift = self.rig.lift();
-                out.push(Layer {
-                    geometry: &p.geometry,
-                    fade: fa,
-                    origin: p.origin,
-                    lift: layer_lift(p.mode, lift),
-                });
-                out.push(Layer {
-                    geometry: &c.geometry,
-                    fade: fb,
-                    origin: c.origin,
-                    lift: layer_lift(c.mode, lift),
-                });
+        match (&self.prev, &self.current, self.switch_fades()) {
+            (Some(p), Some(c), Some(f)) => {
+                self.push_built(&mut out, p, f.from_backdrop, f.from_items, None);
+                self.push_built(&mut out, c, f.to_backdrop, f.to_items, self.swap.as_ref());
             }
-            (_, Some(c)) => {
-                let lift = layer_lift(c.mode, self.rig.lift());
-                out.push(Layer {
-                    geometry: &c.geometry,
-                    fade: 1.0,
-                    origin: c.origin,
-                    lift,
-                })
-            }
+            (_, Some(c), _) => self.push_built(&mut out, c, 1.0, 1.0, self.swap.as_ref()),
             _ => {}
         }
         out
@@ -2058,45 +2603,60 @@ impl App {
         let Some(c) = &self.current else {
             return Vec::new();
         };
+        let mut out = Vec::new();
+        // Mid-switch both scenes' labels are shown, each at the opacity of its own grid / items,
+        // so the old tick labels fade out as the new ones fade in.
+        match (&self.prev, self.switch_fades()) {
+            (Some(p), Some(f)) => {
+                self.project_labels(p, f.from_backdrop, f.from_items, &mut out);
+                self.project_labels(c, f.to_backdrop, f.to_items, &mut out);
+            }
+            _ => self.project_labels(c, 1.0, 1.0, &mut out),
+        }
+        out.extend(self.inset_screen_labels());
+        out
+    }
+
+    /// Projects `b`'s labels through the current camera into `out`; tick labels and axis names
+    /// get opacity `back`, an item's own labels `items`.
+    fn project_labels(&self, b: &Built, back: f32, items: f32, out: &mut Vec<ScreenLabel>) {
         let aspect = self.size.0 as f64 / self.size.1.max(1) as f64;
         let (w, h) = (self.size.0 as f64, self.size.1 as f64);
         let rect = self.inset_rect();
         // Labels of a 3D scene ride the switch lift with its geometry.
-        let lift = layer_lift(c.mode, self.rig.lift()) as f64;
-        let mut out: Vec<ScreenLabel> = c
-            .geometry
-            .labels
-            .iter()
-            .map(|l| {
-                let ndc = self
-                    .rig
-                    .project_ndc([l.pos[0], l.pos[1], l.pos[2] * lift], aspect);
-                let (x, y) = ((ndc[0] * 0.5 + 0.5) * w, (1.0 - (ndc[1] * 0.5 + 0.5)) * h);
-                let mut visible =
-                    ndc[0].abs() <= 1.0 && ndc[1].abs() <= 1.0 && (0.0..=1.0).contains(&ndc[2]);
-                // Labels under the inset would show through it.
-                if let Some(r) = rect {
-                    if x >= r[0] as f64
-                        && x <= (r[0] + r[2]) as f64
-                        && y >= r[1] as f64
-                        && y <= (r[1] + r[3]) as f64
-                    {
-                        visible = false;
-                    }
+        let lift = layer_lift(b.mode, self.rig.lift()) as f64;
+        out.extend(b.geometry.labels.iter().filter_map(|l| {
+            let alpha = if l.axis == 4 { items } else { back } as f64;
+            if alpha <= 0.003 {
+                return None;
+            }
+            let ndc = self
+                .rig
+                .project_ndc([l.pos[0], l.pos[1], l.pos[2] * lift], aspect);
+            let (x, y) = ((ndc[0] * 0.5 + 0.5) * w, (1.0 - (ndc[1] * 0.5 + 0.5)) * h);
+            let mut visible =
+                ndc[0].abs() <= 1.0 && ndc[1].abs() <= 1.0 && (0.0..=1.0).contains(&ndc[2]);
+            // Labels under the inset would show through it.
+            if let Some(r) = rect {
+                if x >= r[0] as f64
+                    && x <= (r[0] + r[2]) as f64
+                    && y >= r[1] as f64
+                    && y <= (r[1] + r[3]) as f64
+                {
+                    visible = false;
                 }
-                ScreenLabel {
-                    text: l.text.clone(),
-                    axis: l.axis,
-                    x,
-                    y,
-                    visible,
-                    inset: false,
-                    clip: None,
-                }
+            }
+            Some(ScreenLabel {
+                text: l.text.clone(),
+                axis: l.axis,
+                x,
+                y,
+                visible,
+                alpha,
+                inset: false,
+                clip: None,
             })
-            .collect();
-        out.extend(self.inset_screen_labels());
-        out
+        }));
     }
 
     /// Tick labels and axis names of the slice inset, in canvas pixels (empty without one).
@@ -2124,6 +2684,7 @@ impl App {
                     x: r[0] as f64 + lx,
                     y: r[1] as f64 + ly,
                     visible,
+                    alpha: 1.0,
                     inset: true,
                     clip: Some([r[0] as f64, r[1] as f64, pw, ph]),
                 }
@@ -2152,7 +2713,11 @@ mod tests {
     use super::*;
 
     fn app() -> App {
-        App::new((800, 600))
+        let mut a = App::new((800, 600));
+        // Tests fast-forward the clock; the frame clamp has its own tests.
+        a.max_frame_dt_ms = f64::INFINITY;
+        a.rig.max_frame_dt_ms = f64::INFINITY;
+        a
     }
 
     fn cmd(app: &mut App, json: &str) -> Vec<serde_json::Value> {
@@ -2257,10 +2822,12 @@ mod tests {
         assert!(a.frame(60_000.0));
         assert!(a.rig.is_animating(), "the whole tween is still ahead");
         assert_eq!(a.rig.progress(), 0.0);
+        // The first frame still shows the 2D scene as it was: grid and curves, no 3D yet.
         let l = a.layers();
-        assert_eq!(l.len(), 2);
-        assert_eq!((l[0].fade, l[1].fade), crossfade(0.0));
-        assert_eq!(l[1].lift, 0.0, "the 3D scene starts flat in the plane");
+        assert_eq!(l.len(), 2, "grid + curves of the 2D scene");
+        assert!(l.iter().all(|x| x.fade == 1.0 && x.lift == 1.0));
+        assert_eq!(a.current.as_ref().unwrap().mode, Mode::D3);
+        drop(l);
         let mut t = 60_000.0;
         let mut frames = 0;
         while a.rig.is_animating() {
@@ -2271,12 +2838,25 @@ mod tests {
         assert!(frames >= 29, "{frames} frames");
     }
 
+    /// Frames (16 ms apart from `t`) until the staged refinement has finished and its blend is
+    /// over; the meshing slices are bounded in real time, so a debug build needs many.
+    fn run_until_refined(a: &mut App, mut t: f64) -> f64 {
+        let mut n = 0;
+        while a.busy() {
+            t += 16.0;
+            a.frame(t);
+            n += 1;
+            assert!(n < 20_000, "refinement never finished");
+        }
+        t
+    }
+
     #[test]
     fn switch_to_3d_previews_then_refines_at_full_quality() {
         let mut a = app();
         cmd(
             &mut a,
-            r#"{"t":"setExpr","id":"a","latex":"z=\\sin(x)\\cos(y)"}"#,
+            r#"{"t":"setExpr","id":"a","latex":"\\sin(x)\\cos(y)+\\sin(y)\\cos(z)+\\sin(z)\\cos(x)=0"}"#,
         );
         a.frame(0.0);
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
@@ -2288,71 +2868,195 @@ mod tests {
             a.size,
             &a.theme,
         );
-        let preview = a.layers()[1].geometry.vertices.len();
+        let preview = a.current.as_ref().unwrap().geometry.vertices.len();
         assert!(a.refine);
         assert!(
-            preview > 0 && preview < full.vertices.len(),
+            preview > 0 && preview < full.vertices.len() / 4,
             "{preview} vs {}",
             full.vertices.len()
         );
-        // Mid-switch: the 3D scene is partly lifted, the outgoing 2D one is untouched.
+        // Mid-switch: the 3D scene is partly lifted (and fading in), the outgoing 2D one is not.
         a.frame(16.0);
         a.frame(266.0);
         let l = a.layers();
-        assert!(l[1].lift > 0.0 && l[1].lift < 1.0);
-        assert_eq!(l[0].lift, 1.0);
+        let lifted: Vec<_> = l.iter().filter(|x| x.lift < 1.0).collect();
+        assert!(!lifted.is_empty() && lifted.iter().all(|x| x.lift > 0.0));
+        assert!(l.iter().any(|x| x.lift == 1.0), "the flat scene is not lifted");
         drop(l);
-        assert!(a.refine, "no full rebuild while moving");
-        a.frame(600.0);
-        assert!(!a.rig.is_animating());
-        assert!(a.refine, "the final pose is drawn first");
-        a.frame(616.0);
-        assert!(!a.refine);
+        // The refinement runs in slices alongside the tween, not in one stall.
+        assert!(a.refine, "no full rebuild in one frame");
+        assert!(a.busy());
+        run_until_refined(&mut a, 266.0);
+        assert!(!a.rig.is_animating() && !a.refine && a.swap.is_none());
         let l = a.layers();
         assert_eq!(l.len(), 1);
         assert_eq!(l[0].lift, 1.0);
-        assert_eq!(l[0].geometry.vertices.len(), full.vertices.len());
+        assert_eq!(l[0].fade, 1.0);
+        assert_eq!(l[0].geometry.indices.len(), full.indices.len());
         // Leaving 3D needs no preview (2D builds are cheap) and nothing to refine.
         drop(l);
         cmd(&mut a, r#"{"t":"setMode","mode":"2d"}"#);
         assert!(!a.refine);
+        assert!(!a.busy() || a.rig.is_animating());
     }
 
     #[test]
-    fn refine_waits_for_a_pause_in_the_input() {
+    fn refinement_swaps_the_mesh_in_with_a_short_blend() {
         let mut a = app();
         cmd(
             &mut a,
-            r#"{"t":"setExpr","id":"a","latex":"z=\\sin(x)\\cos(y)"}"#,
+            r#"{"t":"setExpr","id":"a","latex":"x^2+y^2+z^2=9"}"#,
         );
         a.frame(0.0);
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
-        a.frame(10.0);
-        cmd(&mut a, r#"{"t":"pointer","phase":"down","x":400,"y":300}"#);
-        let mut t = 10.0;
-        while t < 800.0 {
+        a.frame(16.0);
+        let mut t = 16.0;
+        let mut saw_blend = false;
+        let mut n = 0;
+        while a.busy() {
             t += 16.0;
-            a.now_ms = t;
-            cmd(
-                &mut a,
-                &format!(
-                    r#"{{"t":"pointer","phase":"move","x":{},"y":300}}"#,
-                    400.0 + t / 10.0
-                ),
-            );
             a.frame(t);
+            n += 1;
+            assert!(n < 20_000);
+            if a.swap.is_some() && !a.rig.is_animating() {
+                let l = a.layers();
+                // The coarse mesh stays opaque underneath, the refined one fades in over it.
+                assert!(l.len() <= 2 && !l.is_empty());
+                assert_eq!(l[0].fade, 1.0);
+                assert!(l.len() == 1 || l[1].fade <= 1.0);
+                saw_blend = true;
+            }
         }
-        assert!(!a.rig.is_animating());
-        assert!(a.refine, "no full build while the user is orbiting");
-        cmd(&mut a, r#"{"t":"pointer","phase":"up","x":480,"y":300}"#);
-        a.frame(t + 50.0);
-        assert!(a.refine);
-        a.frame(t + 200.0);
-        assert!(!a.refine);
+        assert!(saw_blend, "the refined mesh popped in");
+        assert_eq!(a.layers().len(), 1);
     }
 
     #[test]
-    fn reduced_motion_switches_at_once_at_full_quality() {
+    fn settle_finishes_the_refinement_at_full_quality_at_once() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"x^2+y^2+z^2=9"}"#);
+        a.frame(0.0);
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        a.frame(16.0);
+        assert!(a.refine);
+        a.settle();
+        assert!(!a.refine && a.swap.is_none());
+        let full = crate::scene::build_scene(&a.doc, Mode::D3, a.scene_window(), a.rig.render_origin(), a.size, &a.theme);
+        assert_eq!(a.current.as_ref().unwrap().geometry.indices.len(), full.indices.len());
+    }
+
+    #[test]
+    fn legacy_transition_hook_restores_the_old_switch() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"x^2+y^2+z^2=9"}"#);
+        cmd(&mut a, r#"{"t":"setLegacyTransition","on":true}"#);
+        assert!(a.rig.max_frame_dt_ms.is_infinite());
+        a.frame(0.0);
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        assert!(a.prev.as_ref().unwrap().parts.is_none(), "no 2D split");
+        a.frame(16.0);
+        a.frame(266.0);
+        assert_eq!(a.layers().len(), 2, "plain two-layer crossfade (one flat layer, not grid + items)");
+        assert!(a.refine);
+        a.frame(100.0);
+        assert!(a.refine, "no refinement while moving");
+        a.frame(900.0);
+        a.frame(1100.0);
+        assert!(!a.refine, "rebuilt in one go on the still picture");
+        assert!(a.swap.is_none(), "no blend");
+        cmd(&mut a, r#"{"t":"setLegacyTransition","on":false}"#);
+        assert_eq!(a.rig.max_frame_dt_ms, MAX_FRAME_DT_MS);
+    }
+
+    #[test]
+    fn a_resize_during_the_switch_does_not_block_on_the_full_build() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"x^2+y^2+z^2=9"}"#);
+        a.frame(0.0);
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        a.frame(16.0);
+        // The stage is laid out differently in 3D: the canvas is resized right after the switch.
+        cmd(&mut a, r#"{"t":"resize","width":700,"height":520}"#);
+        assert!(a.refine, "resize rebuilt at full quality in the command");
+        assert!(a.current.as_ref().unwrap().geometry.indices.len() < 2000, "first look expected");
+        run_until_refined(&mut a, 16.0);
+        assert!(!a.refine);
+        let full = crate::scene::build_scene(&a.doc, Mode::D3, a.scene_window(), a.rig.render_origin(), a.size, &a.theme);
+        assert_eq!(a.current.as_ref().unwrap().geometry.indices.len(), full.indices.len());
+        // At rest and cheap, a resize still rebuilds at once.
+        let mut b = app();
+        cmd(&mut b, r#"{"t":"setExpr","id":"a","latex":"y=x^2"}"#);
+        cmd(&mut b, r#"{"t":"resize","width":390,"height":844}"#);
+        assert!(!b.refine && !b.layers().is_empty());
+    }
+
+    #[test]
+    fn an_unsliceable_stage_waits_for_the_tween_to_end() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"z=\\sin(x)\\cos(y)"}"#);
+        a.frame(0.0);
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        let full = crate::scene::build_scene(&a.doc, Mode::D3, a.scene_window(), a.rig.render_origin(), a.size, &a.theme);
+        a.frame(16.0);
+        let mut t = 16.0;
+        while a.rig.is_animating() {
+            t += 16.0;
+            a.frame(t);
+            if a.rig.is_animating() {
+                // The heavy full-depth height field is not meshed in the middle of the motion.
+                let n = a.current.as_ref().unwrap().geometry.indices.len();
+                assert!(n < full.indices.len() / 2, "full-depth mesh arrived mid-tween: {n}");
+                assert!(a.refine, "refinement is still pending");
+            }
+        }
+        run_until_refined(&mut a, t);
+        assert!(!a.refine);
+        assert_eq!(a.current.as_ref().unwrap().geometry.indices.len(), full.indices.len());
+    }
+
+    #[test]
+    fn next_refine_depth_walks_the_stages() {
+        assert_eq!(next_refine_depth(4, 7), Some(5));
+        assert_eq!(next_refine_depth(3, 7), Some(5));
+        assert_eq!(next_refine_depth(5, 7), Some(7));
+        assert_eq!(next_refine_depth(7, 7), None);
+        assert_eq!(next_refine_depth(4, 5), Some(5));
+        assert_eq!(next_refine_depth(3, 4), Some(4));
+        assert_eq!(next_refine_depth(8, 7), None);
+    }
+
+    #[test]
+    fn swap_blend_is_a_smooth_ramp() {
+        assert_eq!(swap_blend(0.0), 0.0);
+        assert_eq!(swap_blend(SWAP_BLEND_MS), 1.0);
+        assert_eq!(swap_blend(1e9), 1.0);
+        assert_eq!(swap_blend(-5.0), 0.0);
+        assert_eq!(swap_blend(f64::NAN), 1.0);
+        assert!((swap_blend(SWAP_BLEND_MS / 2.0) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn refining_never_blocks_a_frame_for_the_whole_mesh() {
+        let mut a = app();
+        cmd(
+            &mut a,
+            r#"{"t":"setExpr","id":"a","latex":"\\sin(x)\\cos(y)+\\sin(y)\\cos(z)+\\sin(z)\\cos(x)=0"}"#,
+        );
+        a.frame(0.0);
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        let mut frames = 0;
+        let mut t = 0.0;
+        while a.refine {
+            t += 16.0;
+            a.frame(t);
+            frames += 1;
+            assert!(frames < 20_000);
+        }
+        assert!(frames >= 4, "the full mesh took {frames} frames: it was not sliced");
+    }
+
+    #[test]
+    fn reduced_motion_switches_at_once_without_a_stall() {
         let mut a = app();
         cmd(
             &mut a,
@@ -2361,25 +3065,118 @@ mod tests {
         cmd(&mut a, r#"{"t":"setReducedMotion","on":true}"#);
         a.frame(0.0);
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
-        assert!(!a.rig.is_animating());
-        assert!(!a.refine);
+        assert!(!a.rig.is_animating(), "no tween");
+        assert!(a.refine, "the surface is built in slices, not in the command");
         a.frame(16.0);
         let l = a.layers();
         assert_eq!(l.len(), 1);
         assert_eq!(l[0].lift, 1.0);
+        assert_eq!(l[0].fade, 1.0);
         drop(l);
+        let mut t = 16.0;
+        while a.refine {
+            t += 16.0;
+            a.frame(t);
+            assert!(a.swap.is_none(), "no blend under reduced motion");
+            assert!(t < 400_000.0);
+        }
         // The setting outlives a document load (which replaces the camera rig).
         let json = doc::to_json(&a.doc);
         cmd(
             &mut a,
             &serde_json::json!({"t":"loadDoc","json":json}).to_string(),
         );
-        a.frame(32.0);
+        a.frame(t + 16.0);
         cmd(&mut a, r#"{"t":"setMode","mode":"2d"}"#);
         assert!(!a.rig.is_animating());
         cmd(&mut a, r#"{"t":"setReducedMotion","on":false}"#);
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
         assert!(a.rig.is_animating());
+    }
+
+    #[test]
+    fn a_stalled_frame_does_not_use_up_the_switch() {
+        let mut a = app();
+        a.max_frame_dt_ms = MAX_FRAME_DT_MS;
+        a.rig.max_frame_dt_ms = MAX_FRAME_DT_MS;
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=x^2"}"#);
+        a.frame(100.0);
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        a.frame(116.0); // first frame: starts the clock
+        assert_eq!(a.rig.progress(), 0.0);
+        a.frame(116.0 + 1850.0); // the 1.8 s stall measured in the browser
+        assert!(a.rig.is_animating());
+        let p = a.rig.progress();
+        assert!(p > 0.0 && p <= MAX_FRAME_DT_MS / a.rig.duration_ms + 1e-9, "{p}");
+    }
+
+    #[test]
+    fn a_2d_curve_stays_drawn_while_it_lifts_and_the_grid_goes_first() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=x^2"}"#);
+        a.frame(0.0);
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        a.frame(16.0);
+        let mut t = 16.0;
+        let (mut grid_gone_at, mut curve_gone_at, mut three_seen_at) = (None, None, None);
+        while a.rig.is_animating() {
+            t += 16.0;
+            a.frame(t);
+            if !a.rig.is_animating() {
+                break;
+            }
+            let lift = a.rig.lift();
+            let l = a.layers();
+            let flat: Vec<_> = l.iter().filter(|x| x.lift == 1.0 && !x.geometry.segments.is_empty()).collect();
+            // layer 0 of the flat scene is the backdrop, layer 1 the items
+            let has_back = flat.iter().any(|x| x.geometry.segments.len() == a.prev.as_ref().unwrap().parts.as_ref().unwrap().0.segments.len());
+            let has_items = l.iter().any(|x| std::ptr::eq(x.geometry, &a.prev.as_ref().unwrap().parts.as_ref().unwrap().1));
+            if !has_back && grid_gone_at.is_none() {
+                grid_gone_at = Some(lift);
+            }
+            if !has_items && curve_gone_at.is_none() {
+                curve_gone_at = Some(lift);
+            }
+            if l.iter().any(|x| x.lift < 1.0) && three_seen_at.is_none() {
+                three_seen_at = Some(lift);
+            }
+        }
+        let (g, c, th) = (grid_gone_at.unwrap(), curve_gone_at.unwrap(), three_seen_at.unwrap());
+        assert!(g < th + 0.25, "grid should go before / as the 3D scene appears: {g} vs {th}");
+        assert!(th >= crate::render::FADE_3D_START as f64 - 0.05, "3D appears only once lifted: {th}");
+        assert!(c > 0.8, "the curve stays until the form has risen: {c}");
+    }
+
+    #[test]
+    fn labels_cross_fade_with_the_scenes() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=x^2"}"#);
+        a.frame(0.0);
+        let flat = a.screen_labels();
+        assert!(!flat.is_empty() && flat.iter().all(|l| l.alpha == 1.0));
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        a.frame(16.0);
+        // Start: the 2D tick labels are still there, the 3D ones not yet.
+        let l0 = a.screen_labels();
+        assert_eq!(l0.len(), flat.len());
+        assert!(l0.iter().all(|l| l.alpha == 1.0));
+        // Middle: both sets, partly faded.
+        a.frame(16.0 + 250.0);
+        let lm = a.screen_labels();
+        let (mut old, mut new) = (0, 0);
+        for l in &lm {
+            assert!(l.alpha > 0.0 && l.alpha <= 1.0);
+        }
+        for l in &lm {
+            if l.axis == 2 { new += 1 } else { old += 1 }
+        }
+        assert!(old > 0, "2D labels vanished at once");
+        let _ = new;
+        // End: only the 3D scene's labels, fully opaque.
+        run_until_refined(&mut a, 266.0);
+        let l1 = a.screen_labels();
+        assert!(!l1.is_empty() && l1.iter().all(|l| l.alpha == 1.0));
+        assert!(l1.iter().any(|l| l.axis == 2), "z tick labels of the 3D box");
     }
 
     #[test]
@@ -2393,8 +3190,10 @@ mod tests {
         cmd(&mut a, r#"{"t":"pointer","phase":"up","x":300,"y":300}"#);
         let w1 = a.rig.window();
         assert!(w1.min[0] > w0.min[0], "dragging left pans the window right");
-        // The scene is cheap, so it rebuilds at once and the origin follows the window.
-        a.frame(1.0);
+        // Past the idle delay the dirty scene rebuilds whatever the measured build time was
+        // (`last_build_ms` is a real clock reading, so "cheap, rebuild at once" is not
+        // deterministic under load) and the origin follows the window.
+        a.frame(1.0 + IDLE_REBUILD_MS);
         let o = a.layers()[0].origin;
         let c = a.rig.render_origin();
         assert!((o[0] - c[0]).abs() < 1e-9);
@@ -2471,6 +3270,42 @@ mod tests {
         let ev = cmd(&mut a, r#"{"t":"setView","xStep":-1,"arrows":false}"#);
         assert!(error_msg(&ev).is_some());
         assert!(a.doc.view.arrows, "a rejected command changes nothing");
+    }
+
+    #[test]
+    fn set_view_weight_is_saved_reported_and_validated() {
+        let mut a = app();
+        let ev = cmd(&mut a, r#"{"t":"setView","weight":"bold"}"#);
+        let view = ev.iter().rfind(|e| e["t"] == "view").expect("a view event");
+        assert_eq!(view["weight"], "bold");
+        assert_eq!(a.doc.view.weight, math_core::doc::Weight::Bold);
+        assert!(doc::to_json(&a.doc).contains(r#""weight":"bold""#));
+        // Unknown values are an error and change nothing.
+        let ev = cmd(&mut a, r#"{"t":"setView","weight":"heavy"}"#);
+        assert!(has(&ev, "error"));
+        assert_eq!(a.doc.view.weight, math_core::doc::Weight::Bold);
+        let ev = cmd(&mut a, r#"{"t":"setView","weight":"normal"}"#);
+        assert_eq!(ev.iter().rfind(|e| e["t"] == "view").unwrap()["weight"], "normal");
+        assert!(!doc::to_json(&a.doc).contains("weight"));
+    }
+
+    #[test]
+    fn render_scale_widens_lines_without_touching_the_document() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=x"}"#);
+        a.frame(0.0);
+        let before = doc::to_json(&a.doc);
+        let max_w = |a: &App| {
+            a.layers().iter().flat_map(|l| l.geometry.segments.iter()).map(|s| s.width).fold(0.0f32, f32::max)
+        };
+        let w1 = max_w(&a);
+        cmd(&mut a, r#"{"t":"setRenderScale","scale":2}"#);
+        a.frame(0.0);
+        assert_eq!(max_w(&a), w1 * 2.0);
+        assert_eq!(doc::to_json(&a.doc), before, "the scale is never saved");
+        cmd(&mut a, r#"{"t":"setRenderScale","scale":1}"#);
+        a.frame(0.0);
+        assert_eq!(max_w(&a), w1);
     }
 
     #[test]
@@ -2791,6 +3626,412 @@ mod tests {
             r#"{"t":"pointer","phase":"move","x":10,"y":10,"button":-1}"#,
         );
         assert!(!has(&ev, "error"));
+    }
+
+    fn hover_at(a: &mut App, x: f64, y: f64) -> Vec<serde_json::Value> {
+        cmd(a, &format!(r#"{{"t":"pointer","phase":"move","x":{x},"y":{y},"button":-1}}"#))
+    }
+
+    fn hover_event(ev: &[serde_json::Value]) -> Option<&serde_json::Value> {
+        ev.iter().find(|e| e["t"] == "hover")
+    }
+
+    #[test]
+    fn hover_finds_the_curve_under_the_pointer() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setMode","mode":"2d"}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=x^2"}"#);
+        let (px, py) = a.rig.world_to_pixel([2.0, 4.0, 0.0], (800.0, 600.0));
+        let ev = hover_at(&mut a, px, py + 3.0);
+        let h = hover_event(&ev).expect("a hover event");
+        assert_eq!(h["item"], "a");
+        assert!((h["x"].as_f64().unwrap() - 2.0).abs() < 0.3, "x near 2, got {}", h["x"]);
+        let (x, y) = (h["x"].as_f64().unwrap(), h["y"].as_f64().unwrap());
+        assert!((y - x * x).abs() < 1e-9, "the point lies on the curve");
+        assert!((h["py"].as_f64().unwrap() - py).abs() < 8.0, "py is where the curve is drawn");
+        // the same pointer position again sends nothing; moving off the curve clears it
+        assert!(hover_event(&hover_at(&mut a, px, py + 3.0)).is_none());
+        let ev = hover_at(&mut a, px, py + 200.0);
+        assert_eq!(hover_event(&ev).expect("cleared")["item"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn hover_follows_edits_and_is_2d_only() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setMode","mode":"2d"}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=x^2"}"#);
+        let (px, py) = a.rig.world_to_pixel([2.0, 4.0, 0.0], (800.0, 600.0));
+        assert!(hover_event(&hover_at(&mut a, px, py)).is_some());
+        // an edit re-compiles the curve: y = 2x passes through (2, 4) too, y = x + 10 does not
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=x+10"}"#);
+        let ev = hover_at(&mut a, px, py);
+        assert_eq!(hover_event(&ev).expect("cleared after the edit")["item"], serde_json::Value::Null);
+        // 3D has no hover
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        assert!(!has(&hover_at(&mut a, 400.0, 300.0), "error"));
+    }
+
+    fn pick_at(a: &mut App, x: f64, y: f64) -> Vec<serde_json::Value> {
+        cmd(a, &format!(r#"{{"t":"pick","x":{x},"y":{y}}}"#))
+    }
+
+    fn analysis(ev: &[serde_json::Value]) -> Option<&serde_json::Value> {
+        ev.iter().find(|e| e["t"] == "analysis")
+    }
+
+    fn kinds(an: &serde_json::Value, kind: &str) -> Vec<(f64, f64)> {
+        an["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["kind"] == kind)
+            .map(|p| (p["x"].as_f64().unwrap(), p["y"].as_f64().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn picking_a_curve_sends_its_special_points() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=x^2-4"}"#);
+        let (px, py) = a.rig.world_to_pixel([3.0, 5.0, 0.0], (800.0, 600.0));
+        let ev = pick_at(&mut a, px, py);
+        let an = analysis(&ev).expect("an analysis event");
+        assert_eq!(an["item"], "a");
+        let roots = kinds(an, "root");
+        assert_eq!(roots.len(), 2);
+        assert!((roots[0].0 + 2.0).abs() < 1e-6 && (roots[1].0 - 2.0).abs() < 1e-6);
+        let mins = kinds(an, "minimum");
+        assert!(mins.len() == 1 && mins[0].0.abs() < 1e-6 && (mins[0].1 + 4.0).abs() < 1e-6);
+        assert_eq!(kinds(an, "y-intercept").len(), 1);
+        // picking the same curve again changes nothing, so nothing is sent
+        assert!(analysis(&pick_at(&mut a, px, py)).is_none());
+        // a click on empty space clears the selection
+        let ev = pick_at(&mut a, 10.0, 10.0);
+        let an = analysis(&ev).expect("cleared");
+        assert!(an["item"].is_null() && an["points"].as_array().unwrap().is_empty());
+    }
+
+    fn ptr_at(a: &mut App, phase: &str, x: f64, y: f64) -> Vec<serde_json::Value> {
+        cmd(a, &format!(r#"{{"t":"pointer","phase":"{phase}","x":{x},"y":{y},"button":0}}"#))
+    }
+
+    fn slider_of(a: &App, name: &str) -> f64 {
+        a.doc.sliders[name].value
+    }
+
+    /// `y = a(x-h)^2 + k` with sliders, selected by a click on its flank at x = 2.
+    fn selected_parabola(a: &mut App) -> (f64, f64) {
+        cmd(a, r#"{"t":"setMode","mode":"2d"}"#);
+        cmd(a, r#"{"t":"setSlider","name":"a","value":1,"min":-5,"max":5}"#);
+        cmd(a, r#"{"t":"setSlider","name":"h","value":0,"min":-10,"max":10}"#);
+        cmd(a, r#"{"t":"setSlider","name":"k","value":0,"min":-10,"max":10}"#);
+        cmd(a, r#"{"t":"setExpr","id":"c","latex":"y=a(x-h)^2+k"}"#);
+        let (px, py) = a.rig.world_to_pixel([2.0, 4.0, 0.0], (800.0, 600.0));
+        pick_at(a, px, py);
+        (px, py)
+    }
+
+    #[test]
+    fn dragging_the_selected_curve_changes_its_sliders() {
+        let mut a = app();
+        let (px, py) = selected_parabola(&mut a);
+        // hovering the selected curve announces what a drag would change
+        hover_at(&mut a, 10.0, 10.0);
+        let ev = hover_at(&mut a, px, py);
+        let h = hover_event(&ev).expect("hover");
+        assert_eq!(h["params"], serde_json::json!(["a", "h", "k"]));
+        let ev = ptr_at(&mut a, "down", px, py);
+        assert!(ev.iter().any(|e| e["t"] == "curveDrag" && e["active"] == true));
+        // drag it 1 unit right and 1 up (world units to pixels)
+        let (qx, qy) = a.rig.world_to_pixel([3.0, 5.0, 0.0], (800.0, 600.0));
+        let ev = ptr_at(&mut a, "move", qx, qy);
+        assert!(ev.iter().any(|e| e["t"] == "sliderValue"), "{ev:?}");
+        let (aa, hh, kk) = (slider_of(&a, "a"), slider_of(&a, "h"), slider_of(&a, "k"));
+        // the curve passes through the pointer and kept its shape: a translation
+        assert!((aa * (3.0 - hh).powi(2) + kk - 5.0).abs() < 0.1, "a={aa} h={hh} k={kk}");
+        assert!((aa - 1.0).abs() < 0.15 && (hh - 1.0).abs() < 0.2, "a={aa} h={hh} k={kk}");
+        let ev = ptr_at(&mut a, "up", qx, qy);
+        assert!(ev.iter().any(|e| e["t"] == "curveDrag" && e["active"] == false && e["cancelled"] == false));
+        // the press did not pan
+        assert_eq!(a.rig.world_to_pixel([2.0, 4.0, 0.0], (800.0, 600.0)), (px, py));
+    }
+
+    #[test]
+    fn a_second_drag_right_after_the_first_works_and_escape_restores_it() {
+        let mut a = app();
+        let (px, py) = selected_parabola(&mut a);
+        let at = |a: &App, x: f64, y: f64| a.rig.world_to_pixel([x, y, 0.0], (800.0, 600.0));
+        hover_at(&mut a, px, py);
+        ptr_at(&mut a, "down", px, py);
+        let (qx, qy) = at(&a, 4.0, 4.0);
+        ptr_at(&mut a, "move", qx, qy);
+        ptr_at(&mut a, "up", qx, qy);
+        let after_first = (slider_of(&a, "h"), slider_of(&a, "k"));
+        assert!((after_first.0 - 2.0).abs() < 0.2, "{after_first:?}");
+        // second drag: press on the curve where the first one left it, no click in between
+        let y = (4.0 - slider_of(&a, "h")).powi(2) * slider_of(&a, "a") + slider_of(&a, "k");
+        let (rx, ry) = at(&a, 4.0, y);
+        hover_at(&mut a, rx, ry);
+        let ev = ptr_at(&mut a, "down", rx, ry);
+        assert!(ev.iter().any(|e| e["t"] == "curveDrag"), "no drag started: {ev:?}");
+        let (sx, sy) = at(&a, 6.0, y);
+        ptr_at(&mut a, "move", sx, sy);
+        assert!((slider_of(&a, "h") - after_first.0 - 2.0).abs() < 0.3, "h = {}", slider_of(&a, "h"));
+        cmd(&mut a, r#"{"t":"cancelDrag"}"#);
+        assert_eq!((slider_of(&a, "h"), slider_of(&a, "k")), after_first);
+    }
+
+    #[test]
+    fn an_unselected_curve_is_panned_not_dragged() {
+        let mut a = app();
+        let (px, py) = selected_parabola(&mut a);
+        pick_at(&mut a, 10.0, 10.0); // clears the selection
+        hover_at(&mut a, 10.0, 10.0);
+        assert!(hover_event(&hover_at(&mut a, px, py)).unwrap().get("params").is_none());
+        ptr_at(&mut a, "down", px, py);
+        let ev = ptr_at(&mut a, "move", px + 40.0, py + 20.0);
+        assert!(!ev.iter().any(|e| e["t"] == "sliderValue" || e["t"] == "curveDrag"));
+        assert_eq!(slider_of(&a, "a"), 1.0);
+        assert_ne!(a.rig.world_to_pixel([2.0, 4.0, 0.0], (800.0, 600.0)), (px, py));
+    }
+
+    #[test]
+    fn a_curve_without_parameters_has_no_grab() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setMode","mode":"2d"}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"c","latex":"y=2x^2"}"#);
+        let (px, py) = a.rig.world_to_pixel([2.0, 8.0, 0.0], (800.0, 600.0));
+        pick_at(&mut a, px, py);
+        hover_at(&mut a, 10.0, 10.0);
+        assert!(hover_event(&hover_at(&mut a, px, py)).unwrap().get("params").is_none());
+        ptr_at(&mut a, "down", px, py);
+        let ev = ptr_at(&mut a, "move", px + 30.0, py);
+        assert!(!ev.iter().any(|e| e["t"] == "curveDrag"));
+    }
+
+    #[test]
+    fn escape_restores_the_starting_values() {
+        let mut a = app();
+        let (px, py) = selected_parabola(&mut a);
+        ptr_at(&mut a, "down", px, py);
+        ptr_at(&mut a, "move", px + 60.0, py - 40.0);
+        assert!(slider_of(&a, "h") != 0.0);
+        let ev = cmd(&mut a, r#"{"t":"cancelDrag"}"#);
+        assert!(ev.iter().any(|e| e["t"] == "curveDrag" && e["active"] == false && e["cancelled"] == true));
+        assert_eq!((slider_of(&a, "a"), slider_of(&a, "h"), slider_of(&a, "k")), (1.0, 0.0, 0.0));
+        // later moves of the same press do nothing
+        let ev = ptr_at(&mut a, "move", px + 90.0, py);
+        assert!(!ev.iter().any(|e| e["t"] == "sliderValue"));
+    }
+
+    const VP: (f64, f64) = (800.0, 600.0);
+
+    fn disp_px(a: &App, x: f64, y: f64) -> (f64, f64) {
+        a.rig.world_to_pixel(a.map.fwd3([x, y, 0.0]), VP)
+    }
+
+    fn set_sliders(a: &mut App, defs: &[(&str, f64, f64, f64)]) {
+        for (n, v, lo, hi) in defs {
+            cmd(a, &format!(r#"{{"t":"setSlider","name":"{n}","value":{v},"min":{lo},"max":{hi}}}"#));
+        }
+    }
+
+    /// Selects the curve under `(px, py)` with a click and starts a drag there.
+    fn select_and_press(a: &mut App, px: f64, py: f64) {
+        hover_at(a, 10.0, 10.0);
+        let ev = hover_at(a, px, py);
+        assert!(hover_event(&ev).is_some_and(|h| h["item"] != serde_json::Value::Null), "no curve under the pointer: {ev:?}");
+        pick_at(a, px, py);
+        let ev = ptr_at(a, "down", px, py);
+        assert!(ev.iter().any(|e| e["t"] == "curveDrag" && e["active"] == true), "no drag started: {ev:?}");
+    }
+
+    #[test]
+    fn dragging_a_curve_on_log_axes_keeps_it_under_the_pointer() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setMode","mode":"2d"}"#);
+        set_sliders(&mut a, &[("a", 1.0, 0.01, 100.0), ("b", 2.0, 0.0, 5.0)]);
+        cmd(&mut a, r#"{"t":"setExpr","id":"c","latex":"y=a*x^b"}"#);
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"setView","xScale":"log","yScale":"log","window":{"min":[0.1,0.01,-1],"max":[100,10000,1]}}"#,
+        );
+        assert!(error_msg(&ev).is_none(), "{ev:?}");
+        assert!(!a.map.is_linear());
+        let (px, py) = disp_px(&a, 1.0, 1.0);
+        select_and_press(&mut a, px, py);
+        // one decade right, two and a half decades... up: the curve must pass through (10, 500)
+        let (qx, qy) = disp_px(&a, 10.0, 500.0);
+        ptr_at(&mut a, "move", qx, qy);
+        let (aa, bb) = (slider_of(&a, "a"), slider_of(&a, "b"));
+        // a power law is a straight line in log-log display: translating it keeps the slope b
+        assert!((bb - 2.0).abs() < 0.1, "b = {bb}");
+        let (cx, cy) = disp_px(&a, 10.0, aa * 10f64.powf(bb));
+        assert!((cx - qx).abs() < 1.0 && (cy - qy).abs() < 3.0, "curve at ({cx},{cy}), pointer ({qx},{qy}), a={aa} b={bb}");
+        ptr_at(&mut a, "up", qx, qy);
+    }
+
+    #[test]
+    fn a_coarse_slider_step_snaps_without_drift() {
+        let run = |path: &[(f64, f64)]| {
+            let mut a = app();
+            cmd(&mut a, r#"{"t":"setMode","mode":"2d"}"#);
+            cmd(&mut a, r#"{"t":"setSlider","name":"a","value":1,"min":-5,"max":5,"step":0.5}"#);
+            cmd(&mut a, r#"{"t":"setSlider","name":"b","value":0,"min":-5,"max":5,"step":0.5}"#);
+            cmd(&mut a, r#"{"t":"setExpr","id":"c","latex":"y=a*x+b"}"#);
+            let (px, py) = disp_px(&a, 2.0, 2.0);
+            select_and_press(&mut a, px, py);
+            for (wx, wy) in path {
+                let (qx, qy) = disp_px(&a, *wx, *wy);
+                ptr_at(&mut a, "move", qx, qy);
+                for n in ["a", "b"] {
+                    let v = slider_of(&a, n);
+                    assert!(((v / 0.5).round() * 0.5 - v).abs() < 1e-9, "{n} = {v} is off the 0.5 grid");
+                }
+            }
+            (slider_of(&a, "a"), slider_of(&a, "b"))
+        };
+        // straight to the target, and by 40 small moves: the same step values, no drift
+        let direct = run(&[(2.7, 3.3)]);
+        let small: Vec<(f64, f64)> = (1..=40).map(|i| (2.0 + 0.7 * i as f64 / 40.0, 2.0 + 1.3 * i as f64 / 40.0)).collect();
+        let stepped = run(&small);
+        assert_eq!(direct, stepped, "path dependent: {direct:?} vs {stepped:?}");
+        // and back to where it started: the starting values return exactly
+        let mut round_trip = small.clone();
+        round_trip.extend((0..=40).map(|i| (2.7 - 0.7 * i as f64 / 40.0, 3.3 - 1.3 * i as f64 / 40.0)));
+        assert_eq!(run(&round_trip), (1.0, 0.0));
+    }
+
+    fn circle_setup(a: &mut App, latex: &str) {
+        cmd(a, r#"{"t":"setMode","mode":"2d"}"#);
+        cmd(a, &format!(r#"{{"t":"setExpr","id":"c","latex":"{latex}"}}"#));
+    }
+
+    #[test]
+    fn dragging_a_circle_by_its_edge_moves_its_center() {
+        let mut a = app();
+        set_sliders(&mut a, &[("h", 0.0, -10.0, 10.0), ("k", 0.0, -10.0, 10.0), ("r", 3.0, 0.5, 10.0)]);
+        circle_setup(&mut a, "(x-h)^2+(y-k)^2=r^2");
+        let (px, py) = disp_px(&a, 3.0, 0.0);
+        // a few pixels off the line still grabs it (10 px reach)
+        select_and_press(&mut a, px + 4.0, py + 3.0);
+        assert_eq!(a.selected.as_deref(), Some("c"), "selecting an implicit curve survives analysis");
+        let (qx, qy) = disp_px(&a, 4.0, 1.0);
+        ptr_at(&mut a, "move", qx + 4.0, qy + 3.0);
+        let (h, k, r) = (slider_of(&a, "h"), slider_of(&a, "k"), slider_of(&a, "r"));
+        assert!((h - 1.0).abs() < 0.15 && (k - 1.0).abs() < 0.15 && (r - 3.0).abs() < 0.15, "h={h} k={k} r={r}");
+        ptr_at(&mut a, "up", qx, qy);
+    }
+
+    #[test]
+    fn pulling_a_circle_radially_changes_its_radius_when_only_r_is_a_slider() {
+        let mut a = app();
+        set_sliders(&mut a, &[("r", 3.0, 0.5, 10.0)]);
+        circle_setup(&mut a, "x^2+y^2=r^2");
+        let (px, py) = disp_px(&a, 0.0, 3.0);
+        select_and_press(&mut a, px, py);
+        let (qx, qy) = disp_px(&a, 0.0, 5.0);
+        ptr_at(&mut a, "move", qx, qy);
+        let r = slider_of(&a, "r");
+        assert!((r - 5.0).abs() < 0.2, "r = {r}");
+        // Escape puts it back
+        cmd(&mut a, r#"{"t":"cancelDrag"}"#);
+        assert_eq!(slider_of(&a, "r"), 3.0);
+    }
+
+    #[test]
+    fn dragging_a_parametric_ellipse_translates_it() {
+        let mut a = app();
+        set_sliders(
+            &mut a,
+            &[("h", 0.0, -10.0, 10.0), ("k", 0.0, -10.0, 10.0), ("a", 3.0, 0.5, 8.0), ("b", 2.0, 0.5, 8.0)],
+        );
+        circle_setup(&mut a, "(h+a\\\\cos(t),k+b\\\\sin(t))");
+        let (px, py) = disp_px(&a, 3.0, 0.0);
+        select_and_press(&mut a, px, py + 5.0);
+        let (qx, qy) = disp_px(&a, 4.0, 1.0);
+        ptr_at(&mut a, "move", qx, qy + 5.0);
+        let v = |n| slider_of(&a, n);
+        assert!((v("h") - 1.0).abs() < 0.15 && (v("k") - 1.0).abs() < 0.15, "h={} k={}", v("h"), v("k"));
+        assert!((v("a") - 3.0).abs() < 0.15 && (v("b") - 2.0).abs() < 0.15, "a={} b={}", v("a"), v("b"));
+        ptr_at(&mut a, "up", qx, qy);
+    }
+
+    #[test]
+    fn dragging_a_polar_curve_changes_its_slider() {
+        let mut a = app();
+        set_sliders(&mut a, &[("a", 3.0, 0.5, 10.0)]);
+        circle_setup(&mut a, "r=a\\\\cos(\\\\theta)");
+        let (px, py) = disp_px(&a, 3.0, 0.0);
+        select_and_press(&mut a, px, py);
+        let (qx, qy) = disp_px(&a, 4.0, 0.0);
+        ptr_at(&mut a, "move", qx, qy);
+        let v = slider_of(&a, "a");
+        assert!((v - 4.0).abs() < 0.35, "a = {v}");
+    }
+
+    #[test]
+    fn implicit_curves_are_picked_on_log_axes_too() {
+        let mut a = app();
+        set_sliders(&mut a, &[("r", 3.0, 0.5, 10.0)]);
+        circle_setup(&mut a, "x^2+y^2=r^2");
+        cmd(&mut a, r#"{"t":"setView","xScale":"log","yScale":"log","window":{"min":[0.1,0.1,-1],"max":[100,100,1]}}"#);
+        // (x, y) = (2, sqrt(5)) is on the circle
+        let (px, py) = disp_px(&a, 2.0, 5f64.sqrt());
+        let ev = hover_at(&mut a, px + 2.0, py - 2.0);
+        assert_eq!(hover_event(&ev).expect("hover")["item"], "c", "{ev:?}");
+        let ev = hover_at(&mut a, px + 80.0, py - 80.0);
+        assert_eq!(hover_event(&ev).expect("cleared")["item"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn dragging_a_numeric_definition_rewrites_its_item() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setMode","mode":"2d"}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"d","latex":"b=0"}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"c","latex":"y=x^2+b"}"#);
+        let (px, py) = a.rig.world_to_pixel([2.0, 4.0, 0.0], (800.0, 600.0));
+        pick_at(&mut a, px, py);
+        ptr_at(&mut a, "down", px, py);
+        let (_, qy) = a.rig.world_to_pixel([2.0, 6.0, 0.0], (800.0, 600.0));
+        let ev = ptr_at(&mut a, "move", px, qy);
+        let e = ev.iter().find(|e| e["t"] == "itemEdited" && e["id"] == "d").expect("itemEdited");
+        let v: f64 = e["latex"].as_str().unwrap().trim_start_matches("b=").parse().unwrap();
+        assert!((v - 2.0).abs() < 0.1, "{e}");
+    }
+
+    #[test]
+    fn a_slider_at_its_range_end_is_not_driven_out_of_it() {
+        let mut a = app();
+        let (px, py) = selected_parabola(&mut a);
+        cmd(&mut a, r#"{"t":"setSlider","name":"a","value":5,"min":-5,"max":5}"#);
+        let (px, py) = (px, py);
+        ptr_at(&mut a, "down", px, py);
+        let (qx, qy) = a.rig.world_to_pixel([2.0, -8.0, 0.0], (800.0, 600.0));
+        ptr_at(&mut a, "move", qx, qy);
+        for n in ["a", "h", "k"] {
+            let v = slider_of(&a, n);
+            assert!((a.doc.sliders[n].min..=a.doc.sliders[n].max).contains(&v));
+        }
+    }
+
+    #[test]
+    fn the_selected_curves_points_follow_the_view_and_edits() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=sin(x)"}"#);
+        let (px, py) = a.rig.world_to_pixel([0.0, 0.0, 0.0], (800.0, 600.0));
+        let an = analysis(&pick_at(&mut a, px, py)).cloned().expect("selected");
+        let before = kinds(&an, "root").len();
+        assert!(before >= 5, "sin has several roots in -10..10, got {before}");
+        // zooming in to about -2..2 leaves only the root at 0
+        let ev = cmd(&mut a, r#"{"t":"setView","window":{"min":[-2,-2,-1],"max":[2,2,1]}}"#);
+        let an = analysis(&ev).expect("the points are recomputed for the new window");
+        let roots = kinds(an, "root");
+        assert!(roots.len() == 1 && roots[0].0.abs() < 1e-6, "only the root at 0 is in view, got {roots:?}");
+        // deleting the curve clears the selection
+        let ev = cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":""}"#);
+        let an = analysis(&ev).expect("cleared when the curve went away");
+        assert!(an["item"].is_null());
     }
 
     #[test]
@@ -3960,6 +5201,8 @@ mod tests {
     #[test]
     fn plane_inset_view_keeps_its_aspect_and_follows_until_changed() {
         let mut a = App::new((900, 600));
+        a.max_frame_dt_ms = f64::INFINITY;
+        a.rig.max_frame_dt_ms = f64::INFINITY;
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
         a.frame(0.0);
         a.frame(2000.0);

@@ -2,7 +2,8 @@
 //! be inspected without a window.
 //!
 //!   render_png --mode 3d --out sphere.png "x^2+y^2+z^2=36"
-//!   render_png --from 2d --to 3d --frames 6 --out-dir frames/ "y=x^2/4" "(3,2.25)"
+//!   render_png --from 2d --to 3d --frames 6 [--settle] --out-dir frames/ "y=x^2/4" "(3,2.25)"
+//!       (drives the real App through the switch; --settle builds the 3D scene at full quality first)
 //!   render_png --mode 2d "c:z^2-1"        (c: = complex, domain colouring)
 //!   render_png --table "x_1=1,2,3;y_1=2,4,3" [--table-line] "histogram(x_1)"   (data table)
 //!   render_png --slider a=0 --ticker "a -> a+0.5" --ticker-frames 8 --out t.png "y=a*x"
@@ -21,7 +22,7 @@ use math_core::doc::{Doc, Item, ItemKind, SliderCfg};
 use math_core::view::{Mode, Rig, Window3};
 use math_playground_lib::geometry::{SceneGeometry, Theme};
 use math_playground_lib::headless::{save_png, Headless};
-use math_playground_lib::render::{crossfade, layer_lift, Inset, Layer};
+use math_playground_lib::render::{Inset, Layer};
 use math_playground_lib::scene::{build_scene, build_slice_panel_view, ViewReq};
 use std::path::PathBuf;
 
@@ -47,6 +48,14 @@ fn view_req(doc: &Doc, mode: Mode, spec: Option<&str>) -> Result<Option<ViewReq>
     let [a, b, c, d] = v[..] else { return Err("--slice-view needs 4 numbers: xmin,xmax,ymin,ymax".into()) };
     let free = (0..mode.dims() as usize).filter(|i| !cfg.fixed.contains_key(math_core::slice::axis_name(*i))).collect();
     Ok(Some(ViewReq { free, view: [a, b, c, d] }))
+}
+
+fn to_name(m: Mode) -> &'static str {
+    match m {
+        Mode::D1 => "1d",
+        Mode::D2 => "2d",
+        Mode::D3 => "3d",
+    }
 }
 
 fn aspect_of(size: (u32, u32)) -> f64 {
@@ -193,34 +202,50 @@ fn main() -> Result<(), String> {
     let aspect = size.0 as f64 / size.1 as f64;
 
     if let (Some(from), Some(to)) = (get("--from"), get("--to")) {
+        // Drive the real App (the shell's code path: staged 3D build, split 2D layers, fades),
+        // sampling the switch at evenly spaced times of its tween.
+        use math_playground_lib::app::{App, Command};
         let (from, to) = (parse_mode(&from), parse_mode(&to));
         let frames: usize = get("--frames").and_then(|s| s.parse().ok()).unwrap_or(6);
         let dir = PathBuf::from(get("--out-dir").unwrap_or_else(|| "frames".into()));
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let mut rig = Rig::new(window, from);
-        rig.set_aspect(aspect);
-        let ga = geometry(&doc, from, &rig, size, &theme);
-        let gb = geometry(&doc, to, &rig, size, &theme);
-        for g in [&ga, &gb] {
-            for (id, msg) in &g.diagnostics {
-                eprintln!("diagnostic [{id}]: {msg}");
-            }
+        let mut doc = doc.clone();
+        doc.view.mode = match from {
+            Mode::D1 => math_core::doc::Mode::D1,
+            Mode::D2 => math_core::doc::Mode::D2,
+            Mode::D3 => math_core::doc::Mode::D3,
+        };
+        doc.view.window.min = window.min;
+        doc.view.window.max = window.max;
+        let mut app = App::new(size);
+        app.max_frame_dt_ms = f64::INFINITY; // sample exact tween times
+        app.run(Command::LoadDoc { json: math_core::doc::to_json(&doc) });
+        app.frame(0.0);
+        // `--settle`: finish the 3D build before the switch (frames then show the morph alone).
+        if args.iter().any(|a| a == "--settle") {
+            app.settle();
         }
-        rig.set_mode(to, 0.0);
+        app.run(Command::SetMode { mode: to_name(to).into() });
+        if args.iter().any(|a| a == "--settle") {
+            app.settle();
+        }
+        let dur = app.rig.duration_ms;
+        app.frame(1.0); // the first frame starts the tween clock
         for i in 0..frames {
             let t = i as f64 / (frames - 1).max(1) as f64;
-            rig.update(t * rig.duration_ms);
-            let p = rig.progress() as f32;
-            let (fa, fb) = crossfade(p);
-            let o = rig.render_origin();
-            let layers = [
-                Layer { geometry: &ga, fade: fa, origin: o, lift: layer_lift(from, rig.lift()) },
-                Layer { geometry: &gb, fade: fb, origin: o, lift: layer_lift(to, rig.lift()) },
-            ];
-            let rgba = gpu.render_rgba(size, &rig, &layers, theme.background);
+            app.frame(1.0 + t * dur);
+            let layers = app.layers();
+            let rgba = gpu.render_rgba(size, &app.rig, &layers, theme.background);
             let path = dir.join(format!("frame_{i:02}.png"));
             save_png(&path, size, &rgba)?;
-            eprintln!("{}  progress={p:.2}", path.display());
+            eprintln!(
+                "{}  progress={:.2} lift={:.2} layers={} fades={:?}",
+                path.display(),
+                app.rig.progress(),
+                app.rig.lift(),
+                layers.len(),
+                layers.iter().map(|l| (l.fade * 100.0).round() / 100.0).collect::<Vec<_>>()
+            );
         }
         return Ok(());
     }

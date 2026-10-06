@@ -97,6 +97,9 @@ pub struct FieldSpec {
 pub struct SceneGeometry {
     pub fields: Vec<FieldSpec>,
     pub segments: Vec<SegmentInstance>,
+    /// How many of the leading `segments` are the backdrop (grid, axes, arrows): a mode switch
+    /// fades those on a different schedule than the items drawn after them.
+    pub backdrop_segments: usize,
     /// Lines that lie ON surfaces (slice curves). Drawn after `segments` with depth test but no
     /// depth write, optionally pulled towards the camera by `SegmentInstance::with_depth_bias`.
     pub overlay_segments: Vec<SegmentInstance>,

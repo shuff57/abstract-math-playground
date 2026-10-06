@@ -506,6 +506,7 @@ impl Program {
                         Op::Sub => a - b,
                         Op::Mul => a * b,
                         Op::Div => a / b,
+                        _ if b == 2.0 => a * a,
                         _ => a.powf(b),
                     });
                 }

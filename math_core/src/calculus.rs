@@ -240,9 +240,14 @@ pub fn try_deriv_angle(expr: &Expr, var: &str, angle: Angle) -> Result<Expr, Cal
 
 /// The `n`-th derivative (`n = 0` returns the simplified expression).
 pub fn nth_deriv(expr: &Expr, var: &str, order: usize) -> Result<Expr, CalcError> {
+    nth_deriv_angle(expr, var, order, Angle::Rad)
+}
+
+/// Like [`nth_deriv`] for an expression whose trig functions use `angle`.
+pub fn nth_deriv_angle(expr: &Expr, var: &str, order: usize, angle: Angle) -> Result<Expr, CalcError> {
     let mut e = simplify(expr);
     for _ in 0..order {
-        e = try_deriv(&e, var)?;
+        e = try_deriv_angle(&e, var, angle)?;
     }
     Ok(e)
 }

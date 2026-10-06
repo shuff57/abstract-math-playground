@@ -155,6 +155,17 @@ impl Tween {
     }
 }
 
+/// The part of a frame's elapsed time `dt` that advances a tween: `dt` clamped to `max`
+/// (non-finite or negative `dt` count as 0; a non-positive `max` as no limit).
+pub fn clamp_frame_dt(dt: f64, max: f64) -> f64 {
+    let dt = if dt.is_finite() && dt > 0.0 { dt } else { 0.0 };
+    if max > 0.0 {
+        dt.min(max)
+    } else {
+        dt
+    }
+}
+
 /// Ease-in-out cubic. Clamped; ease(0)=0, ease(1)=1, zero slope at both ends.
 pub fn ease(t: f64) -> f64 {
     let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
@@ -313,7 +324,16 @@ pub struct Rig {
     pub reduced_motion: bool,
     tween: Option<Tween>,
     now_ms: f64,
+    /// The tween's own clock: `now_ms` advanced by at most `max_frame_dt_ms` per `update`.
+    clock_ms: f64,
+    /// Longest time one frame may advance a tween. A stalled frame (a scene upload, a GC pause,
+    /// a backgrounded tab) then costs the animation one frame, not its whole duration, so the
+    /// motion never freezes and jumps. Infinite = follow the wall clock exactly.
+    pub max_frame_dt_ms: f64,
 }
+
+/// What the app feeds [`Rig::max_frame_dt_ms`]: three 60 Hz frames.
+pub const MAX_FRAME_DT_MS: f64 = 50.0;
 
 pub const DEFAULT_YAW: f64 = -PI / 4.0;
 pub const DEFAULT_PITCH: f64 = 0.5;
@@ -341,6 +361,8 @@ impl Rig {
             reduced_motion: false,
             tween: None,
             now_ms: 0.0,
+            clock_ms: 0.0,
+            max_frame_dt_ms: f64::INFINITY,
         }
     }
 
@@ -374,7 +396,7 @@ impl Rig {
     /// `update` after the switch).
     pub fn progress(&self) -> f64 {
         match &self.tween {
-            Some(t) => t.progress(self.now_ms),
+            Some(t) => t.progress(self.clock_ms),
             None => 1.0,
         }
     }
@@ -390,9 +412,11 @@ impl Rig {
     /// finishes the tween when its time is up.
     pub fn update(&mut self, now_ms: f64) {
         if now_ms.is_finite() {
+            let dt = (now_ms - self.now_ms).max(0.0);
+            self.clock_ms += clamp_frame_dt(dt, self.max_frame_dt_ms);
             self.now_ms = now_ms;
         }
-        let now = self.now_ms;
+        let now = self.clock_ms;
         if let Some(t) = &mut self.tween {
             let start = *t.start_ms.get_or_insert(now);
             if now - start >= t.duration_ms {
@@ -430,7 +454,7 @@ impl Rig {
         let aspect = clamp_aspect(aspect);
         let to = self.target_state(self.mode, aspect);
         match &self.tween {
-            Some(t) => lerp_state(&t.from, &to, ease(t.progress(self.now_ms))),
+            Some(t) => lerp_state(&t.from, &to, ease(t.progress(self.clock_ms))),
             None => to,
         }
     }
@@ -825,6 +849,62 @@ mod tests {
         }
         assert_eq!(frames, (r.duration_ms / (1000.0 / 60.0)).ceil() as usize);
         assert!(mat_close(&r.view_proj(1.5), &Rig::new(win(), Mode::D3).view_proj(1.5), 1e-12));
+    }
+
+    #[test]
+    fn clamp_frame_dt_cases() {
+        assert_eq!(clamp_frame_dt(16.0, 50.0), 16.0);
+        assert_eq!(clamp_frame_dt(1800.0, 50.0), 50.0);
+        assert_eq!(clamp_frame_dt(-5.0, 50.0), 0.0);
+        assert_eq!(clamp_frame_dt(f64::NAN, 50.0), 0.0);
+        assert_eq!(clamp_frame_dt(900.0, f64::INFINITY), 900.0);
+        assert_eq!(clamp_frame_dt(900.0, 0.0), 900.0);
+    }
+
+    #[test]
+    fn a_stalled_frame_costs_the_tween_one_frame_not_its_duration() {
+        let mut r = Rig::new(win(), Mode::D2);
+        r.set_aspect(1.5);
+        r.max_frame_dt_ms = MAX_FRAME_DT_MS;
+        r.update(0.0);
+        r.set_mode(Mode::D3, 0.0);
+        r.update(16.0); // first frame: starts the clock
+        assert_eq!(r.progress(), 0.0);
+        r.update(16.0 + 1850.0); // the 1.8 s stall seen on a 2D -> 3D click
+        assert!(r.is_animating(), "a stall must not finish the animation");
+        let p = r.progress();
+        assert!((p - MAX_FRAME_DT_MS / r.duration_ms).abs() < 1e-9, "{p}");
+        // And it still takes the rest of its duration in normal frames.
+        let mut t = 16.0 + 1850.0;
+        let mut frames = 0;
+        while r.is_animating() {
+            t += 16.0;
+            r.update(t);
+            frames += 1;
+            assert!(frames < 100);
+        }
+        assert!(frames >= 27, "{frames}");
+    }
+
+    #[test]
+    fn an_idle_gap_before_a_switch_does_not_eat_it() {
+        let mut r = Rig::new(win(), Mode::D2);
+        r.max_frame_dt_ms = MAX_FRAME_DT_MS;
+        r.update(0.0);
+        r.update(60_000.0); // the frame loop slept for a minute
+        r.set_mode(Mode::D3, 60_000.0);
+        r.update(60_016.0);
+        assert!(r.is_animating() && r.progress() == 0.0);
+    }
+
+    #[test]
+    fn unclamped_rig_follows_the_wall_clock() {
+        let mut r = Rig::new(win(), Mode::D2);
+        r.update(0.0);
+        r.set_mode(Mode::D3, 0.0);
+        r.update(10.0);
+        r.update(10.0 + 250.0);
+        assert!((r.progress() - 0.5).abs() < 1e-9);
     }
 
     #[test]

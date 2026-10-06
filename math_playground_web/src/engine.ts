@@ -10,7 +10,7 @@ export interface DocItem { id: string; kind: Kind; latex: string; hidden?: boole
 export interface SliderCfg { min: number; max: number; step?: number; value: number }
 export interface DocJson { v: number; view: { mode: string; window: { min: number[]; max: number[] }; angle?: string }; items: DocItem[]; sliders?: Record<string, SliderCfg> }
 export interface TableState { id: string; columns: { name: string; cells: string[] }[]; rows: number; style: string }
-export interface ScreenLabel { text: string; axis: number; x: number; y: number; visible: boolean; inset?: boolean }
+export interface ScreenLabel { text: string; axis: number; x: number; y: number; visible: boolean; alpha?: number; inset?: boolean }
 
 export interface ItemInfo {
   id: string; kind: "derivative" | "value" | "regression";

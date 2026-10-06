@@ -79,7 +79,9 @@ The analyser (`analyze.rs`) picks a kind for each item:
 | `r = f(theta)` | polar curve |
 | `x^2+y^2=9`, `x^2+y^2+z^2=36` | implicit curve / surface |
 | `y < x^2`, `x^2+y^2<=4` | inequality region |
-| `(cos(t), sin(t))` | parametric curve (uses `t`) |
+| `(cos(t), sin(t))`, `(cos(t), sin(t), t/4)` | parametric curve, 2D or 3D (uses `t`) |
+| `x=3cos(t), y=2sin(t)` | the same parametric curve as `(3cos(t), 2sin(t))`; also as separate rows |
+| `(cos(u)cos(v), sin(u)cos(v), sin(v))` | parametric surface (3 components using both `u` and `v`, 3D mode) |
 | `(1, 2)`, `(1, 2, 3)` | point |
 | `(-y, x)` | vector field (tuple of x, y(, z) without `t`), 1 to 3 components |
 | `[1, 2, 3]` | list |
@@ -87,7 +89,13 @@ The analyser (`analyze.rs`) picks a kind for each item:
 | `sin(x)+y`, `x^2+y^2` (no `=`) | scalar field coloured over the plane |
 | `2+3`, `int(x^2, x, 0, 2)` | value (shown as a read-out) |
 
-Parametric `t` runs over `[0, 2*pi]` (`[0, 360]` in degree mode). Polar `theta` runs over `[0, 4*pi]` when theta only appears inside trig functions, else `[0, 6*pi]` (for spirals); degree-mode equivalents in degree mode. Scalar fields can only use `x` and `y`; a field that mentions `z` is reported as an error.
+Parametric `t` runs over `[0, 2*pi]` (`[0, 360]` in degree mode) unless the item gives a range (next section). Polar `theta` runs over `[0, 4*pi]` when theta only appears inside trig functions, else `[0, 6*pi]` (for spirals); degree-mode equivalents in degree mode. Scalar fields can only use `x` and `y`; a field that mentions `z` is reported as an error.
+
+### How curves and surfaces are drawn where they are awkward
+
+* **Degenerate shapes that touch zero without changing sign are drawn.** `(x-0.37)^2+(y-0.21)^2=0` is a dot, `(x-y)^2=0` and `x^2=0` are the (double) line, `(x^2+y^2-4)^2=0` is the circle. In 3D a point quadric `(x-a)^2+(y-b)^2+(z-c)^2=0` is a small ball (about one grid cell across, so it is visible), a line quadric `(x-a)^2+(y-b)^2=0` is a thin tube, and a squared factor `(x^2+y^2+z^2-9)^2=0` is the surface itself, once. A feature smaller than one grid cell (`x^2+y^2=0.00000001`) is also drawn as a dot or ball instead of vanishing.
+* **Graphs `y=f(x)`, `x=f(y)` and `z=f(x,y)` break where the function does.** No segment or sheet joins the two sides of a pole (`tan(x)`, `1/x`, `1/(x^2+y^2)`) or a jump (`floor(x)`, `sign(x)`: only the treads are drawn), and a surface ends exactly on the edge of its domain (`z=sqrt(16-x^2-y^2)` has a clean rim, no ragged edge). `y=f(x,z)` and `x=f(y,z)` surfaces behave the same. The same break is applied to implicit surfaces, such as `z=tan(x)` written as `tan(x)-z=0`, but there the cut edge is up to one grid cell ragged.
+* **Surfaces are fast.** `z=f(x,y)` is sampled on a grid (one evaluation per node, finer on steep walls) instead of searched in 3D; implicit surfaces share corner values between cells and find each crossing in a few evaluations.
 
 Examples:
 
@@ -223,12 +231,59 @@ sin(z)
 
 Not available: inverse trig and inverse hyperbolic functions (`asin`, `acos`, `atan` and friends), `cbrt`, `floor`/`round`, `min`/`max`, lists, relations, `sum`, `int`, `prod`. These are reported as unknown functions or not-scalar errors.
 
+## Parametric curves and surfaces
+
+### Ranges: a trailing `{ ... }`
+
+A group of comparisons at the END of an item restricts its parameter (Desmos' domain restriction):
+
+```
+(t^2, 2t) {-3<=t<=3}                          both halves of a parabola
+(2cos(t), 2sin(t), t/4-6) {0<=t<=12pi}        a helix of six turns
+r = theta/3 {0<=theta<=24}                    a spiral over a chosen theta range
+(cos(t), sin(t)) {0<=t<=a pi}                 a slider moves the end of the arc
+(u, v, u v) {0<=u<=1, 0<=v<=1}                a surface patch
+(cos(t), t) {t>=-2}                           one end only: the other keeps its default
+```
+
+* The group is `{...}` (LaTeX `\left\{ ... \right\}` works too) holding one or more comparisons separated by `,` or `;`. Each is `a<=t<=b`, `b>=t>=a` (strict `<`/`>` are the same here), or one-sided `t<=b` / `t>=a`. The parameter is `t` for parametric curves, `theta` for polar curves and `u`, `v` for surfaces; a range on another name is a diagnostic (`... does not apply here`).
+* The bounds are ordinary expressions of constants, `pi`, sliders and definitions. A slider name that does not exist yet is the usual `undefined variable` diagnostic, so the app offers a slider for it. In degree mode the bounds are degrees (`{0<=t<=180}`).
+* A one-sided range moves only that end: `t>=a` runs `[a, 2pi]` (or `[a, a+2pi]` when `a` is already past `2pi`); `t<=b` runs `[0, b]` (or `[b-2pi, b]` when `b` is not above 0). Polar curves use their own default span in the same way.
+* An empty or non-finite range (`{3<=t<=1}`) is a diagnostic and draws nothing.
+* A `{...}` group is only taken as a range when it is last, is not a `^{...}`/`_{...}` script, and contains a comparison. On an item that is not a parametric curve, polar curve or parametric surface (for example `y=x^2 {x>0}`) it is reported (`a {range} applies to ...`); piecewise or restricted explicit curves are not supported.
+* Long ranges get more samples (a curve over `k` default turns uses `k` times as many, up to 120,000 points). Closed and open arcs need nothing special.
+
+### `x=`, `y=`, `z=` pairs
+
+`x=3cos(t), y=2sin(t)` in one row (separated by `,` or `;`, any order) is exactly the tuple `(3cos(t), 2sin(t))`; with `z=...` a space curve. Separate rows `x=3cos(t)` and `y=2sin(t)` (and `z=t/4`) are fused into one curve too: the first visible row of each axis is used, the rows must use `t` (or `u` and `v` for a surface) and not x, y or z on the right, and the fused curve takes the colour and style of the x row (a range may be written on any of the rows). `x=2`, `y=3` (no parameter) stay two lines.
+
+### Parametric surfaces
+
+`(x(u,v), y(u,v), z(u,v))`, three components that use both `u` and `v` and no `t`, is a surface in 3D mode:
+
+```
+(3cos(u)cos(v), 3cos(u)sin(v), 3sin(u))                          sphere
+((3+cos(v))cos(u), (3+cos(v))sin(u), sin(v))                     torus
+(v cos(u), v sin(u), u/2) {-6<=u<=6, -5<=v<=5}                   helicoid
+((2+v cos(u/2))cos(u), (2+v cos(u/2))sin(u), v sin(u/2)) {-1<=v<=1}   Moebius strip
+(v cos(u), v sin(u), v) {0<=v<=3}                                cone
+(a u, v, u^2 - v^2) {-2<=u<=2, -2<=v<=2}                         `a` becomes a slider
+```
+
+* `u` and `v` default to `[0, 2*pi]` each (`[0, 360]` in degrees). Note that a full `[0, 2pi]` range of the sphere formula above covers the sphere twice; `{-pi/2<=u<=pi/2}` covers it once.
+* `u` and `v` are always the surface parameters, even if a slider of that name exists. Other free names are sliders as usual.
+* It is drawn with the same lighting, two-sided shading, per-item colour and opacity as other surfaces, and is clipped to the window box (triangles are cut at the box faces).
+* The grid has at least 96 x 96 cells and refines itself from the surface's size in the window (up to 640 per direction and about 180,000 vertices, fewer while a preview is built). Cells with an undefined corner are left out (holes), triangles that leap across a discontinuity are dropped, and poles and cone apexes get a sound normal. Closed surfaces share their seam and pole vertices (no cracks, no open edges); the Moebius strip's seam keeps two normals but its edges meet in space.
+* In 2D mode a parametric surface draws nothing and reports nothing (the same as `z=f(x,y)` in 2D: the same expression is drawn per mode, see ROADMAP). In 1D it draws nothing.
+* A curve or surface in a tuple with both `t` and `u`/`v` is a curve in `t`; `(u, 2)` and `(a, b, c)` stay points. Not supported: intersection curves of two surfaces, filled volumes, slicing a parametric surface with the slice plane.
+
 ## Tuples and vector fields
 
 ```
 (1, 2)                     point
 (1, 2, 3)                  3D point
-(cos(t), sin(t))           parametric (has t)
+(cos(t), sin(t))           parametric (has t); `(cos(t), sin(t)) {0<=t<=pi}` limits t
+(cos(u), sin(u), v)        parametric surface (3 components with u and v)
 (-y, x)                    2D vector field, arrows
 (x, y, z)                  3D vector field
 ```
@@ -265,7 +320,7 @@ Set it with `setSlice` (or `--slice` in `render_png`). The inset has its own vie
 
 ## Angle mode
 
-`rad` (default) or `deg`. In degree mode trig functions take degrees and inverse trig returns degrees, and the parametric `t` range becomes 0 to 360. Set it with `setAngle` (`--angle deg` in the native app and `render_png`). Complex items ignore it.
+`rad` (default) or `deg`. In degree mode trig functions take degrees and inverse trig returns degrees, and the default parametric `t` (and `u`, `v`) range becomes 0 to 360 (ranges you write are in degrees too). Set it with `setAngle` (`--angle deg` in the native app and `render_png`). Complex items ignore it.
 
 ## Comments and notes
 

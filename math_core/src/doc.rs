@@ -107,6 +107,28 @@ pub struct ViewState {
     pub x_scale: AxisScale,
     #[serde(default, skip_serializing_if = "AxisScale::is_linear")]
     pub y_scale: AxisScale,
+    /// Print weight: thicker lines and bigger points for graphs pasted into documents
+    /// (additive field; saved only when not normal). Applied when drawing, so item styles are
+    /// untouched.
+    #[serde(default, skip_serializing_if = "Weight::is_normal")]
+    pub weight: Weight,
+}
+
+/// How heavy the graph is drawn (lines, points; the shell also enlarges the numbers).
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Weight {
+    #[default]
+    Normal,
+    Bold,
+    Extra,
+}
+
+impl Weight {
+    pub fn is_normal(&self) -> bool {
+        *self == Weight::Normal
+    }
 }
 
 /// The 2D grid: lines parallel to the axes, or circles and spokes around the origin.
@@ -581,6 +603,7 @@ impl Doc {
                 grid_kind: GridKind::Rect,
                 x_scale: AxisScale::Linear,
                 y_scale: AxisScale::Linear,
+                weight: Weight::Normal,
             },
             items: Vec::new(),
             sliders: BTreeMap::new(),
@@ -868,6 +891,25 @@ mod tests {
         // Bad values are rejected.
         let bad = j.replace("125.0", "-1.0");
         assert!(matches!(from_json(&bad), Err(DocError::Invalid(_))));
+    }
+
+    #[test]
+    fn weight_round_trips_defaults_quietly_and_rejects_unknown_values() {
+        let j = to_json(&Doc::new_default());
+        assert!(!j.contains("weight"), "{j}");
+        // A document written before the field existed loads as normal.
+        assert_eq!(from_json(&j).unwrap().view.weight, Weight::Normal);
+        for (w, name) in [(Weight::Bold, "bold"), (Weight::Extra, "extra")] {
+            let mut d = rich_doc();
+            d.view.weight = w;
+            let j = to_json(&d);
+            assert!(j.contains(&format!(r#""weight":"{name}""#)), "{j}");
+            assert_eq!(from_json(&j).unwrap(), d);
+            assert_eq!(decode_hash(&encode_hash(&d)).unwrap(), d);
+        }
+        let mut d = rich_doc();
+        d.view.weight = Weight::Bold;
+        assert!(from_json(&to_json(&d).replace(r#""weight":"bold""#, r#""weight":"heavy""#)).is_err());
     }
 
     #[test]

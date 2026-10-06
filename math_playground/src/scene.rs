@@ -13,7 +13,14 @@
 //!   stay in scope. Empty rows are ignored silently.
 //! * Parametric `t` range is `[0, 2*pi]` (`[0, 360]` in degree mode, where trig takes degrees).
 //!   Polar `theta` range is `[0, 4*pi]` when theta only occurs inside trig functions, else
-//!   `[0, 6*pi]` (spirals); degrees equivalents in degree mode.
+//!   `[0, 6*pi]` (spirals); degrees equivalents in degree mode. A trailing `{a<=t<=b}` replaces
+//!   the default (`{a<=theta<=b}` for polar curves; bounds may use constants, `pi` and sliders;
+//!   a single end moves only that end).
+//! * `(x(u,v), y(u,v), z(u,v))` is a parametric SURFACE over `u, v` in `[0, 2*pi]` (degrees:
+//!   `[0, 360]`) unless a `{a<=u<=b, c<=v<=d}` range says otherwise. It is drawn in 3D mode only;
+//!   in 2D mode it draws nothing (like `z = f(x, y)`), without a diagnostic.
+//! * `x=f(t)` and `y=g(t)` (and `z=h(t)`) as separate rows, or `x=f(t), y=g(t)` in one row,
+//!   are one parametric curve.
 //! * Line widths are physical pixels: grid 1.0/1.5, axes 2.0, curves 2.5, dots 9.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,12 +30,16 @@ use math_core::analyze::{analyze, Kind};
 use math_core::ast::{BinOp, Expr, Rel};
 use math_core::compile::{compile, Angle, Program};
 use math_core::complex::{compile_complex, parse_complex};
-use math_core::doc::{AngleMode, Doc, Item, ItemKind, ItemStyle, LineStyle, PointStyle};
+use math_core::doc::{
+    AngleMode, Doc, Item, ItemKind, ItemStyle, LineStyle, PointStyle, Weight,
+};
 use math_core::list::{eval_value, Bindings, Value};
 use math_core::mesh;
+use math_core::mesh_param;
 use math_core::parse::{parse_with, ParseCtx};
 use math_core::resolve::Defs;
 use math_core::slice::ResolvedSlice;
+use math_core::special::find_roots;
 use math_core::stats;
 use math_core::table::{ColumnStyle, ParsedColumn};
 use math_core::view::{Mode, Window3};
@@ -57,6 +68,23 @@ const DOT_W: f32 = 9.0;
 /// Width of a table column's point outline ring (pixels on each side).
 const OUTLINE_W: f32 = 2.0;
 const TICK_PX: f64 = 4.0;
+/// Largest point size (pixels) the print weight enlarges to.
+const MAX_POINT_PX: f32 = 40.0;
+/// Print weight multipliers of (curve/axis/tick line widths, grid line widths, point sizes). The
+/// grid scales less than the curves so that "extra bold" does not bury the plot in grid.
+const WEIGHT_MUL: [(Weight, f32, f32, f32); 3] = [
+    (Weight::Normal, 1.0, 1.0, 1.0),
+    (Weight::Bold, 1.6, 1.3, 1.3),
+    (Weight::Extra, 2.2, 1.5, 1.6),
+];
+/// The multipliers `(lines, grid, points)` of a print weight.
+pub(crate) fn weight_mul(w: Weight) -> (f32, f32, f32) {
+    let (_, l, g, p) = WEIGHT_MUL
+        .into_iter()
+        .find(|(x, ..)| *x == w)
+        .unwrap_or(WEIGHT_MUL[0]);
+    (l, g, p)
+}
 const MESH_ALPHA: f32 = 0.92;
 /// Opacity of a domain-coloured complex plane in 3D (so surfaces/axes behind still read).
 const DOMAIN_ALPHA_3D: f32 = 0.9;
@@ -316,6 +344,15 @@ struct BuildExt {
     /// `showLabel` of the item being drawn: custom text (or `None` for coordinates) and how many
     /// labels it may still place.
     labels: Option<(Option<String>, usize)>,
+    /// Print weight multiplier of line widths (curves, axes, ticks, arrows; dashes follow).
+    line_mul: f32,
+    /// Print weight multiplier of the grid lines (and the 3D box edges); gentler than `line_mul`
+    /// so a heavy weight does not turn the grid into a wall.
+    grid_mul: f32,
+    /// Print weight multiplier of point sizes (before the clamp, see [`Builder::point_px`]).
+    point_mul: f32,
+    /// Transient render scale (export at a larger pixel size), already part of both multipliers.
+    scale: f32,
 }
 
 impl Default for BuildExt {
@@ -333,6 +370,10 @@ impl Default for BuildExt {
             map: AxisMap::LINEAR,
             world_in: false,
             labels: None,
+            line_mul: 1.0,
+            grid_mul: 1.0,
+            point_mul: 1.0,
+            scale: 1.0,
         }
     }
 }
@@ -346,6 +387,8 @@ struct Prepared<'a> {
     complex: Option<Expr>,
     /// The parsed expression as written (before definitions are resolved).
     expr: Expr,
+    /// The ranges of a trailing `{a<=t<=b}` (see `math_core::param`).
+    domain: Vec<math_core::param::Range>,
 }
 
 /// A table item with its cells parsed (see `math_core::table`).
@@ -458,7 +501,33 @@ impl<'a> Builder<'a> {
         ]
     }
 
+    /// A line segment of `w` nominal pixels, drawn at the print weight.
     fn seg(&mut self, a: [f64; 3], b: [f64; 3], w: f32, color: [f32; 4]) {
+        self.seg_raw(a, b, w * self.ext.line_mul, color);
+    }
+
+    /// A grid line of `w` nominal pixels, drawn at the (gentler) grid print weight.
+    fn gseg(&mut self, a: [f64; 3], b: [f64; 3], w: f32, color: [f32; 4]) {
+        self.seg_raw(a, b, w * self.ext.grid_mul, color);
+    }
+
+    /// A point size in pixels at the print weight, at most [`MAX_POINT_PX`] (never below the
+    /// requested size).
+    fn point_px(&self, v: f32) -> f32 {
+        let (m, s) = (self.ext.point_mul, self.ext.scale);
+        if m == s {
+            return v * m;
+        }
+        (v * m).min((MAX_POINT_PX * s).max(v * s))
+    }
+
+    /// A dot of `w` nominal pixels, drawn at the print weight.
+    fn dseg(&mut self, p: [f64; 3], w: f32, color: [f32; 4]) {
+        self.seg_raw(p, p, self.point_px(w), color);
+    }
+
+    /// [`Builder::seg`] with the final width (no print weight applied).
+    fn seg_raw(&mut self, a: [f64; 3], b: [f64; 3], w: f32, color: [f32; 4]) {
         let (p0, p1) = (self.rb(a), self.rb(b));
         if p0.iter().chain(p1.iter()).all(|v| v.is_finite()) {
             self.out
@@ -468,7 +537,7 @@ impl<'a> Builder<'a> {
     }
 
     fn dot(&mut self, p: [f64; 3], color: [f32; 4]) {
-        self.seg(p, p, DOT_W, color);
+        self.dseg(p, DOT_W, color);
     }
 
     /// A flat, UNLIT, translucent axis-aligned rectangle on the plane z = 0 (histogram bars,
@@ -520,7 +589,8 @@ impl<'a> Builder<'a> {
             return;
         }
         if let Some((on, off)) = st.dash {
-            return self.dashed(pts, st, on, off);
+            let m = self.ext.line_mul as f64;
+            return self.dashed(pts, st, on * m, off * m);
         }
         for w in pts.windows(2) {
             self.seg(w[0], w[1], st.line_w, st.color);
@@ -597,11 +667,11 @@ impl<'a> Builder<'a> {
         if !p.iter().all(|v| v.is_finite()) {
             return;
         }
-        let size = st.point_size as f64;
+        let size = self.point_px(st.point_size) as f64;
         let k = self.px_per_unit();
         let off = |dx: f64, dy: f64| [p[0] + dx / k[0], p[1] + dy / k[1], p[2]];
         match (st.point, self.ext.mode) {
-            (PointStyle::Dot, _) | (_, Mode::D3) => self.seg(p, p, st.point_size, st.color),
+            (PointStyle::Dot, _) | (_, Mode::D3) => self.seg_raw(p, p, size as f32, st.color),
             (PointStyle::Circle, _) => {
                 let rw = (size * 0.22).max(1.5);
                 let r = ((size - rw) * 0.5).max(0.5);
@@ -612,21 +682,21 @@ impl<'a> Builder<'a> {
                     })
                     .collect();
                 for w in ring.windows(2) {
-                    self.seg(w[0], w[1], rw as f32, st.color);
+                    self.seg_raw(w[0], w[1], rw as f32, st.color);
                 }
             }
             (PointStyle::Cross, _) => {
                 let cw = (size * 0.22).max(1.5);
                 let h = ((size - cw) * 0.5).max(0.5);
-                self.seg(off(-h, -h), off(h, h), cw as f32, st.color);
-                self.seg(off(-h, h), off(h, -h), cw as f32, st.color);
+                self.seg_raw(off(-h, -h), off(h, h), cw as f32, st.color);
+                self.seg_raw(off(-h, h), off(h, -h), cw as f32, st.color);
             }
             (PointStyle::Square, _) => {
                 let sw = (size * 0.18).max(1.5);
                 let h = ((size - sw) * 0.5).max(0.5);
                 let c = [off(-h, -h), off(h, -h), off(h, h), off(-h, h), off(-h, -h)];
                 for w in c.windows(2) {
-                    self.seg(w[0], w[1], sw as f32, st.color);
+                    self.seg_raw(w[0], w[1], sw as f32, st.color);
                 }
             }
         }
@@ -825,7 +895,7 @@ impl<'a> Builder<'a> {
                     } else {
                         (MINOR_W, minor_c)
                     };
-                    self.seg(a, b, w, c);
+                    self.gseg(a, b, w, c);
                 }
             }
         }
@@ -929,7 +999,7 @@ impl<'a> Builder<'a> {
                     for i in 1..=n {
                         let cur = pt(i);
                         if let Some((a, b)) = self.clip_to_window(prev, cur) {
-                            self.seg([a[0], a[1], 0.0], [b[0], b[1], 0.0], w, c);
+                            self.gseg([a[0], a[1], 0.0], [b[0], b[1], 0.0], w, c);
                         }
                         prev = cur;
                     }
@@ -946,7 +1016,7 @@ impl<'a> Builder<'a> {
             let Some((a, b)) = self.clip_to_window([0.0, 0.0], far) else {
                 continue;
             };
-            self.seg([a[0], a[1], 0.0], [b[0], b[1], 0.0], MAJOR_W, major_c);
+            self.gseg([a[0], a[1], 0.0], [b[0], b[1], 0.0], MAJOR_W, major_c);
             // Every spoke but 0 (the positive x axis) is labelled with its angle.
             if !labels || j == 0 {
                 continue;
@@ -998,7 +1068,7 @@ impl<'a> Builder<'a> {
                         } else {
                             (MINOR_W, minor_c)
                         };
-                        self.seg(a, b, w, c);
+                        self.gseg(a, b, w, c);
                     }
                 }
             }
@@ -1023,7 +1093,7 @@ impl<'a> Builder<'a> {
                     b[other] = z;
                     self.seg(a, b, AXIS_W, axis_c);
                     for t in ticks[axis].iter().filter(|t| t.major) {
-                        let h = TICK_PX * upp[other];
+                        let h = TICK_PX * self.ext.line_mul as f64 * upp[other];
                         let (mut p, mut q) = ([0.0; 3], [0.0; 3]);
                         p[axis] = t.pos;
                         q[axis] = t.pos;
@@ -1153,14 +1223,14 @@ impl<'a> Builder<'a> {
         let y_visible = lo[0] <= 0.0 && 0.0 <= hi[0];
         if x_visible {
             self.seg([lo[0], 0.0, 0.0], [hi[0], 0.0, 0.0], AXIS_W, axis_c);
-            let h = TICK_PX * (hi[1] - lo[1]) / vh;
+            let h = TICK_PX * self.ext.line_mul as f64 * (hi[1] - lo[1]) / vh;
             for (_, v) in multiples(lo[0], hi[0], steps[0]) {
                 self.seg([v, -h, 0.0], [v, h, 0.0], MINOR_W * 1.5, axis_c);
             }
         }
         if y_visible {
             self.seg([0.0, lo[1], 0.0], [0.0, hi[1], 0.0], AXIS_W, axis_c);
-            let h = TICK_PX * (hi[0] - lo[0]) / vw;
+            let h = TICK_PX * self.ext.line_mul as f64 * (hi[0] - lo[0]) / vw;
             for (_, v) in multiples(lo[1], hi[1], steps[1]) {
                 self.seg([-h, v, 0.0], [h, v, 0.0], MINOR_W * 1.5, axis_c);
             }
@@ -1169,7 +1239,8 @@ impl<'a> Builder<'a> {
         self.axis_labels(1, steps[1], [cx, cy, 0.0], true);
         if self.ext.arrows {
             // Open arrowheads, 10 px long, at the positive end of each visible axis.
-            let (ax, ay) = (ARROW_PX * (hi[0] - lo[0]) / vw, ARROW_PX * (hi[1] - lo[1]) / vh);
+            let ap = ARROW_PX * self.ext.line_mul as f64;
+            let (ax, ay) = (ap * (hi[0] - lo[0]) / vw, ap * (hi[1] - lo[1]) / vh);
             if x_visible {
                 for s in [-1.0, 1.0] {
                     self.seg([hi[0], 0.0, 0.0], [hi[0] - ax, s * ay * 0.4, 0.0], AXIS_W, axis_c);
@@ -1196,7 +1267,7 @@ impl<'a> Builder<'a> {
         let axis_c = self.theme.axis;
         self.seg([lo[0], 0.0, 0.0], [hi[0], 0.0, 0.0], AXIS_W, axis_c);
         // Assumes the 1D strip has the same world-per-pixel scale on y as on x.
-        let h = TICK_PX * (hi[0] - lo[0]) / vw;
+        let h = TICK_PX * self.ext.line_mul as f64 * (hi[0] - lo[0]) / vw;
         for (_, v) in multiples(lo[0], hi[0], step) {
             self.seg([v, -h, 0.0], [v, h, 0.0], MINOR_W * 1.5, axis_c);
         }
@@ -1254,7 +1325,7 @@ impl<'a> Builder<'a> {
             };
             for bit in [1u32, 2, 4] {
                 if i & bit == 0 {
-                    self.seg(corner(i), corner(i | bit), MINOR_W, c);
+                    self.gseg(corner(i), corner(i | bit), MINOR_W, c);
                 }
             }
         }
@@ -1561,7 +1632,8 @@ impl<'a> Builder<'a> {
                 let ye = Expr::bin(BinOp::Mul, r, Expr::call("sin", vec![th()]));
                 let (xe, ye) = (self.ext.map.display_of(0, xe), self.ext.map.display_of(1, ye));
                 let (px, py) = (self.prog(&xe, &["theta"])?, self.prog(&ye, &["theta"])?);
-                let lines = mesh::sample_parametric(&px, &py, 0.0, self.turn() * k, 4000);
+                let [t0, t1] = range_values(&pr.domain, &["theta"], "theta", defs, self.angle, [0.0, self.turn() * k])?;
+                let lines = mesh::sample_parametric(&px, &py, t0, t1, curve_samples(t1 - t0, self.turn()));
                 self.add_lines2(&lines, st);
                 Ok(())
             }
@@ -1572,7 +1644,8 @@ impl<'a> Builder<'a> {
                     let r = self.ext.map.display_of(a, r);
                     ps.push(self.prog(&r, &["t"])?);
                 }
-                let lines = mesh::sample_parametric(&ps[0], &ps[1], 0.0, self.turn(), 4000);
+                let [t0, t1] = range_values(&pr.domain, &["t"], "t", defs, self.angle, [0.0, self.turn()])?;
+                let lines = mesh::sample_parametric(&ps[0], &ps[1], t0, t1, curve_samples(t1 - t0, self.turn()));
                 self.add_lines2(&lines, st);
                 Ok(())
             }
@@ -1632,6 +1705,58 @@ impl<'a> Builder<'a> {
     }
     // ----- 3D -------------------------------------------------------------------------------
 
+    /// `h = rhs(u, v)` as a height field (see `math_core::mesh_height`): `axes` are the world axes
+    /// of `u`, `v` and `h`. Falls back to the implicit surface `implicit = 0` when `rhs` does not
+    /// compile over just `u` and `v`.
+    fn explicit_surface(&mut self, rhs: &Expr, axes: [usize; 3], implicit: &Expr, st: Style) -> Result<(), String> {
+        const NAMES: [&str; 3] = ["x", "y", "z"];
+        let Ok(p) = self.prog(rhs, &[NAMES[axes[0]], NAMES[axes[1]]]) else {
+            return self.surface(implicit, st);
+        };
+        let m = self.px();
+        let full = ((m.0.min(m.1) / 6.0).log2().round()).clamp(5.0, 8.0) as u32;
+        let depth = match SURFACE_DEPTH_CAP.get() {
+            Some(cap) if cap < full => {
+                SURFACE_CAPPED.set(true);
+                cap
+            }
+            _ => full,
+        };
+        // A height field is not tiled like `surface` (its steep-quad refinement looks at
+        // neighbouring nodes, so tile seams would not match the one-shot mesh). It costs one
+        // unsliceable step, which a progressive build can be told to postpone (see
+        // `build_scene_progressive_mapped`) so it does not land in the middle of a tween.
+        if SURFACE_DEADLINE.get().is_some() && SURFACE_DEFER_HEAVY.get() && depth >= HEAVY_HEIGHT_DEPTH {
+            SURFACE_INCOMPLETE.set(true);
+            return Ok(());
+        }
+        let mesh = if SURFACE_DEADLINE.get().is_some() {
+            // Remembered for the next slice of this progressive build (it would otherwise be
+            // meshed again at every frame while a sibling surface is still unfinished).
+            let key = format!("h|{rhs:?}|{axes:?}|{:?}|{:?}|{:?}|{depth}", self.win.min, self.win.max, self.angle);
+            if depth >= SLICE_HEIGHT_DEPTH && !cached_mesh_exists(&key) {
+                // One unsliceable step per slice: the next heavy field waits for the next frame.
+                if SURFACE_HEAVY_DONE.get() {
+                    SURFACE_INCOMPLETE.set(true);
+                    return Ok(());
+                }
+                SURFACE_HEAVY_DONE.set(true);
+            }
+            cached_mesh(&key, || mesh::height_surface(&p, axes, self.win.min, self.win.max, depth))
+        } else {
+            mesh::height_surface(&p, axes, self.win.min, self.win.max, depth)
+        };
+        let base = self.out.vertices.len() as u32;
+        let mut col = st.color;
+        col[3] = (col[3] * MESH_ALPHA / 1.0).min(1.0);
+        for (pos, n) in mesh.positions.iter().zip(mesh.normals.iter()) {
+            let q = self.rb([pos[0] as f64, pos[1] as f64, pos[2] as f64]);
+            self.out.vertices.push(MeshVertex::new(q, *n, col));
+        }
+        self.out.indices.extend(mesh.indices.iter().map(|i| i + base));
+        Ok(())
+    }
+
     fn surface(&mut self, f: &Expr, st: Style) -> Result<(), String> {
         let p = self.prog(f, &["x", "y", "z"])?;
         let m = self.px();
@@ -1643,7 +1768,15 @@ impl<'a> Builder<'a> {
             }
             _ => full,
         };
-        let mesh = mesh::surface_3d(&p, self.win.min, self.win.max, depth, 300_000);
+        let mesh = if SURFACE_DEADLINE.get().is_some() {
+            let key = format!("{f:?}|{:?}|{:?}|{:?}|{depth}", self.win.min, self.win.max, self.angle);
+            match tiled_surface(&key, &p, self.win.min, self.win.max, depth) {
+                Some(m) => m,
+                None => return Ok(()), // not finished: the caller keeps the previous scene
+            }
+        } else {
+            mesh::surface_3d(&p, self.win.min, self.win.max, depth, 300_000)
+        };
         let base = self.out.vertices.len() as u32;
         let mut col = st.color;
         col[3] = (col[3] * MESH_ALPHA / 1.0).min(1.0);
@@ -1657,17 +1790,49 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    fn curve_3d(&mut self, comps: &[Expr], defs: &Defs, st: Style) -> Result<(), String> {
+    /// `(x(u,v), y(u,v), z(u,v))` over its `u`, `v` ranges, clipped to the window box (see
+    /// `math_core::mesh_param`). `u` and `v` stay parameters even when a slider has that name.
+    fn param_surface(&mut self, comps: &[Expr], domain: &[math_core::param::Range], defs: &Defs, st: Style) -> Result<(), String> {
+        let defs_uv = defs.without_vars(&["u", "v"]);
+        let mut ps = Vec::new();
+        for c in comps {
+            let r = defs_uv.resolve(c).map_err(|e| e.to_string())?;
+            ps.push(self.prog(&r, &["u", "v"])?);
+        }
+        let dflt = [0.0, self.turn()];
+        let u = range_values(domain, &["u", "v"], "u", defs, self.angle, dflt)?;
+        let v = range_values(domain, &["u", "v"], "v", defs, self.angle, dflt)?;
+        let budget = match SURFACE_DEPTH_CAP.get() {
+            Some(_) => {
+                SURFACE_CAPPED.set(true);
+                30_000
+            }
+            None => mesh_param::DEFAULT_MAX_VERTICES,
+        };
+        let mesh = mesh_param::surface_param(&ps[0], &ps[1], &ps[2], u, v, self.win.min, self.win.max, budget);
+        let base = self.out.vertices.len() as u32;
+        let mut col = st.color;
+        col[3] = (col[3] * MESH_ALPHA).min(1.0);
+        for (pos, n) in mesh.positions.iter().zip(mesh.normals.iter()) {
+            let q = self.rb([pos[0] as f64, pos[1] as f64, pos[2] as f64]);
+            self.out.vertices.push(MeshVertex::new(q, *n, col));
+        }
+        self.out.indices.extend(mesh.indices.iter().map(|i| i + base));
+        Ok(())
+    }
+
+    fn curve_3d(&mut self, comps: &[Expr], domain: &[math_core::param::Range], defs: &Defs, st: Style) -> Result<(), String> {
         let mut ps = Vec::new();
         for c in comps {
             let r = defs.resolve(c).map_err(|e| e.to_string())?;
             ps.push(self.prog(&r, &["t"])?);
         }
-        const N: usize = 2048;
-        let t1 = self.turn();
+        let [t0, t1] = range_values(domain, &["t"], "t", defs, self.angle, [0.0, self.turn()])?;
+        // 2048 points per default turn, more for a long range
+        let n = (2048.0 * ((t1 - t0) / self.turn()).max(1.0)).min(40_000.0) as usize;
         let mut cur: Vec<[f64; 3]> = Vec::new();
-        for i in 0..=N {
-            let t = t1 * i as f64 / N as f64;
+        for i in 0..=n {
+            let t = t0 + (t1 - t0) * i as f64 / n as f64;
             let mut p = [0.0; 3];
             for (a, pr) in ps.iter().enumerate() {
                 p[a] = pr.eval(&[t]);
@@ -1687,9 +1852,9 @@ impl<'a> Builder<'a> {
         let sub = |a: &str, e: &Expr| Expr::bin(BinOp::Sub, Expr::var(a), e.clone());
         let res = |e: &Expr| defs.resolve(e).map_err(|e| e.to_string());
         match &pr.kind {
-            Kind::ExplicitY { rhs } => self.surface(&sub("y", &res(rhs)?), st),
-            Kind::ExplicitX { rhs } => self.surface(&sub("x", &res(rhs)?), st),
-            Kind::ExplicitZ { rhs } => self.surface(&sub("z", &res(rhs)?), st),
+            Kind::ExplicitY { rhs } => self.explicit_surface(&res(rhs)?, [0, 2, 1], &sub("y", &res(rhs)?), st),
+            Kind::ExplicitX { rhs } => self.explicit_surface(&res(rhs)?, [1, 2, 0], &sub("x", &res(rhs)?), st),
+            Kind::ExplicitZ { rhs } => self.explicit_surface(&res(rhs)?, [0, 1, 2], &sub("z", &res(rhs)?), st),
             Kind::Implicit { f } => self.surface(&res(f)?, st),
             Kind::Inequality { rel, f } => {
                 let r = res(f)?;
@@ -1704,8 +1869,11 @@ impl<'a> Builder<'a> {
             Kind::VectorField { components } => {
                 self.vector_field_3d(components, defs, st, pr.item.color.is_some())
             }
+            Kind::Parametric { components } if pr.kind.is_param_surface() => {
+                self.param_surface(components, &pr.domain, defs, st)
+            }
             Kind::Parametric { components } if (2..=3).contains(&components.len()) => {
-                self.curve_3d(components, defs, st)
+                self.curve_3d(components, &pr.domain, defs, st)
             }
             Kind::Point { components } if (2..=3).contains(&components.len()) => {
                 let v = self.eval_tuple(components, defs)?;
@@ -2084,7 +2252,8 @@ impl<'a> Builder<'a> {
             for p in pts {
                 if mode != Mode::D1 || (p[0] >= self.win.min[0] && p[0] <= self.win.max[0]) {
                     if cs.outline {
-                        self.seg(p, p, st.point_size + 2.0 * OUTLINE_W, bg);
+                        let ow = 2.0 * OUTLINE_W * self.ext.line_mul;
+                        self.seg_raw(p, p, self.point_px(st.point_size) + ow, bg);
                     }
                     self.point(p, st);
                 }
@@ -2259,7 +2428,8 @@ impl<'a> Builder<'a> {
         for b in bins.iter().filter(|b| !b.is_empty()) {
             let x = b.iter().sum::<f64>() / b.len() as f64;
             for k in 0..b.len().min(MAX_STACK) {
-                let y = (DOT_W as f64 * 0.5 + 1.0 + k as f64 * (DOT_W as f64 + 0.5)) * ypp;
+                let d = self.point_px(DOT_W) as f64;
+                let y = (d * 0.5 + 1.0 + k as f64 * (d + 0.5)) * ypp;
                 self.dot([x, y, 0.0], st.color);
             }
         }
@@ -2429,6 +2599,21 @@ fn chain_segments(segs: &[[[f64; 2]; 2]], tol: f64) -> Vec<Vec<[f64; 2]>> {
     out
 }
 
+/// `e` with `var` replaced by `lo + var`, so a curve over `[lo, hi]` becomes one over `[0, hi - lo]`.
+fn shift_param(e: &Expr, var: &str, lo: f64) -> Expr {
+    if lo == 0.0 {
+        e.clone()
+    } else {
+        e.subst(var, &Expr::bin(BinOp::Add, Expr::num(lo), Expr::var(var)))
+    }
+}
+
+/// Sample budget for a curve over a range `span` long, where `turn` is one default turn: 4000
+/// for up to a turn, proportionally more (capped) for longer ranges.
+fn curve_samples(span: f64, turn: f64) -> usize {
+    (4000.0 * (span / turn).max(1.0)).min(120_000.0) as usize
+}
+
 /// True if `theta` appears anywhere outside a trigonometric call.
 fn theta_outside_trig(e: &Expr) -> bool {
     match e {
@@ -2442,57 +2627,6 @@ fn theta_outside_trig(e: &Expr) -> bool {
         }
         Expr::Tuple(v) | Expr::List(v) => v.iter().any(theta_outside_trig),
     }
-}
-
-/// Roots of a single-variable program on `[x0, x1]`: sign-change scan plus bisection. Poles
-/// (sign change with a growing value) are rejected. At most 64 roots.
-fn find_roots(p: &Program, x0: f64, x1: f64) -> Vec<f64> {
-    const N: usize = 4000;
-    let mut roots = Vec::new();
-    if !(x0.is_finite() && x1.is_finite() && x1 > x0) {
-        return roots;
-    }
-    let mut st = Vec::with_capacity(16);
-    let mut f = |x: f64| p.eval_with(&[x], &mut st);
-    let mut xa = x0;
-    let mut fa = f(xa);
-    for i in 1..=N {
-        let xb = x0 + (x1 - x0) * i as f64 / N as f64;
-        let fb = f(xb);
-        if roots.len() >= 64 {
-            break;
-        }
-        if fa == 0.0 {
-            roots.push(xa);
-        } else if fa.is_finite() && fb.is_finite() && fa * fb < 0.0 {
-            let (mut lo, mut hi, mut flo) = (xa, xb, fa);
-            for _ in 0..100 {
-                let mid = lo / 2.0 + hi / 2.0;
-                let fm = f(mid);
-                if fm == 0.0 || mid == lo || mid == hi {
-                    lo = mid;
-                    hi = mid;
-                    break;
-                }
-                if (fm < 0.0) == (flo < 0.0) {
-                    lo = mid;
-                    flo = fm;
-                } else {
-                    hi = mid;
-                }
-            }
-            let r = lo / 2.0 + hi / 2.0;
-            if f(r).abs() <= fa.abs().max(fb.abs()) {
-                roots.push(r);
-            }
-        }
-        xa = xb;
-        fa = fb;
-    }
-    if fa == 0.0 && roots.len() < 64 {
-        roots.push(xa);
-    }
-    roots
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2514,6 +2648,80 @@ fn log_unsupported(pr: &Prepared) -> Option<&'static str> {
 }
 fn is_drawable_kind(k: ItemKind) -> bool {
     !matches!(k, ItemKind::Folder | ItemKind::Note | ItemKind::Action)
+}
+
+/// `x=f(t)`, `y=g(t)` (and `z=h(t)`) as separate rows are one parametric curve: the first visible
+/// row of each axis is fused into the x row (as `(f, g[, h])`, keeping the ranges of all of
+/// them) and the other rows are dropped. Rows that do not share a parameter stay as they are.
+fn fuse_axis_equations(items: &mut Vec<Prepared>) {
+    use math_core::param::axis_equation;
+    let pick = |items: &[Prepared], axis: usize| {
+        items.iter().position(|p| {
+            !p.item.hidden && p.complex.is_none() && axis_equation(&p.kind).is_some_and(|(a, _)| a == axis)
+        })
+    };
+    let (Some(ix), Some(iy)) = (pick(items, 0), pick(items, 1)) else { return };
+    let iz = pick(items, 2);
+    let rhs = |i: usize| axis_equation(&items[i].kind).map(|(_, r)| r.clone());
+    let (Some(fx), Some(fy)) = (rhs(ix), rhs(iy)) else { return };
+    let mut components = vec![fx, fy];
+    if let Some(fz) = iz.and_then(rhs) {
+        components.push(fz);
+    }
+    let kind = Kind::Parametric { components };
+    let Kind::Parametric { components } = &kind else { return };
+    if !(kind.is_param_surface() || components.iter().any(|c| c.contains_var("t"))) {
+        return;
+    }
+    let dims = [0, 1, 2].map(|a| components.iter().any(|c| c.contains_var(["x", "y", "z"][a])));
+    let mut domain: Vec<math_core::param::Range> = Vec::new();
+    let mut gone = vec![iy];
+    gone.extend(iz.filter(|_| components.len() == 3));
+    for i in std::iter::once(ix).chain(gone.iter().copied()) {
+        for r in &items[i].domain {
+            if !domain.iter().any(|d| d.var == r.var) {
+                domain.push(r.clone());
+            }
+        }
+    }
+    items[ix].kind = kind;
+    items[ix].dims = dims;
+    items[ix].domain = domain;
+    gone.sort_unstable_by(|a, b| b.cmp(a));
+    for i in gone {
+        items.remove(i);
+    }
+}
+
+/// The value of a range bound (constants, `pi`, sliders and definitions resolved).
+fn eval_bound(e: &Expr, defs: &Defs, angle: Angle) -> Result<f64, String> {
+    let r = defs.resolve(e).map_err(|e| e.to_string())?;
+    Ok(compile(&r, &[], angle).map_err(|e| e.to_string())?.eval(&[]))
+}
+
+/// `[lo, hi]` of the parameter `var` of an item: its `{...}` range where given, `default`
+/// otherwise (see `math_core::param::resolve_range`). `allowed` are the item's parameter names;
+/// a range on any other name is an error.
+fn range_values(
+    domain: &[math_core::param::Range],
+    allowed: &[&str],
+    var: &str,
+    defs: &Defs,
+    angle: Angle,
+    default: [f64; 2],
+) -> Result<[f64; 2], String> {
+    if let Some(bad) = domain.iter().find(|r| !allowed.contains(&r.var.as_str())) {
+        return Err(format!(
+            "a range on '{}' does not apply here (the parameter is {})",
+            bad.var,
+            allowed.join(" and ")
+        ));
+    }
+    let r = domain.iter().find(|r| r.var == var);
+    let get = |b: Option<&Expr>| b.map(|e| eval_bound(e, defs, angle)).transpose();
+    let (lo, hi) = (get(r.and_then(|r| r.lo.as_ref()))?, get(r.and_then(|r| r.hi.as_ref()))?);
+    math_core::param::resolve_range(lo, hi, default)
+        .map_err(|m| if domain.is_empty() { m } else { format!("{var}: {m}") })
 }
 
 /// Parses and analyzes all relevant items; parse errors become diagnostics (for visible items).
@@ -2553,6 +2761,7 @@ fn prepare<'a>(
                     dims: [false; 3],
                     expr: e.clone(),
                     complex: Some(e),
+                    domain: Vec::new(),
                 }),
                 Err(e) => {
                     if !it.hidden {
@@ -2571,6 +2780,7 @@ fn prepare<'a>(
                     dims: a.dims,
                     complex: None,
                     expr: e,
+                    domain: a.domain,
                 });
             }
             Err(e) => {
@@ -2580,6 +2790,7 @@ fn prepare<'a>(
             }
         }
     }
+    fuse_axis_equations(&mut out);
     let mut defs = Defs::from_kinds(out.iter().map(|p| &p.kind));
     // Each table column defines a list named by its header (ordinary definitions win).
     let mut tables = Vec::new();
@@ -2720,6 +2931,8 @@ pub fn build_scene_mapped(
 ) -> SceneGeometry {
     let doc = &*with_folders_applied(doc);
     let map = if mode == Mode::D2 { map } else { AxisMap::LINEAR };
+    let scale = RENDER_SCALE.get();
+    let (lm, gm, pm) = weight_mul(doc.view.weight);
     let mut b = Builder {
         out: SceneGeometry::default(),
         origin,
@@ -2750,9 +2963,14 @@ pub fn build_scene_mapped(
             map,
             world_in: false,
             labels: None,
+            line_mul: lm * scale,
+            grid_mul: gm * scale,
+            point_mul: pm * scale,
+            scale,
         },
     };
     b.grid_and_axes(mode);
+    b.out.backdrop_segments = b.out.segments.len();
     let mut diags = Vec::new();
     let (items, defs, pdefs, tables, fits) = prepare_fitted(doc, &mut diags);
     b.out.infos = calc_draw::collect_infos(&items, &fits, &defs, &pdefs, b.angle);
@@ -2789,6 +3007,12 @@ pub fn build_scene_mapped(
                 b.end_item_labels(&pr.item.style, seg0);
                 continue;
             }
+        }
+        if !pr.domain.is_empty() && !matches!(pr.kind, Kind::Parametric { .. } | Kind::Polar { .. }) {
+            diags.push((
+                pr.item.id.clone(),
+                "a {range} applies to parametric curves, polar curves and parametric surfaces".into(),
+            ));
         }
         if matches!(pr.kind, Kind::Regression { .. }) {
             if let Some(fit) = fits.get(&pr.item.id) {
@@ -2922,6 +3146,202 @@ thread_local! {
     static SURFACE_DEPTH_CAP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     /// Set when a surface of the current preview was meshed below full quality.
     static SURFACE_CAPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// While set, surfaces are meshed tile by tile and the build stops starting new tiles at
+    /// this instant (see [`build_scene_progressive_mapped`]).
+    static SURFACE_DEADLINE: std::cell::Cell<Option<instant::Instant>> = const { std::cell::Cell::new(None) };
+    /// Set by a progressive build that must not start unsliceable work (see
+    /// [`HEAVY_HEIGHT_DEPTH`]) right now.
+    static SURFACE_DEFER_HEAVY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// An unsliceable surface was meshed in the running slice of a progressive build.
+    static SURFACE_HEAVY_DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set when a tiled surface ran out of time before it was complete.
+    static SURFACE_INCOMPLETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tiles meshed so far of the surfaces of a progressive build, by surface identity.
+    static SURFACE_TILES: std::cell::RefCell<std::collections::HashMap<String, TileJob>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Transient pixel scale of the build (an export at a larger size), see [`set_render_scale`].
+    static RENDER_SCALE: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
+/// Sets the pixel scale the following builds on this thread draw widths at (1 = the on-screen
+/// look; 2 when the canvas is rendered at twice its size for an export). Not part of the
+/// document. Non-finite or non-positive values mean 1.
+pub fn set_render_scale(s: f32) {
+    RENDER_SCALE.set(if s.is_finite() && s > 0.0 { s.min(8.0) } else { 1.0 });
+}
+
+/// A surface being meshed tile by tile (a progressive build): the lattice-aligned sub-boxes of
+/// the window meshed so far and merged. Sub-boxes of the window that keep the cell size share
+/// their boundary vertices exactly with their neighbours (same lattice, same bisection, same
+/// gradient normals), so the merged mesh has no seams.
+struct TileJob {
+    next: usize,
+    total: usize,
+    mesh: mesh::Mesh,
+}
+
+/// Height fields at or beyond this octree depth are one unsliceable step (about 20 ms native
+/// release, far more in a debug wasm build and for steep graphs).
+const HEAVY_HEIGHT_DEPTH: u32 = 6;
+/// From this depth on a progressive build meshes at most one height field per slice.
+const SLICE_HEIGHT_DEPTH: u32 = 5;
+
+/// Tiles are `2^split` per axis; each tile is meshed at depth `depth - split` (3 or 4), which
+/// bounds the work of one step to a few milliseconds.
+fn tile_split(depth: u32) -> u32 {
+    depth.saturating_sub(3).min(4)
+}
+
+/// The full mesh of `f = 0` at `depth` once all its tiles are done, else `None` (and the
+/// progressive build is flagged incomplete). Works through the tiles until the thread's deadline;
+/// finished tiles are kept under `key`, so the next call resumes where this one stopped. Empty
+/// tiles are skipped by the mesher's interval pruning almost for free.
+fn tiled_surface(key: &str, p: &Program, min: [f64; 3], max: [f64; 3], depth: u32) -> Option<mesh::Mesh> {
+    let split = tile_split(depth);
+    let n = 1usize << split;
+    let total = n * n * n;
+    let deadline = SURFACE_DEADLINE.get();
+    SURFACE_TILES.with(|cell| {
+        let mut jobs = cell.borrow_mut();
+        // A progressive build only ever needs the surfaces of the scene being refined.
+        if !jobs.contains_key(key) && jobs.len() >= 32 {
+            jobs.clear();
+        }
+        let job = jobs
+            .entry(key.to_string())
+            .or_insert_with(|| TileJob { next: 0, total, mesh: mesh::Mesh::default() });
+        let size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+        let per_tile_cells = if split == 0 { 300_000 } else { 40_000 };
+        let started = job.next;
+        while job.next < job.total {
+            if job.next > started && deadline.is_some_and(|d| instant::Instant::now() >= d) {
+                SURFACE_INCOMPLETE.set(true);
+                return None;
+            }
+            let t = job.next;
+            let (i, j, k) = (t % n, (t / n) % n, t / (n * n));
+            let lo = |a: usize, c: usize| min[a] + size[a] * c as f64 / n as f64;
+            let hi = |a: usize, c: usize| min[a] + size[a] * (c + 1) as f64 / n as f64;
+            let m = mesh::surface_3d(
+                p,
+                [lo(0, i), lo(1, j), lo(2, k)],
+                [hi(0, i), hi(1, j), hi(2, k)],
+                depth - split,
+                per_tile_cells,
+            );
+            let base = job.mesh.positions.len() as u32;
+            job.mesh.positions.extend(m.positions);
+            job.mesh.normals.extend(m.normals);
+            job.mesh.indices.extend(m.indices.iter().map(|i| i + base));
+            job.next += 1;
+        }
+        Some(job.mesh.clone())
+    })
+}
+
+fn cached_mesh_exists(key: &str) -> bool {
+    SURFACE_TILES.with(|c| c.borrow().get(key).is_some_and(|j| j.next == j.total))
+}
+
+/// The mesh remembered under `key` for the running progressive build, made by `make` the first
+/// time.
+fn cached_mesh(key: &str, make: impl FnOnce() -> mesh::Mesh) -> mesh::Mesh {
+    if let Some(m) = SURFACE_TILES.with(|c| c.borrow().get(key).filter(|j| j.next == j.total).map(|j| j.mesh.clone())) {
+        return m;
+    }
+    let mesh = make();
+    SURFACE_TILES.with(|c| {
+        let mut jobs = c.borrow_mut();
+        if jobs.len() >= 32 {
+            jobs.clear();
+        }
+        jobs.insert(key.to_string(), TileJob { next: 1, total: 1, mesh: mesh.clone() });
+    });
+    mesh
+}
+
+/// Forgets the tiles of finished and abandoned progressive builds.
+pub fn clear_surface_tiles() {
+    SURFACE_TILES.with(|c| c.borrow_mut().clear());
+}
+
+/// [`build_scene_mapped`] with implicit surfaces meshed at most `depth_cap` deep (everything
+/// else identical), meshing tile by tile until `deadline` passes. Returns the geometry and
+/// `done`: false when a surface was not finished (or, with `defer_heavy`, was left for later), in which case the geometry is MISSING that
+/// surface and must not be shown; call again (same arguments) to continue, the finished tiles
+/// are remembered. `capped` is whether `depth_cap` made any surface coarser than a full build.
+#[allow(clippy::too_many_arguments)]
+pub fn build_scene_progressive_mapped(
+    doc: &Doc,
+    map: AxisMap,
+    mode: Mode,
+    window: Window3,
+    origin: [f64; 3],
+    viewport_px: (u32, u32),
+    theme: &Theme,
+    depth_cap: u32,
+    deadline: instant::Instant,
+    defer_heavy: bool,
+) -> ProgressiveBuild {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SURFACE_DEPTH_CAP.set(None);
+            SURFACE_DEADLINE.set(None);
+            SURFACE_DEFER_HEAVY.set(false);
+        }
+    }
+    SURFACE_DEPTH_CAP.set(Some(depth_cap));
+    SURFACE_DEADLINE.set(Some(deadline));
+    SURFACE_DEFER_HEAVY.set(defer_heavy);
+    SURFACE_HEAVY_DONE.set(false);
+    SURFACE_CAPPED.set(false);
+    SURFACE_INCOMPLETE.set(false);
+    let _reset = Reset;
+    let geometry = build_scene_mapped(doc, map, mode, window, origin, viewport_px, theme);
+    ProgressiveBuild { geometry, done: !SURFACE_INCOMPLETE.get(), capped: SURFACE_CAPPED.get() }
+}
+
+/// Result of [`build_scene_progressive_mapped`].
+pub struct ProgressiveBuild {
+    pub geometry: SceneGeometry,
+    pub done: bool,
+    pub capped: bool,
+}
+
+/// [`build_scene_preview_mapped`] with a chosen cap: a quick first look for a mode switch
+/// ([`FIRST_PREVIEW_DEPTH`]) that a progressive build then refines.
+pub fn build_scene_capped_mapped(
+    doc: &Doc,
+    map: AxisMap,
+    mode: Mode,
+    window: Window3,
+    origin: [f64; 3],
+    viewport_px: (u32, u32),
+    theme: &Theme,
+    depth_cap: u32,
+) -> (SceneGeometry, bool) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SURFACE_DEPTH_CAP.set(None);
+        }
+    }
+    SURFACE_DEPTH_CAP.set(Some(depth_cap));
+    SURFACE_CAPPED.set(false);
+    let _reset = Reset;
+    let g = build_scene_mapped(doc, map, mode, window, origin, viewport_px, theme);
+    (g, SURFACE_CAPPED.get())
+}
+
+/// Surface depth of the first, synchronous look at a 3D scene during a mode switch: cheap
+/// enough to build between the click and the first moving frame.
+pub const FIRST_PREVIEW_DEPTH: u32 = 4;
+
+/// Surface depth of a full-quality build for a viewport of `px` pixels (what `Builder::surface`
+/// picks without a cap).
+pub fn full_surface_depth(px: (f64, f64)) -> u32 {
+    ((px.0.min(px.1) / 6.0).log2().round()).clamp(5.0, 8.0) as u32
 }
 
 /// [`build_scene`] at preview quality: implicit surfaces are meshed at most
@@ -3048,6 +3468,273 @@ fn literal_number(e: &Expr) -> Option<f64> {
         Expr::Num(v) => Some(*v),
         Expr::Neg(a) => literal_number(a).map(|v| -v),
         _ => None,
+    }
+}
+
+/// A visible curve `y = f(x)` of a document, compiled for hit-testing (hover, pick).
+pub struct ExplicitCurve {
+    pub id: String,
+    /// `f` of one variable, `x`.
+    pub prog: Program,
+    /// `f'` and `f''` when they have a symbolic form (otherwise analysis differences `f`).
+    pub d1: Option<Program>,
+    pub d2: Option<Program>,
+}
+
+/// The visible `y = f(x)` items of `doc` (an equation `y=...` or a bare expression of `x`), the
+/// same ones `draw_2d` draws with `explicit_y_2d`. Items that fail to compile are skipped.
+pub fn explicit_curves(doc: &Doc) -> Vec<ExplicitCurve> {
+    let doc = &*with_folders_applied(doc);
+    let mut diags = Vec::new();
+    let (items, defs, _, _) = prepare(doc, &mut diags);
+    let angle = match doc.view.angle {
+        AngleMode::Rad => Angle::Rad,
+        AngleMode::Deg => Angle::Deg,
+    };
+    let mut out = Vec::new();
+    for p in items.iter().filter(|p| !p.item.hidden && p.complex.is_none() && !p.dims[2]) {
+        let rhs = match &p.kind {
+            Kind::ExplicitY { rhs } => rhs,
+            Kind::Field { expr } if p.dims[0] && !p.dims[1] => expr,
+            _ => continue,
+        };
+        let Ok(resolved) = defs.resolve(rhs) else { continue };
+        let Ok(prog) = compile(&resolved, &["x"], angle) else { continue };
+        let nth = |n: usize| {
+            math_core::calculus::nth_deriv_angle(&resolved, "x", n, angle)
+                .ok()
+                .and_then(|e| compile(&e, &["x"], angle).ok())
+        };
+        out.push(ExplicitCurve { id: p.item.id.clone(), prog, d1: nth(1), d2: nth(2) });
+    }
+    out
+}
+
+/// Where a draggable curve parameter lives in the document.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParamSrc {
+    Slider,
+    /// A numeric definition item (`a=3`).
+    Def { item: String },
+}
+
+/// One parameter of a [`DragCurve`].
+#[derive(Debug, Clone)]
+pub struct CurveParam {
+    pub name: String,
+    pub src: ParamSrc,
+    pub cfg: math_core::drag::DragParam,
+}
+
+/// What a [`DragCurve`] evaluates. Every program takes its curve variables first and then the
+/// draggable parameters, in `params` order; values are in world coordinates.
+pub enum DragShape {
+    /// `y = f(x)`: variables `[x, params...]`.
+    Explicit(Program),
+    /// `(x(t), y(t))` over `[0, t_end]` (a polar curve is this with `t = theta`): variables
+    /// `[t, params...]`.
+    Parametric { px: Program, py: Program, t_end: f64 },
+    /// `F(x, y) = 0`: variables `[x, y, params...]`.
+    Implicit(Program),
+}
+
+/// A curve `id` compiled with its draggable parameters (sliders and numeric definitions it
+/// uses) kept as inputs.
+pub struct DragCurve {
+    pub id: String,
+    pub shape: DragShape,
+    pub params: Vec<CurveParam>,
+}
+
+/// The curve item `id` (visible; `y = f(x)`, `x = g(y)`, implicit `F(x,y) = 0`, polar or 2D
+/// parametric) with the parameters a drag may change, or `None` when it is not such a curve or
+/// has no slider or numeric definition in its equation.
+pub fn drag_curve(doc: &Doc, id: &str) -> Option<DragCurve> {
+    use math_core::drag::{DragParam, MAX_PARAMS};
+    let doc = &*with_folders_applied(doc);
+    let mut diags = Vec::new();
+    let (items, _, pdefs, _) = prepare(doc, &mut diags);
+    let angle = match doc.view.angle {
+        AngleMode::Rad => Angle::Rad,
+        AngleMode::Deg => Angle::Deg,
+    };
+    let turn = match angle {
+        Angle::Rad => 2.0 * PI,
+        Angle::Deg => 360.0,
+    };
+    let p = items.iter().find(|p| p.item.id == id && !p.item.hidden && p.complex.is_none() && !p.dims[2])?;
+    // Candidates: every slider, and every numeric definition no slider overrides.
+    let mut cands: BTreeMap<String, (ParamSrc, DragParam)> = BTreeMap::new();
+    for q in &items {
+        if let Kind::Definition { name, params, body } = &q.kind {
+            if let (true, Some(v)) = (params.is_empty(), literal_number(body)) {
+                if !doc.sliders.contains_key(name) {
+                    cands.entry(name.clone()).or_insert((ParamSrc::Def { item: q.item.id.clone() }, DragParam::free(v)));
+                }
+            }
+        }
+    }
+    for (name, c) in &doc.sliders {
+        cands.insert(name.clone(), (ParamSrc::Slider, DragParam::slider(c.value, c.min, c.max, c.step)));
+    }
+    let names: Vec<&String> = cands.keys().collect();
+    let res = |e: &Expr| pdefs.without_vars(&names).resolve(e).ok();
+    let th = || Expr::var("theta");
+    // The curve variables, its expressions (already resolved) and how to build the shape.
+    enum K {
+        Explicit,
+        Implicit,
+        Param(f64),
+    }
+    let (kind, vars, exprs): (K, Vec<&str>, Vec<Expr>) = match &p.kind {
+        Kind::ExplicitY { rhs } => (K::Explicit, vec!["x"], vec![res(rhs)?]),
+        Kind::Field { expr } if p.dims[0] && !p.dims[1] => (K::Explicit, vec!["x"], vec![res(expr)?]),
+        Kind::ExplicitX { rhs } => {
+            (K::Implicit, vec!["x", "y"], vec![Expr::bin(BinOp::Sub, Expr::var("x"), res(rhs)?)])
+        }
+        Kind::Implicit { f } => (K::Implicit, vec!["x", "y"], vec![res(f)?]),
+        Kind::Polar { rhs } => {
+            let r = res(rhs)?;
+            let k = if theta_outside_trig(&r) { 3.0 } else { 2.0 };
+            let xe = Expr::bin(BinOp::Mul, r.clone(), Expr::call("cos", vec![th()]));
+            let ye = Expr::bin(BinOp::Mul, r, Expr::call("sin", vec![th()]));
+            // a range moves the start onto 0: t -> lo + t (bounds must be plain numbers here)
+            let [t0, t1] = range_values(&p.domain, &["theta"], "theta", &pdefs, angle, [0.0, turn * k]).ok()?;
+            (K::Param(t1 - t0), vec!["theta"], vec![shift_param(&xe, "theta", t0), shift_param(&ye, "theta", t0)])
+        }
+        Kind::Parametric { components } if components.len() == 2 => {
+            let [t0, t1] = range_values(&p.domain, &["t"], "t", &pdefs, angle, [0.0, turn]).ok()?;
+            (
+                K::Param(t1 - t0),
+                vec!["t"],
+                vec![shift_param(&res(&components[0])?, "t", t0), shift_param(&res(&components[1])?, "t", t0)],
+            )
+        }
+        _ => return None,
+    };
+    let mut used = BTreeSet::new();
+    for e in &exprs {
+        used.extend(e.free_vars());
+    }
+    let params: Vec<CurveParam> = cands
+        .into_iter()
+        .filter(|(n, _)| !vars.contains(&n.as_str()) && n != "y" && used.contains(n))
+        .map(|(name, (src, cfg))| CurveParam { name, src, cfg })
+        .collect();
+    if params.is_empty() || params.len() > MAX_PARAMS {
+        return None;
+    }
+    let mut all: Vec<&str> = vars.clone();
+    all.extend(params.iter().map(|q| q.name.as_str()));
+    let shape = match kind {
+        K::Explicit => DragShape::Explicit(compile(&exprs[0], &all, angle).ok()?),
+        K::Implicit => DragShape::Implicit(compile(&exprs[0], &all, angle).ok()?),
+        K::Param(t_end) => DragShape::Parametric {
+            px: compile(&exprs[0], &all, angle).ok()?,
+            py: compile(&exprs[1], &all, angle).ok()?,
+            t_end,
+        },
+    };
+    Some(DragCurve { id: id.to_string(), shape, params })
+}
+
+/// A visible implicit, polar or parametric 2D curve compiled for hit-testing, with its programs
+/// in display coordinates (see [`AxisMap`]) exactly as the renderer builds them.
+pub struct ShapeCurve {
+    pub id: String,
+    pub kind: ShapeKind,
+}
+
+pub enum ShapeKind {
+    /// `F(X, Y) = 0` in display coordinates.
+    Implicit(Program),
+    /// `(X(t), Y(t))` in display coordinates over `[0, t_end]`.
+    Parametric { px: Program, py: Program, t_end: f64 },
+}
+
+/// The visible curves of `doc` that are not `y = f(x)`: implicit (and `x = g(y)`), polar and
+/// parametric ones, for picking by distance to their drawn polyline ([`shape_lines`]).
+pub fn shape_curves(doc: &Doc, map: AxisMap) -> Vec<ShapeCurve> {
+    let doc = &*with_folders_applied(doc);
+    let mut diags = Vec::new();
+    let (items, defs, _, _) = prepare(doc, &mut diags);
+    let angle = match doc.view.angle {
+        AngleMode::Rad => Angle::Rad,
+        AngleMode::Deg => Angle::Deg,
+    };
+    let turn = match angle {
+        Angle::Rad => 2.0 * PI,
+        Angle::Deg => 360.0,
+    };
+    let mut out = Vec::new();
+    for p in items.iter().filter(|p| !p.item.hidden && p.complex.is_none() && !p.dims[2]) {
+        let kind = (|| -> Option<ShapeKind> {
+            match &p.kind {
+                Kind::ExplicitX { rhs } => {
+                    let r = defs.resolve(rhs).ok()?;
+                    let f = map.display_expr(&Expr::bin(BinOp::Sub, Expr::var("x"), r));
+                    Some(ShapeKind::Implicit(compile(&f, &["x", "y"], angle).ok()?))
+                }
+                Kind::Implicit { f } => {
+                    let f = map.display_expr(&defs.resolve(f).ok()?);
+                    Some(ShapeKind::Implicit(compile(&f, &["x", "y"], angle).ok()?))
+                }
+                Kind::Polar { rhs } => {
+                    let r = defs.resolve(rhs).ok()?;
+                    let k = if theta_outside_trig(&r) { 3.0 } else { 2.0 };
+                    let th = || Expr::var("theta");
+                    let xe = Expr::bin(BinOp::Mul, r.clone(), Expr::call("cos", vec![th()]));
+                    let ye = Expr::bin(BinOp::Mul, r, Expr::call("sin", vec![th()]));
+                    let [t0, t1] = range_values(&p.domain, &["theta"], "theta", &defs, angle, [0.0, turn * k]).ok()?;
+                    Some(ShapeKind::Parametric {
+                        px: compile(&shift_param(&map.display_of(0, xe), "theta", t0), &["theta"], angle).ok()?,
+                        py: compile(&shift_param(&map.display_of(1, ye), "theta", t0), &["theta"], angle).ok()?,
+                        t_end: t1 - t0,
+                    })
+                }
+                Kind::Parametric { components } if components.len() == 2 => {
+                    let [t0, t1] = range_values(&p.domain, &["t"], "t", &defs, angle, [0.0, turn]).ok()?;
+                    let mut ps = Vec::new();
+                    for (a, c) in components.iter().enumerate() {
+                        let r = shift_param(&map.display_of(a, defs.resolve(c).ok()?), "t", t0);
+                        ps.push(compile(&r, &["t"], angle).ok()?);
+                    }
+                    let py = ps.pop()?;
+                    let px = ps.pop()?;
+                    Some(ShapeKind::Parametric { px, py, t_end: t1 - t0 })
+                }
+                _ => None,
+            }
+        })();
+        if let Some(kind) = kind {
+            out.push(ShapeCurve { id: p.item.id.clone(), kind });
+        }
+    }
+    out
+}
+
+/// The polylines (display coordinates) the renderer draws for `c` over the display window
+/// `win` on a `vp` pixel viewport: the same `mesh::sample_parametric` and `mesh::contour_2d`
+/// samplers. An implicit curve comes back as one two-point polyline per contour segment.
+pub fn shape_lines(c: &ShapeCurve, win: Window3, vp: (f64, f64)) -> Vec<Vec<[f64; 2]>> {
+    match &c.kind {
+        ShapeKind::Parametric { px, py, t_end } => mesh::sample_parametric(px, py, 0.0, *t_end, 4000),
+        ShapeKind::Implicit(p) => {
+            let w = win.sanitized();
+            let (vw, vh) = (vp.0.max(1.0), vp.1.max(1.0));
+            let (sx, sy) = (w.max[0] - w.min[0], w.max[1] - w.min[1]);
+            let min_cell = (sx / vw).min(sy / vh) * 2.0;
+            let big = sx.max(sy);
+            let depth = if min_cell > 0.0 && min_cell.is_finite() {
+                ((big / min_cell).log2().ceil() + 1.0).clamp(4.0, 16.0) as u32
+            } else {
+                10
+            };
+            mesh::contour_2d(p, (w.min[0], w.max[0]), (w.min[1], w.max[1]), min_cell, depth, 100_000)
+                .into_iter()
+                .map(|s| vec![s[0], s[1]])
+                .collect()
+        }
     }
 }
 
@@ -4531,6 +5218,128 @@ mod tests {
             })
             .sum();
         (v, len)
+    }
+
+    fn weighted(mut d: Doc, w: Weight) -> Doc {
+        d.view.weight = w;
+        d
+    }
+
+    fn widths(g: &SceneGeometry) -> Vec<f32> {
+        g.segments.iter().map(|s| s.width).collect()
+    }
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn print_weight_scales_lines_at_draw_time_and_normal_is_unchanged() {
+        let d = doc_with(&[("a", "y=x")]);
+        let normal = build(&d, Mode::D2);
+        assert_eq!(widths(&normal), widths(&build(&weighted(d.clone(), Weight::Normal), Mode::D2)));
+        // (weight, curve/axis/tick multiplier, grid multiplier): the grid scales less.
+        for (w, m, gm) in [(Weight::Bold, 1.6f32, 1.3f32), (Weight::Extra, 2.2, 1.5)] {
+            let g = build(&weighted(d.clone(), w), Mode::D2);
+            assert_eq!(g.segments.len(), normal.segments.len());
+            for (a, b) in normal.segments.iter().zip(&g.segments) {
+                assert!(
+                    near(b.width, a.width * m) || near(b.width, a.width * gm),
+                    "{} -> {} at {m}/{gm}",
+                    a.width,
+                    b.width
+                );
+            }
+            let ws = widths(&g);
+            // Axes and curves take the full multiplier; the minor grid only the gentle one.
+            for (base, k) in [(AXIS_W, m), (CURVE_W, m), (MINOR_W, gm)] {
+                assert!(ws.iter().any(|x| near(*x, base * k)), "{base} x {k}");
+            }
+            assert!(!ws.iter().any(|x| near(*x, AXIS_W)), "no unweighted axis");
+            assert!(!ws.iter().any(|x| near(*x, MINOR_W * m)), "grid not at the line weight");
+            assert!(gm < m);
+        }
+    }
+
+    #[test]
+    fn print_weight_multiplies_an_explicit_line_width_only_when_drawing() {
+        let d = styled("y=x", |s| s.line_width = Some(4.0));
+        let mut b = weighted(d.clone(), Weight::Bold);
+        let (segs, _) = item_segs(&build(&b, Mode::D2), Mode::D2);
+        assert!(segs.iter().all(|s| near(s.width, 6.4)));
+        // The stored style is untouched, and turning the weight off restores the width.
+        assert_eq!(b.items[0].style.line_width, Some(4.0));
+        b.view.weight = Weight::Normal;
+        let (segs, _) = item_segs(&build(&b, Mode::D2), Mode::D2);
+        assert!(segs.iter().all(|s| near(s.width, 4.0)));
+    }
+
+    #[test]
+    fn print_weight_enlarges_points_up_to_a_clamp_and_scales_dashes() {
+        let pt = |size: Option<f64>, w| {
+            let d = weighted(styled("(1,2)", |s| s.point_size = size), w);
+            let g = build(&d, Mode::D2);
+            let dots: Vec<f32> = g.segments.iter().filter(|s| s.p0 == s.p1 && s.width > 4.0)
+                .map(|s| s.width).collect();
+            assert_eq!(dots.len(), 1, "{dots:?}");
+            dots[0]
+        };
+        assert!(near(pt(None, Weight::Normal), DOT_W));
+        assert!(near(pt(None, Weight::Bold), DOT_W * 1.3));
+        assert!(near(pt(None, Weight::Extra), DOT_W * 1.6));
+        assert!(near(pt(Some(20.0), Weight::Extra), 32.0));
+        assert!(near(pt(Some(30.0), Weight::Extra), 40.0), "clamped to 40");
+        assert!(near(pt(Some(60.0), Weight::Extra), 60.0), "never below the request");
+        assert!(near(pt(Some(60.0), Weight::Normal), 60.0));
+        // A dashed curve keeps its dash-to-width proportions: fewer, thicker dashes.
+        let dashed = |w| {
+            let d = weighted(styled("y=x", |s| s.line_style = Some(LineStyle::Dashed)), w);
+            item_segs(&build(&d, Mode::D2), Mode::D2).0
+        };
+        let (n, b) = (dashed(Weight::Normal), dashed(Weight::Bold));
+        assert!(b.len() < n.len() && b.len() * 2 > n.len(), "{} vs {}", b.len(), n.len());
+        assert!(b.iter().all(|s| near(s.width, CURVE_W * 1.6)));
+    }
+
+    #[test]
+    fn print_weight_applies_to_polar_log_and_3d_builds() {
+        let mut polar = weighted(doc_with(&[("a", "r=2")]), Weight::Bold);
+        polar.view.grid_kind = math_core::doc::GridKind::Polar;
+        let mut log = weighted(doc_with(&[("a", "y=x")]), Weight::Bold);
+        log.view.x_scale = math_core::doc::AxisScale::Log;
+        log.view.y_scale = math_core::doc::AxisScale::Log;
+        log.view.window.min = [0.1, 0.1, -1.0];
+        log.view.window.max = [100.0, 100.0, 1.0];
+        let d3 = weighted(doc_with(&[("a", "z=x+y")]), Weight::Extra);
+        for (d, mode, m, gm) in [
+            (polar, Mode::D2, 1.6f32, 1.3f32),
+            (log, Mode::D2, 1.6, 1.3),
+            (d3, Mode::D3, 2.2, 1.5),
+        ] {
+            let base = build(&weighted(d.clone(), Weight::Normal), mode);
+            let g = build(&d, mode);
+            assert_eq!(g.segments.len(), base.segments.len());
+            assert!(!g.segments.is_empty());
+            for (a, b) in base.segments.iter().zip(&g.segments) {
+                assert!(near(b.width, a.width * m) || near(b.width, a.width * gm));
+            }
+            // The grid lines (width 1.0 or 1.5) never exceed the gentle multiplier.
+            assert!(g.segments.iter().zip(&base.segments).any(|(b, a)| near(b.width, a.width * gm)));
+        }
+    }
+
+    #[test]
+    fn render_scale_multiplies_widths_for_one_build_only() {
+        let d = weighted(doc_with(&[("a", "y=x")]), Weight::Bold);
+        let one = build(&d, Mode::D2);
+        set_render_scale(2.0);
+        let two = build(&d, Mode::D2);
+        set_render_scale(f32::NAN);
+        let after = build(&d, Mode::D2);
+        for ((a, b), c) in one.segments.iter().zip(&two.segments).zip(&after.segments) {
+            assert!(near(b.width, a.width * 2.0));
+            assert!(near(c.width, a.width));
+        }
     }
 
     #[test]

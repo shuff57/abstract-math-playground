@@ -31,7 +31,7 @@ npm run wasm-dev # Builds the wasm/webgpu code from `math_playground` once, then
 
 # Graphing calculator
 
-This branch adds a Desmos-style graphing calculator on top of the playground. You type expressions and they are drawn in 1D, 2D or 3D. Switching between the three modes is animated (the camera moves while the scene cross-fades, and 3D surfaces rise out of the plane or settle into it), and the same expressions are kept across modes. It is written in Rust with [wgpu](https://wgpu.rs/) and [winit](https://github.com/rust-windowing/winit), runs natively and in the browser through WASM, and the web version has a TypeScript shell that uses [MathLive](https://cortexjs.io/mathlive/) for math input.
+This branch adds a Desmos-style graphing calculator on top of the playground. You type expressions and they are drawn in 1D, 2D or 3D. Switching between the three modes is animated (the camera moves while the scene cross-fades, and 3D surfaces rise out of the plane or settle into it), and the same expressions are kept across modes. See "Smooth mode switches" below. It is written in Rust with [wgpu](https://wgpu.rs/) and [winit](https://github.com/rust-windowing/winit), runs natively and in the browser through WASM, and the web version has a TypeScript shell that uses [MathLive](https://cortexjs.io/mathlive/) for math input.
 
 What it handles (details and examples in [docs/syntax.md](docs/syntax.md)): equations, inequalities, parametric curves, polar curves, points, lists and statistics, regression, complex-valued functions (domain colouring), derivatives, integrals/sums/products, sliders, actions and a ticker, data tables, vector fields, and slices (a lower-dimensional cross-section of the same items).
 
@@ -108,8 +108,20 @@ Prefix an expression with `c:` to make it a complex item (domain colouring). Exa
 ```bash
 cargo run -p math_playground --bin render_png -- --mode 3d --out sphere.png "x^2+y^2+z^2=36"
 cargo run -p math_playground --bin render_png -- --from 2d --to 3d --frames 6 --out-dir frames/ "y=x^2/4" "(3,2.25)"
+# --settle builds the 3D scene at full quality before the switch; frames come from the real App
+cargo run -p math_playground --bin render_png -- --from 2d --to 3d --frames 12 --settle --out-dir frames/ "y=x^2" "z=sin(x)cos(y)" "x^2+y^2+z^2=9"
 cargo run -p math_playground --bin render_png -- --mode 2d "c:z^2-1"
 ```
+
+### Smooth mode switches
+
+Switching 2D/1D to 3D and back is built so it never freezes and then jumps:
+
+- The 3D scene appears as a cheap first look at once and its surfaces are then refined in a few milliseconds of meshing per frame (time-sliced, seam-free tiles), blending in over the coarser mesh; nothing blocks for the whole mesh.
+- A stalled frame advances the 500 ms tween by at most 50 ms, so a long frame cannot eat the animation.
+- The 2D grid and axes fade out first, the 3D scene fades in once it has height, and a 2D curve stays drawn until its 3D form (for `y = x^2`, the extruded wall) has risen out of it. Tick labels cross-fade with the scenes.
+- The GPU buffers of a scene are uploaded once, not every frame.
+- With `prefers-reduced-motion` the switch is immediate (no tween, no blend) and still does not stall.
 
 ### Web
 

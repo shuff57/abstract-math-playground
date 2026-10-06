@@ -65,6 +65,50 @@ pub fn crossfade(progress: f32) -> (f32, f32) {
     (1.0 - smooth(0.35, 0.95, progress), smooth(0.05, 0.55, progress))
 }
 
+/// Opacity multipliers of the two sides of a mode switch. Each side's backdrop (grid, axes) and
+/// items (curves, surfaces) fade separately: see [`mode_fades`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModeFades {
+    pub from_backdrop: f32,
+    pub from_items: f32,
+    pub to_backdrop: f32,
+    pub to_items: f32,
+}
+
+fn smooth(a: f32, b: f32, x: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Lift below which the 3D scene is still invisible (it is a flat sheet in the plane then, and
+/// drawn over the 2D grid it would only wash it out).
+pub const FADE_3D_START: f32 = 0.2;
+/// Lift at which the 3D scene is fully opaque.
+pub const FADE_3D_FULL: f32 = 0.6;
+
+/// Opacities for a switch from `from` to `to` at tween `progress` with the rig's `lift`.
+///
+/// A switch that involves 3D is driven by the LIFT (so an interrupted switch stays consistent):
+/// the flat scene's grid and axes go first, the 3D scene (box, surfaces) comes in once it has
+/// some height, and the flat scene's curves stay until the 3D form has risen, so a 2D curve
+/// visibly turns into its wall / surface instead of fading next to a different object.
+/// Switches between the flat modes (1D <-> 2D) keep the plain staggered [`crossfade`].
+pub fn mode_fades(from: Mode, to: Mode, progress: f32, lift: f32) -> ModeFades {
+    if from != Mode::D3 && to != Mode::D3 {
+        let (o, i) = crossfade(progress);
+        return ModeFades { from_backdrop: o, from_items: o, to_backdrop: i, to_items: i };
+    }
+    let s = if lift.is_finite() { lift.clamp(0.0, 1.0) } else { 0.0 };
+    let three = smooth(FADE_3D_START, FADE_3D_FULL, s);
+    let back = 1.0 - smooth(0.0, 0.4, s);
+    let items = 1.0 - smooth(0.5, 0.95, s);
+    if from == Mode::D3 {
+        ModeFades { from_backdrop: three, from_items: three, to_backdrop: back, to_items: items }
+    } else {
+        ModeFades { from_backdrop: back, from_items: items, to_backdrop: three, to_items: three }
+    }
+}
+
 /// A secondary view drawn into a corner rectangle of the target (the slice inset): its own 2D
 /// camera and layers, clipped to `rect`.
 pub struct Inset<'a> {
@@ -76,14 +120,69 @@ pub struct Inset<'a> {
 
 struct Prepared {
     bind_group: wgpu::BindGroup,
+    geo: Arc<GeoBufs>,
+    /// (index into the layer's `fields`, params bind group)
+    fields: Vec<(usize, wgpu::BindGroup)>,
+}
+
+/// The GPU buffers of one [`SceneGeometry`], uploaded once and reused every frame until the
+/// geometry changes (see [`GeoKey`]); only the per-layer uniforms are rebuilt per frame.
+struct GeoBufs {
     segments: Option<(wgpu::Buffer, u32)>,
     overlay: Option<(wgpu::Buffer, u32)>,
     mesh: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
     /// (shared vertex buffer, flat-triangle indices, count)
     flat: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
-    /// (index into the layer's `fields`, params bind group)
-    fields: Vec<(usize, wgpu::BindGroup)>,
 }
+
+/// Identity of a geometry's buffers: where its vectors live, how long they are and a sampled
+/// content hash, so a rebuilt scene that happens to reuse an allocation is still told apart.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct GeoKey {
+    ptrs: [usize; 4],
+    lens: [usize; 4],
+    sample: u64,
+}
+
+/// FNV-1a over up to 192 evenly spaced 8-byte words of `s` (plus its length).
+fn sample_hash<T: bytemuck::Pod>(h: u64, s: &[T]) -> u64 {
+    let b: &[u8] = bytemuck::cast_slice(s);
+    let mut h = h ^ b.len() as u64;
+    h = h.wrapping_mul(0x100000001b3);
+    let words = b.len() / 8;
+    let step = (words / 192).max(1);
+    let mut i = 0;
+    while i < words {
+        let w = u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+        h = (h ^ w).wrapping_mul(0x100000001b3);
+        i += step;
+    }
+    h
+}
+
+impl GeoKey {
+    pub fn of(g: &SceneGeometry) -> GeoKey {
+        let mut h = 0xcbf29ce484222325u64;
+        h = sample_hash(h, &g.segments);
+        h = sample_hash(h, &g.overlay_segments);
+        h = sample_hash(h, &g.vertices);
+        h = sample_hash(h, &g.indices);
+        h = sample_hash(h, &g.flat_indices);
+        GeoKey {
+            ptrs: [
+                g.segments.as_ptr() as usize,
+                g.overlay_segments.as_ptr() as usize,
+                g.vertices.as_ptr() as usize,
+                g.indices.as_ptr() as usize,
+            ],
+            lens: [g.segments.len(), g.overlay_segments.len(), g.vertices.len(), g.indices.len() + g.flat_indices.len()],
+            sample: h,
+        }
+    }
+}
+
+/// Renders (not frames) an unused cached geometry is kept for before it is dropped.
+const GEO_CACHE_KEEP: u64 = 24;
 
 pub struct Renderer {
     seg_pipeline: wgpu::RenderPipeline,
@@ -104,6 +203,14 @@ pub struct Renderer {
     /// How many field pipelines have been compiled over this renderer's life (test hook: a
     /// slider drag must not increase it).
     field_compiles: usize,
+    /// Uploaded geometry by identity, with the render count it was last drawn at.
+    geo_cache: HashMap<GeoKey, (Arc<GeoBufs>, u64)>,
+    renders: u64,
+    /// How many geometries were uploaded over this renderer's life (test hook: a still scene
+    /// must not be re-uploaded every frame).
+    geo_uploads: usize,
+    /// False re-uploads every geometry every frame (the behaviour before the cache; measurement only).
+    pub cache_geometry: bool,
 }
 
 /// Camera uniform bytes in the exact layout of `Camera` in render.wgsl (112 bytes).
@@ -346,10 +453,19 @@ impl Renderer {
             field_order: VecDeque::new(),
             format,
             field_compiles: 0,
+            geo_cache: HashMap::new(),
+            renders: 0,
+            geo_uploads: 0,
+            cache_geometry: true,
         }
     }
 
     /// Number of field pipelines compiled so far (test hook for the pipeline cache).
+    /// Geometries uploaded so far (test hook).
+    pub fn geo_uploads(&self) -> usize {
+        self.geo_uploads
+    }
+
     pub fn field_compiles(&self) -> usize {
         self.field_compiles
     }
@@ -449,6 +565,69 @@ impl Renderer {
         }
     }
 
+    /// Uploads every geometry in `layers` that is not on the GPU yet and forgets the ones unused
+    /// for a while. A still scene costs no buffer uploads per frame.
+    fn ensure_geometry<'a>(&mut self, device: &wgpu::Device, layers: impl Iterator<Item = &'a Layer<'a>>) {
+        self.renders += 1;
+        let now = self.renders;
+        if !self.cache_geometry {
+            self.geo_cache.clear();
+        }
+        for l in layers {
+            let g = l.geometry;
+            let key = GeoKey::of(g);
+            if let Some(e) = self.geo_cache.get_mut(&key) {
+                e.1 = now;
+                continue;
+            }
+            self.geo_uploads += 1;
+            let segments = (!g.segments.is_empty()).then(|| {
+                    let b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("segments"),
+                        contents: bytemuck::cast_slice(&g.segments),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                    (b, g.segments.len() as u32)
+                });
+                let overlay = (!g.overlay_segments.is_empty()).then(|| {
+                    let b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("overlay segments"),
+                        contents: bytemuck::cast_slice(&g.overlay_segments),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                    (b, g.overlay_segments.len() as u32)
+                });
+                let mesh = (!g.indices.is_empty() && !g.vertices.is_empty()).then(|| {
+                    let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("mesh vertices"),
+                        contents: bytemuck::cast_slice(&g.vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                    let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("mesh indices"),
+                        contents: bytemuck::cast_slice(&g.indices),
+                        usage: wgpu::BufferUsages::INDEX,
+                    });
+                    (vb, ib, g.indices.len() as u32)
+                });
+                let flat = (!g.flat_indices.is_empty() && !g.vertices.is_empty()).then(|| {
+                    let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("flat vertices"),
+                        contents: bytemuck::cast_slice(&g.vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                    let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("flat indices"),
+                        contents: bytemuck::cast_slice(&g.flat_indices),
+                        usage: wgpu::BufferUsages::INDEX,
+                    });
+                    (vb, ib, g.flat_indices.len() as u32)
+                });
+            self.geo_cache.insert(key, (Arc::new(GeoBufs { segments, overlay, mesh, flat }), now));
+        }
+        self.geo_cache.retain(|_, e| now - e.1 <= GEO_CACHE_KEEP);
+    }
+
     fn prepare_layers(
         &self,
         device: &wgpu::Device,
@@ -482,48 +661,7 @@ impl Renderer {
                 ],
             });
             let g = l.geometry;
-            let segments = (!g.segments.is_empty()).then(|| {
-                let b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("segments"),
-                    contents: bytemuck::cast_slice(&g.segments),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                (b, g.segments.len() as u32)
-            });
-            let overlay = (!g.overlay_segments.is_empty()).then(|| {
-                let b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("overlay segments"),
-                    contents: bytemuck::cast_slice(&g.overlay_segments),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                (b, g.overlay_segments.len() as u32)
-            });
-            let mesh = (!g.indices.is_empty() && !g.vertices.is_empty()).then(|| {
-                let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("mesh vertices"),
-                    contents: bytemuck::cast_slice(&g.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("mesh indices"),
-                    contents: bytemuck::cast_slice(&g.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
-                (vb, ib, g.indices.len() as u32)
-            });
-            let flat = (!g.flat_indices.is_empty() && !g.vertices.is_empty()).then(|| {
-                let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("flat vertices"),
-                    contents: bytemuck::cast_slice(&g.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("flat indices"),
-                    contents: bytemuck::cast_slice(&g.flat_indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
-                (vb, ib, g.flat_indices.len() as u32)
-            });
+            let geo = self.geo_cache.get(&GeoKey::of(g)).map(|e| e.0.clone()).expect("geometry uploaded by ensure_geometry");
             let fields = g
                 .fields
                 .iter()
@@ -542,14 +680,14 @@ impl Renderer {
                     (i, bg)
                 })
                 .collect();
-            Prepared { bind_group, segments, overlay, mesh, flat, fields }
+            Prepared { bind_group, geo, fields }
         })
         .collect()
     }
 
     fn draw_prepared<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, prepared: &'p [Prepared], layers: &[Layer]) {
             for p in prepared {
-                if let Some((vb, ib, n)) = &p.mesh {
+                if let Some((vb, ib, n)) = &p.geo.mesh {
                     pass.set_pipeline(&self.mesh_pipeline);
                     pass.set_bind_group(0, &p.bind_group, &[]);
                     pass.set_vertex_buffer(0, vb.slice(..));
@@ -573,7 +711,7 @@ impl Renderer {
             }
             // Flat translucent shapes (histogram bars): above surfaces and fields, below lines.
             for p in prepared {
-                if let Some((vb, ib, n)) = &p.flat {
+                if let Some((vb, ib, n)) = &p.geo.flat {
                     pass.set_pipeline(&self.flat_pipeline);
                     pass.set_bind_group(0, &p.bind_group, &[]);
                     pass.set_vertex_buffer(0, vb.slice(..));
@@ -582,7 +720,7 @@ impl Renderer {
                 }
             }
             for p in prepared {
-                if let Some((buf, n)) = &p.segments {
+                if let Some((buf, n)) = &p.geo.segments {
                     pass.set_pipeline(&self.seg_pipeline);
                     pass.set_bind_group(0, &p.bind_group, &[]);
                     pass.set_vertex_buffer(0, buf.slice(..));
@@ -591,7 +729,7 @@ impl Renderer {
             }
             // Overlay lines (slice curves) last: tested against everything, writing no depth.
             for p in prepared {
-                if let Some((buf, n)) = &p.overlay {
+                if let Some((buf, n)) = &p.geo.overlay {
                     pass.set_pipeline(&self.overlay_pipeline);
                     pass.set_bind_group(0, &p.bind_group, &[]);
                     pass.set_vertex_buffer(0, buf.slice(..));
@@ -664,6 +802,7 @@ impl Renderer {
             .collect();
         self.ensure_field_pipes(device, &wanted);
 
+        self.ensure_geometry(device, layers.iter().chain(inset.iter().flat_map(|i| i.layers.iter())));
         let prepared = self.prepare_layers(device, &cam_buf, size, rig, layers);
 
         // Inset: clamp its rectangle into the target, build its own camera and layers.
@@ -744,6 +883,58 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fades_into_3d_wait_for_the_lift_and_clear_the_grid_first() {
+        let f0 = mode_fades(Mode::D2, Mode::D3, 0.0, 0.0);
+        assert_eq!(f0, ModeFades { from_backdrop: 1.0, from_items: 1.0, to_backdrop: 0.0, to_items: 0.0 });
+        let f1 = mode_fades(Mode::D2, Mode::D3, 1.0, 1.0);
+        assert_eq!(f1, ModeFades { from_backdrop: 0.0, from_items: 0.0, to_backdrop: 1.0, to_items: 1.0 });
+        // A flat sheet (lift <= start threshold) is invisible, so it cannot wash out the grid.
+        for l in [0.0, 0.05, FADE_3D_START] {
+            assert_eq!(mode_fades(Mode::D2, Mode::D3, 0.1, l).to_items, 0.0, "lift {l}");
+        }
+        // The grid is mostly gone before the 3D scene is half visible.
+        let m = mode_fades(Mode::D2, Mode::D3, 0.5, 0.35);
+        assert!(m.from_backdrop < 0.3, "{m:?}");
+        assert!(m.to_items < 0.5, "{m:?}");
+        // The curves stay (nearly) opaque while the surface rises, and only then go.
+        assert!(mode_fades(Mode::D2, Mode::D3, 0.5, 0.5).from_items > 0.99);
+        assert!(mode_fades(Mode::D2, Mode::D3, 0.5, 0.95).from_items < 0.01);
+        // Monotone in the lift, and always within [0, 1].
+        let mut prev = mode_fades(Mode::D2, Mode::D3, 0.0, 0.0);
+        for i in 1..=100 {
+            let m = mode_fades(Mode::D2, Mode::D3, 0.0, i as f32 / 100.0);
+            assert!(m.to_items >= prev.to_items && m.from_items <= prev.from_items);
+            assert!(m.from_backdrop <= prev.from_backdrop);
+            for v in [m.from_backdrop, m.from_items, m.to_backdrop, m.to_items] {
+                assert!((0.0..=1.0).contains(&v));
+            }
+            prev = m;
+        }
+        // Garbage lift is treated as flat.
+        assert_eq!(mode_fades(Mode::D2, Mode::D3, 0.5, f32::NAN).to_items, 0.0);
+    }
+
+    #[test]
+    fn fades_out_of_3d_mirror_the_way_in() {
+        for i in 0..=20 {
+            let l = i as f32 / 20.0;
+            let a = mode_fades(Mode::D2, Mode::D3, 0.3, l);
+            let b = mode_fades(Mode::D3, Mode::D1, 0.3, l);
+            assert_eq!((a.to_items, a.to_backdrop), (b.from_items, b.from_backdrop));
+            assert_eq!((a.from_items, a.from_backdrop), (b.to_items, b.to_backdrop));
+        }
+    }
+
+    #[test]
+    fn flat_switches_keep_the_progress_crossfade() {
+        for p in [0.0f32, 0.3, 0.7, 1.0] {
+            let (o, i) = crossfade(p);
+            let m = mode_fades(Mode::D1, Mode::D2, p, 0.0);
+            assert_eq!((m.from_backdrop, m.from_items, m.to_backdrop, m.to_items), (o, o, i, i));
+        }
+    }
 
     #[test]
     fn only_3d_scenes_are_lifted() {

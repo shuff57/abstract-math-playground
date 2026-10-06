@@ -49,8 +49,33 @@ pub fn parse(src: &str) -> Result<Expr, ParseError> {
 }
 
 pub fn parse_with(src: &str, ctx: &ParseCtx) -> Result<Expr, ParseError> {
+    // A trailing `{a<=t<=b, ...}` restricts the parameters: `domain(body, clause, ...)`.
+    if let Some((body, inner)) = crate::param::split_domain_src(src) {
+        let mut parts = vec![parse_body(body, ctx)?];
+        for clause in crate::param::split_top_level(inner).into_iter().filter(|c| !c.is_empty()) {
+            parts.push(parse_body(clause, ctx)?);
+        }
+        if parts.len() < 2 {
+            return Err(ParseError::new(body.len(), "empty range"));
+        }
+        crate::param::ranges_of(&parts[1..]).map_err(|m| ParseError::new(body.len(), m))?;
+        return Ok(Expr::Call(crate::ast::DOMAIN_FN.to_string(), parts));
+    }
+    parse_body(src, ctx)
+}
+
+fn parse_body(src: &str, ctx: &ParseCtx) -> Result<Expr, ParseError> {
     let norm = normalize(src)?;
-    let toks = lex(&norm)?;
+    match parse_normalized(&norm, ctx) {
+        Ok(e) => Ok(e),
+        // `x=3cos(t), y=2sin(t)`: a bare top-level comma was always an error, now it joins
+        // axis equations into the tuple of their right sides.
+        Err(err) => parse_axis_pair(&norm, ctx).ok_or(err),
+    }
+}
+
+fn parse_normalized(norm: &str, ctx: &ParseCtx) -> Result<Expr, ParseError> {
+    let toks = lex(norm)?;
     let mut ctx = ctx.clone();
     if let Some(name) = definition_prefix(&toks) {
         ctx.functions.insert(name);
@@ -61,6 +86,30 @@ pub fn parse_with(src: &str, ctx: &ParseCtx) -> Result<Expr, ParseError> {
         Tok::Eof => Ok(e),
         _ => Err(ParseError::new(p.peek().pos, "unexpected trailing input")),
     }
+}
+
+/// `x=f, y=g` or `x=f, y=g, z=h` (any order, separated by `,` or `;`) as `(f, g)` / `(f, g, h)`.
+fn parse_axis_pair(norm: &str, ctx: &ParseCtx) -> Option<Expr> {
+    let parts = crate::param::split_top_level(norm);
+    if !(2..=3).contains(&parts.len()) {
+        return None;
+    }
+    let mut slots: [Option<Expr>; 3] = [None, None, None];
+    for part in parts {
+        let Expr::Rel(Rel::Eq, lhs, rhs) = parse_normalized(part, ctx).ok()? else { return None };
+        let axis = match &*lhs {
+            Expr::Var(n) if n == "x" => 0,
+            Expr::Var(n) if n == "y" => 1,
+            Expr::Var(n) if n == "z" => 2,
+            _ => return None,
+        };
+        if slots[axis].is_some() || ["x", "y", "z"].iter().any(|v| rhs.contains_var(v)) {
+            return None;
+        }
+        slots[axis] = Some(*rhs);
+    }
+    let [x, y, z] = slots;
+    Some(Expr::Tuple(vec![x?, y?].into_iter().chain(z).collect()))
 }
 
 // ---------------------------------------------------------------- LaTeX normalization

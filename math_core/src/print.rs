@@ -133,6 +133,10 @@ fn deriv_form<'a>(name: &str, args: &'a [Expr]) -> Option<(&'a Expr, &'a str)> {
 
 pub fn to_text(e: &Expr) -> String {
     match e {
+        Expr::Call(name, args) if name == crate::ast::DOMAIN_FN && args.len() >= 2 => {
+            let clauses: Vec<String> = args[1..].iter().map(to_text).collect();
+            format!("{} {{{}}}", to_text(&args[0]), clauses.join(", "))
+        }
         Expr::Call(name, args) if name == "factorial" && args.len() == 1 => {
             let inner = to_text(&args[0]);
             if factorial_atom(&args[0]) {
@@ -257,6 +261,10 @@ fn is_big_op(e: &Expr) -> bool {
 
 pub fn to_latex(e: &Expr) -> String {
     match e {
+        Expr::Call(name, args) if name == crate::ast::DOMAIN_FN && args.len() >= 2 => {
+            let clauses: Vec<String> = args[1..].iter().map(to_latex).collect();
+            format!("{}\\left\\{{{}\\right\\}}", to_latex(&args[0]), clauses.join(",\\,"))
+        }
         Expr::Call(name, args) if big_op_form(name, args).is_some() => {
             let (kind, a) = big_op_form(name, args).unwrap();
             let Expr::Var(v) = &a[1] else { unreachable!() };
@@ -456,6 +464,11 @@ mod tests {
         "int(sin(t), t, 0, x)",
         "sum(int(x, x, 0, n), n, 1, 3)",
         "a*sin(x)",
+        "(t^2, 2t) {-3<=t<=3}",
+        "(cos(t), sin(t), t/4) {0<=t<=12pi}",
+        "r=theta {0<=theta<=6pi}",
+        "(u, v, u*v) {0<=u<=1, 0<=v<=a}",
+        "(2sin(t), 1) {t>=0}",
     ];
 
     #[test]

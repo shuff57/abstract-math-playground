@@ -91,6 +91,27 @@ impl Calculator {
         self.app.drain_json()
     }
 
+    /// Finishes any pending rebuild / refinement at full quality now (before an export).
+    pub fn settle(&mut self) {
+        self.app.settle();
+    }
+
+    /// Measurement hook: restores the pre-staged-refinement mode switch (see
+    /// `Command::SetLegacyTransition`) and per-frame geometry uploads. Never set by the shells.
+    pub fn set_legacy_transition(&mut self, on: bool) {
+        if self.renderer.cache_geometry != on {
+            return; // unchanged
+        }
+        self.app.dispatch(&format!(r#"{{"t":"setLegacyTransition","on":{on}}}"#));
+        self.renderer.cache_geometry = !on;
+    }
+
+    /// True while the app has background work (a 3D scene being refined in time slices) that
+    /// needs more `frame` calls even when nothing was redrawn.
+    pub fn busy(&self) -> bool {
+        self.app.busy()
+    }
+
     /// Advances the app and renders if needed. Returns whether a frame was rendered.
     pub fn frame(&mut self, now_ms: f64) -> bool {
         if !self.app.frame(now_ms) {
