@@ -11,6 +11,7 @@ pub mod compile;
 pub mod complex;
 pub mod drag;
 pub mod doc;
+pub mod intersect;
 pub mod interval;
 pub mod list;
 pub mod mesh;

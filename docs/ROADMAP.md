@@ -47,6 +47,13 @@ A plain list of what does not work yet or has not been checked. Items marked "fr
 - **A full `[0, 2pi]` range may cover a surface twice** (the sphere formula does), which draws two coincident sheets with opposite normals; write the range to cover it once.
 - **No intersection curves of two surfaces and no volume fills** (also in the 3D list above).
 
+## Intersections
+
+- **Grid resolution.** Implicit/implicit and parametric/parametric intersections use a 160x160 grid over the window (or over the parameter ranges). Two crossings closer than a cell, a loop smaller than a cell, or a near miss tighter than the refinement tolerance can be missed or merged. Tangent touches are found but converge linearly, so they are good to about 1e-8, not full precision.
+- **Partner and point caps.** The selected curve is checked against at most 8 other visible curves (document order), 48 points per pair and 48 points in all with the other special points. Intersection points beyond the window are not listed.
+- **Overlaps** (identical curves, or a stretch where two curves coincide) give no points, by design, as in Desmos.
+- **Not done:** intersections of a curve with an inequality boundary, 3D curves, and domain clips (`math_core::intersect::Curve::clip` takes one, but no document syntax feeds it yet).
+
 ## Slices and modes
 
 - Slices exist for 3D (plane or line) and 2D (line). There is no slice for a 1D document.
