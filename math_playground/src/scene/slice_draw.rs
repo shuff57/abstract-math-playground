@@ -87,6 +87,19 @@ impl SliceGeo {
     }
 }
 
+/// The window the slice is drawn over: the main window, except on a sloped plane where slots 0
+/// and 1 carry the in-plane `(u, v)` ranges of the plane's section of the main window.
+pub fn slice_window(rs: &ResolvedSlice, win: &Window3) -> Window3 {
+    let Some(pl) = &rs.plane else { return *win };
+    let [(u0, u1), (v0, v1)] = pl.uv_ranges(win.min, win.max);
+    let mut w = *win;
+    w.min[0] = u0;
+    w.max[0] = u1;
+    w.min[1] = v0;
+    w.max[1] = v1;
+    w
+}
+
 fn turn_of(angle: Angle) -> f64 {
     match angle {
         Angle::Rad => 2.0 * PI,
@@ -226,9 +239,10 @@ pub fn collect(
                 it.points.push(rs.snap(p));
             }
         }
-        // Parametric / polar curves cross a slice PLANE (one fixed axis) at isolated points.
-        if rs.fixed_axes().len() == 1 {
-            let axis = rs.fixed_axes()[0];
+        // Parametric / polar curves cross a slice PLANE (one fixed axis, or a sloped plane) at
+        // isolated points.
+        if rs.fixed_axes().len() == 1 || rs.plane.is_some() {
+            let axis = rs.fixed_axes().first().copied().unwrap_or(0);
             let c = rs.fixed[axis].unwrap_or(0.0);
             let curve: Option<(Vec<Expr>, &str, f64)> = match &pr.kind {
                 Kind::Parametric { components }
@@ -254,15 +268,38 @@ pub fn collect(
                     .iter()
                     .filter_map(|c| compile(c, &[var], angle).ok())
                     .collect();
-                if progs.len() == comps.len() && axis < progs.len() {
-                    let g = Expr::bin(BinOp::Sub, comps[axis].clone(), Expr::num(c));
-                    if let Ok(gp) = compile(&g, &[var], angle) {
+                // `g` is zero where the curve meets the slice: its fixed coordinate minus the
+                // constant, or its signed distance from a sloped plane.
+                let g = match &rs.plane {
+                    Some(pl) if comps.len() == 3 => {
+                        let term = |a: usize| {
+                            Expr::bin(BinOp::Mul, Expr::num(pl.n[a]), comps[a].clone())
+                        };
+                        let sum = Expr::bin(
+                            BinOp::Add,
+                            Expr::bin(BinOp::Add, term(0), term(1)),
+                            term(2),
+                        );
+                        Some(Expr::bin(BinOp::Sub, sum, Expr::num(pl.d)))
+                    }
+                    Some(_) => None,
+                    None if axis < comps.len() => {
+                        Some(Expr::bin(BinOp::Sub, comps[axis].clone(), Expr::num(c)))
+                    }
+                    None => None,
+                };
+                if progs.len() == comps.len() {
+                    if let Some(Ok(gp)) = g.map(|g| compile(&g, &[var], angle)) {
                         for t in find_roots(&gp, 0.0, t1) {
                             let mut p = [0.0; 3];
                             for (a, pg) in progs.iter().enumerate() {
                                 p[a] = pg.eval(&[t]);
                             }
-                            p[axis] = c;
+                            if rs.plane.is_some() {
+                                p = rs.snap(p);
+                            } else {
+                                p[axis] = c;
+                            }
                             if p.iter().all(|v| v.is_finite()) {
                                 it.points.push(p);
                             }
@@ -579,25 +616,40 @@ impl<'a> Builder<'a> {
         let (lo, hi) = (win.min, win.max);
         let mut halo = self.theme.background;
         halo[3] = 0.9;
-        let in_window = rs.fixed_axes().iter().all(|a| {
-            let c = rs.fixed[*a].unwrap_or(0.0);
-            c >= lo[*a] && c <= hi[*a]
-        });
+        // A sloped plane is drawn as its section of the window (a fan of triangles).
+        let section = rs.plane.map(|pl| pl.section(lo, hi));
+        let in_window = match &section {
+            Some(poly) => !poly.is_empty(),
+            None => rs.fixed_axes().iter().all(|a| {
+                let c = rs.fixed[*a].unwrap_or(0.0);
+                c >= lo[*a] && c <= hi[*a]
+            }),
+        };
         if free.len() == 2 {
             let (u, v) = (free[0], free[1]);
             if in_window {
-                let corners = [
-                    [lo[u], lo[v]],
-                    [hi[u], lo[v]],
-                    [hi[u], hi[v]],
-                    [lo[u], hi[v]],
-                ]
-                .map(|c| rs.lift(&c));
+                let corners: Vec<[f64; 3]> = match section {
+                    Some(poly) => poly,
+                    None => [
+                        [lo[u], lo[v]],
+                        [hi[u], lo[v]],
+                        [hi[u], hi[v]],
+                        [lo[u], hi[v]],
+                    ]
+                    .map(|c| rs.lift(&c))
+                    .to_vec(),
+                };
                 let mut fill = SLICE_COLOR;
                 fill[3] = PLANE_ALPHA;
-                self.quad4(corners, fill);
-                for i in 0..4 {
-                    self.seg(corners[i], corners[(i + 1) % 4], 2.0, SLICE_COLOR);
+                if corners.len() == 4 {
+                    self.quad4([corners[0], corners[1], corners[2], corners[3]], fill);
+                } else {
+                    for i in 1..corners.len().saturating_sub(1) {
+                        self.quad4([corners[0], corners[i], corners[i + 1], corners[i + 1]], fill);
+                    }
+                }
+                for i in 0..corners.len() {
+                    self.seg(corners[i], corners[(i + 1) % corners.len()], 2.0, SLICE_COLOR);
                 }
             }
             for (it, segs) in items.iter().zip(&geo.curves) {
@@ -742,11 +794,12 @@ pub fn build_panel(
         AngleMode::Rad => Angle::Rad,
         AngleMode::Deg => Angle::Deg,
     };
-    let win = window.sanitized();
+    let win = slice_window(rs, &window.sanitized());
     let free = rs.free_axes();
     let two_d = free.len() == 2;
     let u = free[0];
     let names: Vec<&str> = free.iter().map(|a| axis_name(*a)).collect();
+    let labels = rs.free_names();
     let req = ctx
         .view
         .filter(|r| r.free == free && math_core::slice::view_valid(&r.view))
@@ -877,7 +930,8 @@ pub fn build_panel(
         }
         for it in items {
             for p in &it.points {
-                b.halo_dot([p[free[0]], p[free[1]], 0.0], it.color, b.point_px(8.0));
+                let q = rs.project(*p);
+                b.halo_dot([q[0], q[1], 0.0], it.color, b.point_px(8.0));
             }
         }
     } else {
@@ -928,7 +982,7 @@ pub fn build_panel(
         b.seg([a[0], a[1], 0.0], [c[0], c[1], 0.0], 2.0, frame);
     }
     let vname = if two_d {
-        axis_name(free[1]).to_string()
+        labels[1].to_string()
     } else {
         "f".to_string()
     };
@@ -937,7 +991,7 @@ pub fn build_panel(
     // (x name leftwards, y name downwards) until clear of every tick box.
     let xn = place_name(
         0,
-        names[0],
+        labels[0],
         (pw - NAME_INSET_X, ph - NAME_INSET_Y),
         (-1.0, 0.0),
         &tick_boxes,
@@ -945,7 +999,7 @@ pub fn build_panel(
         pw,
         ph,
     );
-    let xbox = label_box(0, names[0], xn.0, xn.1);
+    let xbox = label_box(0, labels[0], xn.0, xn.1);
     let yn = place_name(
         1,
         &vname,
@@ -958,7 +1012,7 @@ pub fn build_panel(
     );
     b.label(
         [u0 + xn.0 * wu, v_hi_s - xn.1 * wv, 0.0],
-        names[0].to_string(),
+        labels[0].to_string(),
         0,
     );
     b.label([u0 + yn.0 * wu, v_hi_s - yn.1 * wv, 0.0], vname.clone(), 1);
@@ -970,7 +1024,7 @@ pub fn build_panel(
         rig,
         origin,
         rect,
-        axes: [names[0].to_string(), vname],
+        axes: [labels[0].to_string(), vname],
         curves,
         points,
         view,
@@ -1245,7 +1299,7 @@ mod tests {
             Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 1.0])
         };
         let si = collect(&items, &defs, &Theme::light(), Angle::Rad, &rs, &w);
-        let geo = compute(&rs, &si, &w, (532.0, 532.0), Angle::Rad);
+        let geo = compute(&rs, &si, &slice_window(&rs, &w), (532.0, 532.0), Angle::Rad);
         (rs, si, geo)
     }
 
@@ -1847,4 +1901,51 @@ mod tests {
         );
         assert_eq!(p.view, [-1.0, 1.0, -5.0, 5.0]);
     }
+    #[test]
+    fn sloped_plane_cuts_a_sphere_in_a_true_circle() {
+        // z = x passes through the origin: a great circle of radius 2. z = x + 1 is 1/sqrt 2 from
+        // it: radius sqrt(4 - 1/2). The inset coordinates are distances in the plane.
+        for (plane, r) in [("z = x", 2.0), ("z = x + 1", 3.5f64.sqrt())] {
+            let d = doc_with(&["x^2+y^2+z^2=4"], plane, Mode::D3);
+            let (rs, _, geo) = geo_of(&d, Mode::D3);
+            assert!(rs.plane.is_some() && rs.dim == 2, "{plane}");
+            let segs = &geo.curves[0];
+            assert!(segs.len() > 100, "{plane}: {}", segs.len());
+            // The sphere is centred on the origin, which is the frame origin of both planes.
+            let mid = (0.0, 0.0);
+            for s in segs {
+                for p in s {
+                    let rr = (p[0] - mid.0).hypot(p[1] - mid.1);
+                    assert!((rr - r).abs() < 5e-3, "{plane}: radius {rr} != {r}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sloped_plane_collects_points_and_draws_overlay_and_panel() {
+        let d = doc_with(&["(1,1,2)", "(1,1,3)", "x^2+y^2+z^2=4"], "z = x + y", Mode::D3);
+        let (rs, si, _) = geo_of(&d, Mode::D3);
+        assert_eq!(si[0].points.len(), 1, "(1,1,2) is on z = x + y, (1,1,3) is not");
+        let q = rs.project(si[0].points[0]);
+        assert!((q[0].hypot(q[1]) - rs.plane.unwrap().project([1.0, 1.0, 2.0]).iter().map(|v| v * v).sum::<f64>().sqrt()).abs() < 1e-9);
+        // Main-scene overlay: every plane vertex lies on the plane.
+        let g = build_scene(&d, Mode::D3, win(), [0.0; 3], (900, 600), &Theme::light());
+        assert!(!g.overlay_segments.is_empty());
+        // The inset builds with u / v axis names.
+        let out = build_slice_panel(&d, Mode::D3, win(), (900, 600), &Theme::light())
+            .expect("has a slice")
+            .expect("resolves");
+        assert_eq!(out.panel.axes, ["u".to_string(), "v".to_string()]);
+        assert!(out.panel.curves >= 1 && out.panel.points == 1);
+    }
+
+    #[test]
+    fn sloped_plane_misses_window_without_panicking() {
+        let d = doc_with(&["x^2+y^2+z^2=4"], "z = x + 100", Mode::D3);
+        let (_, si, geo) = geo_of(&d, Mode::D3);
+        assert!(si.len() == 1 && geo.curves[0].is_empty());
+        let _ = build_scene(&d, Mode::D3, win(), [0.0; 3], (900, 600), &Theme::light());
+    }
+
 }

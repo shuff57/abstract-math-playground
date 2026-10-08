@@ -357,6 +357,8 @@ y = 1, z = 0.5
 y = a
 ```
 
+In the 3D view a single plane may also be sloped: write one axis equal to a linear expression of `x`, `y` and `z` (sliders allowed), such as `z = 2x + y`, `y = 1 - x/2` or `x = a z`. The inset then shows the plane's own in-plane coordinates, `u` along the level direction and `v` up the slope (`v` runs along `z` on a vertical plane), and the main view draws the plane clipped to the window. Anything that is not linear (`z = x^2`) is an error. An expression that turns out parallel to a coordinate plane (`z = z/2 + 1`) is the ordinary `z = 2`. Sloped slices need the 3D view, only one sloped plane can be set (not a sloped line), and a sloped slice is recompiled as a slider sweeps it.
+
 Set it with `setSlice` (or `--slice` in `render_png`). The inset has its own view window; dragging or the wheel on the inset changes it, a double-click resets it to follow the main window.
 
 ## Angle mode

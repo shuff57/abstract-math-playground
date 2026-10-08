@@ -197,8 +197,190 @@ pub struct ResolvedSlice {
     pub mode: Mode,
     /// Dimension of the slice itself (1 or 2).
     pub dim: u8,
-    /// `Some(c)` for a fixed axis.
+    /// `Some(c)` for a fixed axis. All `None` for a sloped plane.
     pub fixed: [Option<f64>; 3],
+    /// A plane that is not parallel to a coordinate plane (`z = 2x + y`); then `fixed` is empty
+    /// and the free coordinates are the in-plane `(u, v)` (named `x`, `y` inside the slice).
+    pub plane: Option<Plane>,
+}
+
+/// A sloped plane `n . p = d` with an in-plane frame: `e1` is horizontal, `e2` runs
+/// up the slope (positive z unless the plane is vertical).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Plane {
+    pub n: [f64; 3],
+    pub d: f64,
+    pub e1: [f64; 3],
+    pub e2: [f64; 3],
+}
+
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+impl Plane {
+    /// From the plane `g . p = c` (`g` need not be unit). `None` for a zero normal.
+    pub fn from_normal(g: [f64; 3], c: f64) -> Option<Plane> {
+        let len = dot3(g, g).sqrt();
+        if !(len.is_finite() && len > 1e-12) {
+            return None;
+        }
+        let mut n = [g[0] / len, g[1] / len, g[2] / len];
+        let mut d = c / len;
+        // Normal points up (or +x / +y for a vertical plane) so the frame is stable.
+        let flip = if n[2].abs() > 1e-12 { n[2] < 0.0 } else if n[0].abs() > 1e-12 { n[0] < 0.0 } else { n[1] < 0.0 };
+        if flip {
+            n = n.map(|v| -v);
+            d = -d;
+        }
+        let h = (n[0] * n[0] + n[1] * n[1]).sqrt();
+        if h < 1e-12 {
+            // Parallel to the xy plane: a frame along x and y.
+            return Some(Plane { n, d, e1: [1.0, 0.0, 0.0], e2: [0.0, 1.0, 0.0] });
+        }
+        let e1 = [n[1] / h, -n[0] / h, 0.0];
+        // e2 = e1 x n is up the slope for an upward normal.
+        let e2 = [
+            e1[1] * n[2] - e1[2] * n[1],
+            e1[2] * n[0] - e1[0] * n[2],
+            e1[0] * n[1] - e1[1] * n[0],
+        ];
+        Some(Plane { n, d, e1, e2 })
+    }
+
+    /// Ambient point at in-plane coordinates `(u, v)`.
+    pub fn lift(&self, u: f64, v: f64) -> [f64; 3] {
+        let mut p = [0.0; 3];
+        for (a, slot) in p.iter_mut().enumerate() {
+            *slot = self.n[a] * self.d + u * self.e1[a] + v * self.e2[a];
+        }
+        p
+    }
+
+    /// In-plane coordinates of the orthogonal projection of `p`.
+    pub fn project(&self, p: [f64; 3]) -> [f64; 2] {
+        [dot3(p, self.e1), dot3(p, self.e2)]
+    }
+
+    /// Signed distance of `p` from the plane.
+    pub fn dist(&self, p: [f64; 3]) -> f64 {
+        dot3(self.n, p) - self.d
+    }
+
+    /// The plane clipped to the box `lo..hi`, as ordered polygon vertices (empty when the plane
+    /// misses the box).
+    pub fn section(&self, lo: [f64; 3], hi: [f64; 3]) -> Vec<[f64; 3]> {
+        let corner = |m: usize| [0, 1, 2].map(|a| if m >> a & 1 == 1 { hi[a] } else { lo[a] });
+        let mut pts: Vec<[f64; 3]> = Vec::new();
+        for m in 0..8usize {
+            for a in 0..3 {
+                if m >> a & 1 == 1 {
+                    continue;
+                }
+                let (p, q) = (corner(m), corner(m | 1 << a));
+                let (dp, dq) = (self.dist(p), self.dist(q));
+                if (dp <= 0.0) != (dq <= 0.0) || dp == 0.0 {
+                    let t = if dp == dq { 0.0 } else { dp / (dp - dq) };
+                    let r = [0, 1, 2].map(|k| p[k] + t * (q[k] - p[k]));
+                    if pts.iter().all(|o| (0..3).any(|k| (o[k] - r[k]).abs() > 1e-9 * (1.0 + r[k].abs()))) {
+                        pts.push(r);
+                    }
+                }
+            }
+        }
+        if pts.len() < 3 {
+            return Vec::new();
+        }
+        let uv: Vec<[f64; 2]> = pts.iter().map(|p| self.project(*p)).collect();
+        let c = [
+            uv.iter().map(|q| q[0]).sum::<f64>() / uv.len() as f64,
+            uv.iter().map(|q| q[1]).sum::<f64>() / uv.len() as f64,
+        ];
+        let mut idx: Vec<usize> = (0..pts.len()).collect();
+        idx.sort_by(|a, b| {
+            let (qa, qb) = (uv[*a], uv[*b]);
+            (qa[1] - c[1]).atan2(qa[0] - c[0]).total_cmp(&(qb[1] - c[1]).atan2(qb[0] - c[0]))
+        });
+        idx.into_iter().map(|i| pts[i]).collect()
+    }
+
+    /// The `(u, v)` ranges to show for the box `lo..hi`: the section's extent, or the extent of
+    /// the projected box corners when the plane misses it.
+    pub fn uv_ranges(&self, lo: [f64; 3], hi: [f64; 3]) -> [(f64, f64); 2] {
+        let mut pts = self.section(lo, hi);
+        if pts.is_empty() {
+            pts = (0..8usize)
+                .map(|m| [0, 1, 2].map(|a| if m >> a & 1 == 1 { hi[a] } else { lo[a] }))
+                .collect();
+        }
+        let mut r = [(f64::INFINITY, f64::NEG_INFINITY); 2];
+        for p in pts {
+            let q = self.project(p);
+            for k in 0..2 {
+                r[k] = (r[k].0.min(q[k]), r[k].1.max(q[k]));
+            }
+        }
+        for k in 0..2 {
+            if !(r[k].1 - r[k].0 > 1e-9) {
+                r[k] = (r[k].0 - 1.0, r[k].0 + 1.0);
+            }
+        }
+        r
+    }
+}
+
+/// A slice constant that mentions x, y or z describes a sloped plane.
+enum Sloped {
+    /// The expression turned out to be a constant plane after all (`z = z/2 + 1`).
+    Axis(usize, f64),
+    Plane(Plane),
+}
+
+/// `Ok(None)` when the config is an ordinary constant slice. A single `axis = expr` whose
+/// expr uses x, y or z must be linear (`z = 2x + y`, `y = 1 - x/2`) and describes a plane that
+/// need not be parallel to a coordinate plane.
+fn resolve_sloped(cfg: &SliceCfg, mode: Mode, defs: &Defs, angle: Angle) -> Result<Option<Sloped>, String> {
+    let (k, e) = match cfg.fixed.iter().next() {
+        Some((k, SliceVal::Expr(s))) if cfg.fixed.len() == 1 => (k, s),
+        _ => return Ok(None),
+    };
+    let parsed = parse_with(e, &ParseCtx::new()).map_err(|e| format!("slice {k}: {e}"))?;
+    let r = defs.resolve(&parsed).map_err(|e| format!("slice {k}: {e}"))?;
+    if !["x", "y", "z"].iter().any(|v| r.contains_var(v)) {
+        return Ok(None);
+    }
+    if mode != Mode::D3 {
+        return Err("Slice paused: a sloped plane needs the 3D view (it comes back when you return to it).".into());
+    }
+    let ai = axis_index(k).unwrap_or(0);
+    // F = axis - expr is zero on the plane.
+    let f = Expr::bin(crate::ast::BinOp::Sub, Expr::Var(axis_name(ai).to_string()), r);
+    let prog = compile(&f, &["x", "y", "z"], angle).map_err(|e| format!("slice {k}: {e}"))?;
+    let at = |p: [f64; 3]| prog.eval(&p);
+    let g0 = at([0.0; 3]);
+    let g = [at([1.0, 0.0, 0.0]) - g0, at([0.0, 1.0, 0.0]) - g0, at([0.0, 0.0, 1.0]) - g0];
+    let flat = |p: [f64; 3]| {
+        let want = g0 + dot3(g, p);
+        let got = at(p);
+        got.is_finite() && (got - want).abs() <= 1e-9 * (1.0 + want.abs().max(g0.abs()))
+    };
+    if !(g0.is_finite() && g.iter().all(|v| v.is_finite()))
+        || !flat([1.7, -2.3, 0.9])
+        || !flat([-3.1, 0.4, 2.2])
+        || !flat([5.5, 4.1, -6.3])
+    {
+        return Err(format!("slice {k}: a sloped plane must be linear in x, y and z (like z = 2x + y)"));
+    }
+    let Some(plane) = Plane::from_normal(g, -g0) else {
+        return Err(format!("slice {k}: that does not describe a plane"));
+    };
+    // Parallel to a coordinate plane: use the ordinary axis form.
+    for a in 0..3 {
+        if plane.n[a].abs() > 1.0 - 1e-12 {
+            return Ok(Some(Sloped::Axis(a, plane.d / plane.n[a])));
+        }
+    }
+    Ok(Some(Sloped::Plane(plane)))
 }
 
 impl ResolvedSlice {
@@ -212,7 +394,22 @@ impl ResolvedSlice {
             return Err("Slice paused: slices need the 2D or 3D view (it comes back when you return to one).".into());
         }
         let mut fixed = [None; 3];
+        let mut collapsed = false;
+        if let Some(sloped) = resolve_sloped(cfg, mode, defs, angle)? {
+            match sloped {
+                Sloped::Axis(i, c) => {
+                    fixed[i] = Some(c);
+                    collapsed = true;
+                }
+                Sloped::Plane(plane) => {
+                    return Ok(ResolvedSlice { mode, dim: 2, fixed, plane: Some(plane) });
+                }
+            }
+        }
         for (k, v) in &cfg.fixed {
+            if collapsed {
+                break;
+            }
             let i = axis_index(k).unwrap_or(0);
             if i >= ambient {
                 return Err(format!(
@@ -241,11 +438,14 @@ impl ResolvedSlice {
         }
         // Always derived from the mode now, never from the stored `dim`.
         let dim = (ambient - n) as u8;
-        Ok(ResolvedSlice { mode, dim, fixed })
+        Ok(ResolvedSlice { mode, dim, fixed, plane: None })
     }
 
     /// Indices of the axes that stay free, ascending.
     pub fn free_axes(&self) -> Vec<usize> {
+        if self.plane.is_some() {
+            return vec![0, 1];
+        }
         (0..self.mode.dims() as usize).filter(|i| self.fixed[*i].is_none()).collect()
     }
 
@@ -256,12 +456,35 @@ impl ResolvedSlice {
 
     /// `e` with every fixed axis replaced by its constant.
     pub fn restrict(&self, e: &Expr) -> Expr {
-        restrict(e, &self.fixed)
+        match &self.plane {
+            Some(pl) => restrict_plane(e, pl),
+            None => restrict(e, &self.fixed),
+        }
+    }
+
+    /// Axis names shown for the free coordinates (`u`, `v` on a sloped plane).
+    pub fn free_names(&self) -> Vec<&'static str> {
+        if self.plane.is_some() {
+            return vec!["u", "v"];
+        }
+        self.free_axes().into_iter().map(axis_name).collect()
+    }
+
+    /// Coordinates of an ambient point in the slice frame (the free axes in order; `u, v` on a
+    /// sloped plane).
+    pub fn project(&self, p: [f64; 3]) -> Vec<f64> {
+        match &self.plane {
+            Some(pl) => pl.project(p).to_vec(),
+            None => self.free_axes().into_iter().map(|a| p[a]).collect(),
+        }
     }
 
     /// Ambient point from free-axis coordinates `u` (in `free_axes` order); fixed axes get their
     /// constants.
     pub fn lift(&self, u: &[f64]) -> [f64; 3] {
+        if let Some(pl) = &self.plane {
+            return pl.lift(u.first().copied().unwrap_or(0.0), u.get(1).copied().unwrap_or(0.0));
+        }
         let mut p = [0.0; 3];
         let mut k = 0;
         for (i, slot) in p.iter_mut().enumerate() {
@@ -302,12 +525,20 @@ impl ResolvedSlice {
 
     /// True when `p` is within `tol` of every fixed axis constant.
     pub fn contains_point(&self, p: [f64; 3], tol: [f64; 3]) -> bool {
+        if let Some(pl) = &self.plane {
+            let t: f64 = (0..3).map(|a| pl.n[a].abs() * tol[a]).sum();
+            return p.iter().all(|v| v.is_finite()) && pl.dist(p).abs() <= t;
+        }
         p.iter().all(|v| v.is_finite())
             && self.fixed.iter().enumerate().all(|(a, c)| c.is_none_or(|c| (p[a] - c).abs() <= tol[a]))
     }
 
     /// `p` moved onto the slice (fixed axes set to their constants).
     pub fn snap(&self, mut p: [f64; 3]) -> [f64; 3] {
+        if let Some(pl) = &self.plane {
+            let k = pl.dist(p);
+            return [0, 1, 2].map(|a| p[a] - k * pl.n[a]);
+        }
         for (a, c) in self.fixed.iter().enumerate() {
             if let Some(c) = c {
                 p[a] = *c;
@@ -321,6 +552,10 @@ impl ResolvedSlice {
 /// renamed to `x`, `y` in ascending order, so the result is a function `f(x, y)` (or `f(x)`)
 /// whatever the slice orientation. The constants' values are `rs.fixed`.
 pub fn virtualize(e: &Expr, rs: &ResolvedSlice) -> Expr {
+    if rs.plane.is_some() {
+        // The plane's numbers are folded in (a sweeping sloped slice recompiles).
+        return rs.restrict(e);
+    }
     let mut out = e.clone();
     for a in rs.fixed_axes() {
         out = out.subst(axis_name(a), &Expr::Var(const_var(a)));
@@ -378,6 +613,26 @@ pub fn zoom_view(v: [f64; 4], fx: f64, fy: f64, factor: f64) -> [f64; 4] {
     } else {
         v
     }
+}
+
+/// `e` with x, y, z replaced by the point of the plane at in-plane coordinates `(x, y)`.
+pub fn restrict_plane(e: &Expr, pl: &Plane) -> Expr {
+    use crate::ast::BinOp;
+    let o = pl.lift(0.0, 0.0);
+    let mut out = e.clone();
+    for (a, tmp) in ["$px", "$py", "$pz"].iter().enumerate() {
+        out = out.subst(axis_name(a), &Expr::Var((*tmp).to_string()));
+    }
+    for (a, tmp) in ["$px", "$py", "$pz"].iter().enumerate() {
+        let term = |c: f64, v: &str| Expr::bin(BinOp::Mul, Expr::Num(c), Expr::Var(v.to_string()));
+        let sum = Expr::bin(
+            BinOp::Add,
+            Expr::bin(BinOp::Add, Expr::Num(o[a]), term(pl.e1[a], "x")),
+            term(pl.e2[a], "y"),
+        );
+        out = out.subst(tmp, &sum);
+    }
+    out
 }
 
 /// `e` with each axis that has a constant replaced by that number.
@@ -543,5 +798,80 @@ mod tests {
         let bad = new.replace("\"z\"", "\"w\"");
         assert!(crate::doc::from_json(&bad).is_err());
     }
+    fn sloped(text: &str) -> Result<ResolvedSlice, String> {
+        let cfg = SliceCfg::new(None, parse_fixed_text(text).unwrap(), Mode::D3).unwrap();
+        ResolvedSlice::resolve(&cfg, Mode::D3, &Defs::new(), Angle::Rad)
+    }
+
+    #[test]
+    fn sloped_plane_frame_and_lift() {
+        let r = sloped("z = 2x + y").unwrap();
+        let pl = r.plane.expect("sloped");
+        assert_eq!((r.dim, r.free_axes(), r.fixed_axes()), (2, vec![0, 1], vec![]));
+        for (u, v) in [(0.0, 0.0), (1.5, -2.0), (-3.0, 4.0)] {
+            let p = pl.lift(u, v);
+            assert!((p[2] - (2.0 * p[0] + p[1])).abs() < 1e-9, "{p:?} lies on z = 2x + y");
+            let q = pl.project(p);
+            assert!((q[0] - u).abs() < 1e-9 && (q[1] - v).abs() < 1e-9);
+        }
+        assert!((dot3(pl.e1, pl.e2)).abs() < 1e-12 && dot3(pl.e1, pl.n).abs() < 1e-12);
+        assert!(pl.e2[2] > 0.0, "v runs up the slope");
+        assert_eq!(r.free_names(), vec!["u", "v"]);
+    }
+
+    #[test]
+    fn sloped_plane_restricts_and_snaps() {
+        let r = sloped("z = x + y").unwrap();
+        // x + y - z vanishes on the plane, so its restriction is zero everywhere in (x, y).
+        let e = parse_with("x + y - z", &ParseCtx::new()).unwrap();
+        let p = compile(&r.restrict(&e), &["x", "y"], Angle::Rad).unwrap();
+        for (u, v) in [(0.3, 0.7), (-2.0, 5.0)] {
+            assert!(p.eval(&[u, v]).abs() < 1e-9);
+        }
+        let off = [1.0, 1.0, 3.0];
+        let tol = [0.1; 3];
+        assert!(!r.contains_point(off, [0.01; 3]) && r.contains_point([1.0, 1.0, 2.01], tol));
+        let on = r.snap(off);
+        assert!((on[2] - (on[0] + on[1])).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sloped_text_can_use_sliders_and_any_axis() {
+        let mut defs = Defs::new();
+        defs.set_slider("a", 3.0);
+        let cfg = SliceCfg::new(None, parse_fixed_text("y = a x").unwrap(), Mode::D3).unwrap();
+        let pl = ResolvedSlice::resolve(&cfg, Mode::D3, &defs, Angle::Rad).unwrap().plane.unwrap();
+        let p = pl.lift(1.0, 1.0);
+        assert!((p[1] - 3.0 * p[0]).abs() < 1e-9, "vertical plane y = 3x");
+        assert!(pl.e2[2].abs() > 0.99, "a vertical plane's v axis is z");
+    }
+
+    #[test]
+    fn sloped_degenerate_cases() {
+        // Parallel to a coordinate plane: the ordinary axis form.
+        let r = sloped("z = z/2 + 1").unwrap();
+        assert!(r.plane.is_none() && r.fixed == [None, None, Some(2.0)]);
+        assert!(sloped("z = x^2").unwrap_err().contains("linear"));
+        assert!(sloped("z = sin(x)").is_err());
+        assert!(sloped("z = z").is_err(), "not a plane");
+        let cfg = SliceCfg::new(None, parse_fixed_text("z = x").unwrap(), Mode::D3).unwrap();
+        let e = ResolvedSlice::resolve(&cfg, Mode::D2, &Defs::new(), Angle::Rad).unwrap_err();
+        assert!(e.starts_with("Slice paused"), "{e}");
+    }
+
+    #[test]
+    fn sloped_plane_section_is_a_polygon() {
+        let pl = sloped("z = x").unwrap().plane.unwrap();
+        let sec = pl.section([-2.0; 3], [2.0; 3]);
+        assert_eq!(sec.len(), 4, "z = x cuts the cube in a rectangle");
+        for p in &sec {
+            assert!(pl.dist(*p).abs() < 1e-9 && p.iter().all(|v| v.abs() <= 2.0 + 1e-9));
+        }
+        let far = sloped("z = x + 100").unwrap().plane.unwrap();
+        assert!(far.section([-2.0; 3], [2.0; 3]).is_empty());
+        let r = far.uv_ranges([-2.0; 3], [2.0; 3]);
+        assert!(r[0].1 > r[0].0 && r[1].1 > r[1].0);
+    }
+
 }
 

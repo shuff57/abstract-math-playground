@@ -3287,7 +3287,7 @@ pub fn build_scene_mapped(
                 Mode::D3 => (0.7 * b.vw.min(b.vh), 0.7 * b.vw.min(b.vh)),
                 _ => (b.vw, b.vh),
             };
-            let geo = slice_draw::compute(&rs, &sitems, &b.win, px, b.angle);
+            let geo = slice_draw::compute(&rs, &sitems, &slice_draw::slice_window(&rs, &b.win), px, b.angle);
             b.slice_overlay(&rs, &sitems, &geo);
         }
     }

@@ -90,7 +90,7 @@ Slices:
 
 | `t` | Fields | Notes |
 | --- | --- | --- |
-| `setSlice` | `fixed` (aliases `plane`, `axis`, `at`, `axes`), optional `dim` | `fixed` is an object `{"z":0.5}` / `{"y":1,"z":"a"}` or a string `"y=1,z=0.5"`. Values are numbers or expressions of slider names. `dim` is derived from the mode and the number of fixed axes; a value that disagrees is an error. |
+| `setSlice` | `fixed` (aliases `plane`, `axis`, `at`, `axes`), optional `dim` | `fixed` is an object `{"z":0.5}` / `{"y":1,"z":"a"}` or a string `"y=1,z=0.5"`. Values are numbers or expressions of slider names; a single value that uses `x`, `y` or `z` and is linear (`{"z":"2x+y"}`) is a sloped plane in 3D (the `slice` event then has an empty `fixed` and `free` is `["u","v"]`). `dim` is derived from the mode and the number of fixed axes; a value that disagrees is an error. |
 | `clearSlice` | none | |
 | `setSliceView` | optional `min` `[xmin,ymin]`, `max` `[xmax,ymax]`, `view` `[xmin,xmax,ymin,ymax]` | Sets the inset's own window; it stops following the main window. Error if there is no slice. |
 | `resetSliceView` | none | Back to auto-follow. |
