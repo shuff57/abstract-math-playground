@@ -2,6 +2,7 @@ extern crate nalgebra as na;
 
 pub mod app;
 pub mod axis_map;
+pub mod curve_pairs;
 pub mod demo;
 pub mod geometry;
 #[cfg(not(target_arch = "wasm32"))]

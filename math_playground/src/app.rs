@@ -370,6 +370,9 @@ pub struct AnalysisPoint {
     /// The point on the canvas in pixels from the top-left.
     pub px: f64,
     pub py: f64,
+    /// For an `intersection`: the id of the other curve. Absent for every other kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub with: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1806,7 +1809,7 @@ impl App {
                             .iter()
                             .map(|s| {
                                 let (px, py) = self.rig.world_to_pixel(m.fwd3([s.x, s.y, 0.0]), vp);
-                                AnalysisPoint { kind: s.kind.name(), x: s.x, y: s.y, px, py }
+                                AnalysisPoint { kind: s.kind.name(), x: s.x, y: s.y, px, py, with: None }
                             })
                             .collect();
                     }
@@ -1814,6 +1817,9 @@ impl App {
                     // no analysis (no special points).
                     None if self.hover_shapes.as_ref().is_some_and(|(_, cs)| cs.iter().any(|(c, _)| c.id == id)) => {}
                     None => self.selected = None,
+                }
+                if self.selected.is_some() {
+                    self.add_intersections(&id, &mut points, vp);
                 }
             }
             (Some(_), false) => self.selected = None,
@@ -1825,6 +1831,34 @@ impl App {
         }
         self.outbox.push(Event::Analysis { item: now.0.clone(), points: now.1.clone() });
         self.last_analysis = Some(now);
+    }
+
+    /// Appends `intersection` points of curve `id` with the other visible curves to `points`
+    /// (see `curve_pairs`). Special points are trimmed so at least 16 slots stay free for them;
+    /// the total never exceeds 48.
+    fn add_intersections(&self, id: &str, points: &mut Vec<AnalysisPoint>, vp: (f64, f64)) {
+        const CAP: usize = 48;
+        const RESERVED: usize = 16;
+        let m = self.active_map();
+        let w = m.to_world(self.scene_window());
+        let (Some((_, ex)), Some((_, sh))) = (self.hover_curves.as_ref(), self.hover_shapes.as_ref()) else { return };
+        let shapes: Vec<&crate::scene::ShapeCurve> = sh.iter().map(|(c, _)| c).collect();
+        let order = |other: &str| self.doc.items.iter().position(|i| i.id == other).unwrap_or(usize::MAX);
+        let hits = crate::curve_pairs::with_others(id, ex, &shapes, &order, m, [w.min[0], w.max[0], w.min[1], w.max[1]]);
+        let (sx, sy) = ((w.max[0] - w.min[0]).abs(), (w.max[1] - w.min[1]).abs());
+        let mut found: Vec<AnalysisPoint> = Vec::new();
+        for (other, x, y) in hits {
+            // A root, intercept or extremum already listed at the same spot is not repeated.
+            let dup = points.iter().chain(found.iter()).any(|p| (p.x - x).abs() <= 1e-6 * sx && (p.y - y).abs() <= 1e-6 * sy);
+            if dup {
+                continue;
+            }
+            let (px, py) = self.rig.world_to_pixel(m.fwd3([x, y, 0.0]), vp);
+            found.push(AnalysisPoint { kind: "intersection", x, y, px, py, with: Some(other) });
+        }
+        points.truncate(CAP - found.len().min(RESERVED));
+        found.truncate(CAP - points.len());
+        points.extend(found);
     }
 
     /// `(item, world x, world y, pixel x, pixel y)` of the curve point nearest the pointer, looking
@@ -3709,6 +3743,54 @@ mod tests {
         let ev = pick_at(&mut a, 10.0, 10.0);
         let an = analysis(&ev).expect("cleared");
         assert!(an["item"].is_null() && an["points"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn analysis_lists_intersections_with_the_other_curves() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=x^2-4"}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"b","latex":"y=x"}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"c","latex":"x^2+y^2=25"}"#);
+        let (px, py) = a.rig.world_to_pixel([3.0, 5.0, 0.0], (800.0, 600.0));
+        let ev = pick_at(&mut a, px, py);
+        let an = analysis(&ev).expect("an analysis event");
+        let hits: Vec<&serde_json::Value> =
+            an["points"].as_array().unwrap().iter().filter(|p| p["kind"] == "intersection").collect();
+        // with y=x: x^2 - x - 4 = 0; with the circle: 4 points of x^2 + (x^2-4)^2 = 25
+        let with = |w: &str| hits.iter().filter(|p| p["with"] == w).count();
+        assert_eq!(with("b"), 2, "{an}");
+        assert_eq!(with("c"), 2, "{an}");
+        let r = (1.0 + 17f64.sqrt()) / 2.0;
+        assert!(hits.iter().any(|p| p["with"] == "b" && (p["x"].as_f64().unwrap() - r).abs() < 1e-6));
+        assert!(hits.iter().all(|p| p["px"].is_number() && p["py"].is_number()));
+        assert!(an["points"].as_array().unwrap().len() <= 48);
+        // The roots and the rest are still listed.
+        assert_eq!(kinds(an, "root").len(), 2);
+    }
+
+    #[test]
+    fn a_picked_implicit_curve_lists_its_intersections() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"c","latex":"x^2+y^2=25"}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"d","latex":"(x-5)^2+y^2=25"}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"e","latex":"y=x"}"#);
+        let (px, py) = a.rig.world_to_pixel([-5.0, 0.0, 0.0], (800.0, 600.0));
+        let ev = pick_at(&mut a, px, py);
+        let an = analysis(&ev).expect("selected");
+        assert_eq!(an["item"], "c");
+        let n = |w: &str| an["points"].as_array().unwrap().iter().filter(|p| p["with"] == w).count();
+        assert_eq!((n("d"), n("e")), (2, 2), "{an}");
+    }
+
+    #[test]
+    fn hidden_curves_have_no_intersections() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=x^2-4"}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"b","latex":"y=x"}"#);
+        cmd(&mut a, r#"{"t":"setHidden","id":"b","hidden":true}"#);
+        let (px, py) = a.rig.world_to_pixel([3.0, 5.0, 0.0], (800.0, 600.0));
+        let an = analysis(&pick_at(&mut a, px, py)).cloned().expect("selected");
+        assert!(kinds(&an, "intersection").is_empty(), "{an}");
     }
 
     fn ptr_at(a: &mut App, phase: &str, x: f64, y: f64) -> Vec<serde_json::Value> {
