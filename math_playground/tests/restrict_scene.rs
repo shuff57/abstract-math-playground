@@ -24,6 +24,11 @@ struct Drawn {
     g: SceneGeometry,
 }
 
+/// Width of an open marker's ring outline (just under the 2.5 px curve).
+fn is_ring(w: f32) -> bool {
+    (w - 2.4).abs() < 0.02
+}
+
 fn drawn(lines: &[&str]) -> Drawn {
     drawn_in(lines, &Theme::light())
 }
@@ -36,11 +41,11 @@ fn drawn_in(lines: &[&str], theme: &Theme) -> Drawn {
     let abs = |p: [f32; 3]| [p[0] as f64 + o[0], p[1] as f64 + o[1]];
     let (mut curve, mut filled, mut ring, mut interiors) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for s in g.segments.iter().skip(g.backdrop_segments) {
-        if s.p0 == s.p1 && s.width > 6.0 && s.color == theme.background {
+        if s.p0 == s.p1 && s.width > 8.0 && s.color == theme.background {
             interiors.push(abs(s.p0));
-        } else if s.p0 == s.p1 && s.width > 6.0 {
+        } else if s.p0 == s.p1 && s.width > 8.0 {
             filled.push(abs(s.p0));
-        } else if s.width < 2.2 {
+        } else if is_ring(s.width) {
             ring.push(abs(s.p0));
             ring.push(abs(s.p1));
         } else {
@@ -162,17 +167,29 @@ fn open_marker_has_an_opaque_background_interior_in_both_themes() {
         // the interior is in the background colour, fully opaque, and drawn after the curve
         let i = d.g.segments.iter().position(|s| s.p0 == s.p1 && s.color == theme.background && s.width > 6.0).unwrap();
         assert_eq!(d.g.segments[i].color[3], 1.0);
-        let last_curve = d.g.segments.iter().rposition(|s| s.p0 != s.p1 && s.width >= 2.2).unwrap();
+        let last_curve = d.g.segments.iter().rposition(|s| s.p0 != s.p1 && !is_ring(s.width) && s.width >= 2.2).unwrap();
         assert!(i > last_curve, "interior must cover the curve end");
         // the ring is drawn over the interior
-        assert!(d.g.segments[i + 1..].iter().any(|s| s.width < 2.2 && s.p0 != s.p1));
+        assert!(d.g.segments[i + 1..].iter().any(|s| is_ring(s.width) && s.p0 != s.p1));
         // the interior is as wide as the ring's outer diameter
         let ring_w = d.g.segments[i + 1].width;
-        let ring_d = d.g.segments[i + 1..].iter().find(|s| s.width < 2.2).unwrap();
+        let ring_d = d.g.segments[i + 1..].iter().find(|s| is_ring(s.width)).unwrap();
         assert!(d.g.segments[i].width > 2.0 * ring_w && ring_d.width >= 1.5);
         // a closed marker has no such interior
         let c = drawn_in(&["y=x^2 {x>=0}"], &theme);
         assert!(c.interiors.is_empty());
         assert_eq!(c.filled.len(), 1);
     }
+}
+
+#[test]
+fn endpoint_markers_are_larger_than_a_point_with_a_thick_ring() {
+    let d = drawn(&["y=x^2 {x>0}"]);
+    let disc = d.g.segments.iter().find(|s| s.p0 == s.p1 && s.color == Theme::light().background && s.width > 8.0).unwrap();
+    assert!(disc.width >= 12.0, "open marker diameter {}", disc.width);
+    let ring = d.g.segments.iter().find(|s| is_ring(s.width) && s.p0 != s.p1).unwrap();
+    assert!((ring.width - 2.4).abs() < 0.02);
+    let c = drawn(&["y=x^2 {x>=0}"]);
+    let dot = c.g.segments.iter().find(|s| s.p0 == s.p1 && s.width > 8.0).unwrap();
+    assert!(dot.width >= 12.0, "filled marker diameter {}", dot.width);
 }

@@ -66,6 +66,10 @@ const MAJOR_W: f32 = 1.5;
 const AXIS_W: f32 = 2.0;
 const CURVE_W: f32 = 2.5;
 const DOT_W: f32 = 9.0;
+/// Range-endpoint markers are this much larger than a point of the same item, and their ring
+/// outline is [`MARKER_RING_W`] pixels (just under the curve width, so scene tests can tell them apart).
+const MARKER_SCALE: f32 = 1.35;
+const MARKER_RING_W: f32 = 2.4;
 /// Width of a table column's point outline ring (pixels on each side).
 const OUTLINE_W: f32 = 2.0;
 const TICK_PX: f64 = 4.0;
@@ -660,6 +664,22 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// An open ring of outer diameter `size` pixels and outline `rw` pixels around `p` (display
+    /// coordinates).
+    fn ring(&mut self, p: [f64; 3], size: f64, rw: f64, color: [f32; 4]) {
+        let k = self.px_per_unit();
+        let r = ((size - rw) * 0.5).max(0.5);
+        let pts: Vec<[f64; 3]> = (0..=RING_SIDES)
+            .map(|i| {
+                let t = 2.0 * PI * i as f64 / RING_SIDES as f64;
+                [p[0] + r * t.cos() / k[0], p[1] + r * t.sin() / k[1], p[2]]
+            })
+            .collect();
+        for w in pts.windows(2) {
+            self.seg_raw(w[0], w[1], rw as f32, color);
+        }
+    }
+
     /// One point marker in the item's style (`pointStyle`, `pointSize`), plus its `showLabel`
     /// label. Open shapes are sized in pixels; in 3D every style is a dot. `p` is in WORLD
     /// coordinates (mapped onto logarithmic axes; a point that cannot be shown there is skipped).
@@ -673,19 +693,7 @@ impl<'a> Builder<'a> {
         let off = |dx: f64, dy: f64| [p[0] + dx / k[0], p[1] + dy / k[1], p[2]];
         match (st.point, self.ext.mode) {
             (PointStyle::Dot, _) | (_, Mode::D3) => self.seg_raw(p, p, size as f32, st.color),
-            (PointStyle::Circle, _) => {
-                let rw = (size * 0.22).max(1.5);
-                let r = ((size - rw) * 0.5).max(0.5);
-                let ring: Vec<[f64; 3]> = (0..=RING_SIDES)
-                    .map(|i| {
-                        let t = 2.0 * PI * i as f64 / RING_SIDES as f64;
-                        off(r * t.cos(), r * t.sin())
-                    })
-                    .collect();
-                for w in ring.windows(2) {
-                    self.seg_raw(w[0], w[1], rw as f32, st.color);
-                }
-            }
+            (PointStyle::Circle, _) => self.ring(p, size, (size * 0.22).max(1.5), st.color),
             (PointStyle::Cross, _) => {
                 let cw = (size * 0.22).max(1.5);
                 let h = ((size - cw) * 0.5).max(0.5);
@@ -1608,17 +1616,21 @@ impl<'a> Builder<'a> {
     fn draw_markers(&mut self, marks: &[Marker], st: Style) {
         let labels = self.ext.labels.take();
         for m in marks {
-            let ms = Style { point: if m.open { PointStyle::Circle } else { PointStyle::Dot }, ..st };
+            // Larger than a plain point and, for the ring, a thicker outline: an endpoint must
+            // read at a glance on a projector.
+            let size = self.point_px(st.point_size * MARKER_SCALE);
+            let p = self.ext.map.fwd3([m.pos[0], m.pos[1], 0.0]);
+            if !p.iter().all(|v| v.is_finite()) {
+                continue;
+            }
             if m.open {
                 // Opaque background-coloured interior (as Desmos does): the axes, grid and the
                 // curve's own end must not show through the ring.
-                let p = self.ext.map.fwd3([m.pos[0], m.pos[1], 0.0]);
-                if p.iter().all(|v| v.is_finite()) {
-                    let size = self.point_px(st.point_size);
-                    self.seg_raw(p, p, size, self.theme.background);
-                }
+                self.seg_raw(p, p, size, self.theme.background);
+                self.ring(p, size as f64, MARKER_RING_W as f64, st.color);
+            } else {
+                self.seg_raw(p, p, size, st.color);
             }
-            self.point([m.pos[0], m.pos[1], 0.0], ms);
         }
         self.ext.labels = labels;
     }

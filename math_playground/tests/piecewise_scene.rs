@@ -14,7 +14,7 @@ fn run(src: &str) -> (Vec<[f64; 2]>, Vec<String>, String) {
         .segments
         .iter()
         .skip(g.backdrop_segments)
-        .filter(|s| s.width > 2.2)
+        .filter(|s| s.width > 2.45)
         .flat_map(|s| [s.p0, s.p1])
         .map(|p| [p[0] as f64 + o[0], p[1] as f64 + o[1]])
         .collect();
