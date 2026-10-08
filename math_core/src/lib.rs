@@ -25,6 +25,7 @@ pub mod print;
 pub mod reg_family;
 pub mod regress;
 pub mod resolve;
+pub mod restrict;
 pub mod slice;
 pub mod special;
 pub mod stats;

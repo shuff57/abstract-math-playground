@@ -163,7 +163,7 @@ fn bad_ranges_are_diagnostics_not_panics() {
     assert!(dg.iter().any(|m| m.contains("empty range")), "{dg:?}");
     let (_, _, dg) = curve_box(&["(t, t) {0<=u<=1}"], &[], Mode::D2);
     assert!(dg.iter().any(|m| m.contains("does not apply")), "{dg:?}");
-    let (_, _, dg) = curve_box(&["y=x^2 {x>0}"], &[], Mode::D2);
+    let (_, _, dg) = curve_box(&["z=x y {x>0}"], &[], Mode::D2); // was y=x^2 {x>0}, now supported (see restrict_scene.rs)
     assert!(dg.iter().any(|m| m.contains("range")), "{dg:?}");
     let (_, _, dg) = curve_box(&["(t, t) {t<=1/0}"], &[], Mode::D2);
     assert!(!dg.is_empty());

@@ -250,8 +250,24 @@ r = theta/3 {0<=theta<=24}                    a spiral over a chosen theta range
 * The bounds are ordinary expressions of constants, `pi`, sliders and definitions. A slider name that does not exist yet is the usual `undefined variable` diagnostic, so the app offers a slider for it. In degree mode the bounds are degrees (`{0<=t<=180}`).
 * A one-sided range moves only that end: `t>=a` runs `[a, 2pi]` (or `[a, a+2pi]` when `a` is already past `2pi`); `t<=b` runs `[0, b]` (or `[b-2pi, b]` when `b` is not above 0). Polar curves use their own default span in the same way.
 * An empty or non-finite range (`{3<=t<=1}`) is a diagnostic and draws nothing.
-* A `{...}` group is only taken as a range when it is last, is not a `^{...}`/`_{...}` script, and contains a comparison. On an item that is not a parametric curve, polar curve or parametric surface (for example `y=x^2 {x>0}`) it is reported (`a {range} applies to ...`); piecewise or restricted explicit curves are not supported.
+* A `{...}` group is only taken as a range when it is last, is not a `^{...}`/`_{...}` script, and contains a comparison. On a parametric curve, polar curve or parametric surface it restricts the parameter; on `y=f(x)`, `x=g(y)`, an implicit equation, an inequality or a bare expression of `x` it restricts the curve itself (see "Restricting x or y" below). On any other item (for example a number, or `z=f(x,y)`) it is reported (`a {range} applies to ...`).
 * Long ranges get more samples (a curve over `k` default turns uses `k` times as many, up to 120,000 points). Closed and open arcs need nothing special.
+
+### Restricting x or y: `y=x^2 {x>0}`
+
+```
+y=x^2 {x>0}                  right half of the parabola
+y=x^2 {-1<x<2}               only between x=-1 and x=2
+x=y^2 {y>=0}                 the upper branch of a sideways parabola
+x^2+y^2=4 {y>0}              the upper half circle
+y<x {x>0}                    the region y<x, but only where x>0
+y=sin(x) {0<=x<=2pi, y>0}    bounds on both axes
+```
+
+* Bounds are on `x` and/or `y` (a range on another name is a diagnostic). Bounds are expressions of constants, `pi`, sliders and definitions. The curve is clipped to the box, so no sample lies outside it; hover, click-to-select and the special points of a selected curve respect the clip too.
+* Endpoints are marked as in Desmos: a strict bound (`<`, `>`) gets an OPEN circle where the curve ends, a non-strict one (`<=`, `>=`, `≤`, `≥`) a FILLED dot. The markers use the item's colour and point size and are drawn with the ordinary point renderer. A curve that crosses a bound (a circle cut at `y>0`) gets a marker at each crossing; a bound at which the function is undefined (`y=1/x {x>0}`) gets none.
+* An inequality fill is cut to the box. The edge of the box itself is not drawn, only the inequality's own boundary curve, clipped.
+* An empty box (`{x>2, x<1}`) is a diagnostic and draws nothing. Restrictions apply in 2D with linear axes; in 3D or on logarithmic axes they are reported and ignored.
 
 ### `x=`, `y=`, `z=` pairs
 

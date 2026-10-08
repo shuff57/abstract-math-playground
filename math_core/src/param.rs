@@ -19,6 +19,10 @@ pub struct Range {
     pub var: String,
     pub lo: Option<Expr>,
     pub hi: Option<Expr>,
+    /// The lower / upper bound was written with a strict `<` or `>` (the boundary point is
+    /// excluded). Parametric ranges ignore this; [`crate::restrict`] draws an open endpoint.
+    pub lo_strict: bool,
+    pub hi_strict: bool,
 }
 
 /// Names that are taken as the range variable of a comparison when both sides are names.
@@ -225,14 +229,17 @@ pub fn ranges_of(clauses: &[Expr]) -> Result<Vec<Range>, String> {
             let idx = match out.iter().position(|x| x.var == name) {
                 Some(i) => i,
                 None => {
-                    out.push(Range { var: name, lo: None, hi: None });
+                    out.push(Range { var: name, lo: None, hi: None, lo_strict: false, hi_strict: false });
                     out.len() - 1
                 }
             };
+            let strict = matches!(rel, Rel::Lt | Rel::Gt);
             if var_is_small {
                 out[idx].hi = Some(bound);
+                out[idx].hi_strict = strict;
             } else {
                 out[idx].lo = Some(bound);
+                out[idx].lo_strict = strict;
             }
         }
     }

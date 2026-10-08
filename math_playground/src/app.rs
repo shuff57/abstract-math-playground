@@ -1795,15 +1795,24 @@ impl App {
                         let mut f = |x: f64| c.prog.eval(&[x]);
                         let mut g1 = c.d1.as_ref().map(|p| move |x: f64| p.eval(&[x]));
                         let mut g2 = c.d2.as_ref().map(|p| move |x: f64| p.eval(&[x]));
-                        let found = analyze(
-                            &mut f,
-                            g1.as_mut().map(|g| g as &mut dyn FnMut(f64) -> f64),
-                            g2.as_mut().map(|g| g as &mut dyn FnMut(f64) -> f64),
-                            w.min[0],
-                            w.max[0],
-                        );
+                        // A {x..}/{y..} range clips the curve: look only inside it.
+                        let span = match &c.restrict {
+                            Some(r) => r.x_interval(w.min[0], w.max[0]),
+                            None => Some((w.min[0], w.max[0])),
+                        };
+                        let found = match span {
+                            Some((a, b)) => analyze(
+                                &mut f,
+                                g1.as_mut().map(|g| g as &mut dyn FnMut(f64) -> f64),
+                                g2.as_mut().map(|g| g as &mut dyn FnMut(f64) -> f64),
+                                a,
+                                b,
+                            ),
+                            None => Vec::new(),
+                        };
                         points = found
                             .iter()
+                            .filter(|s| c.restrict.as_ref().is_none_or(|r| r.contains(s.x, s.y)))
                             .map(|s| {
                                 let (px, py) = self.rig.world_to_pixel(m.fwd3([s.x, s.y, 0.0]), vp);
                                 AnalysisPoint { kind: s.kind.name(), x: s.x, y: s.y, px, py }
@@ -1840,7 +1849,7 @@ impl App {
             for k in -(HOVER_PX as i32)..=(HOVER_PX as i32) {
                 let wx = m.inv3(self.rig.pixel_to_world((x + k as f64, y), vp))[0];
                 let wy = c.prog.eval(&[wx]);
-                if !wy.is_finite() {
+                if !wy.is_finite() || c.restrict.as_ref().is_some_and(|r| !r.contains(wx, wy)) {
                     continue;
                 }
                 let (px, py) = self.rig.world_to_pixel(m.fwd3([wx, wy, 0.0]), vp);
@@ -3709,6 +3718,28 @@ mod tests {
         let ev = pick_at(&mut a, 10.0, 10.0);
         let an = analysis(&ev).expect("cleared");
         assert!(an["item"].is_null() && an["points"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hover_pick_and_analysis_respect_a_range_restriction() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setMode","mode":"2d"}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=x^2-4 {x>0}"}"#);
+        // the clipped-off left branch cannot be hovered ...
+        let (lx, ly) = a.rig.world_to_pixel([-3.0, 5.0, 0.0], (800.0, 600.0));
+        let ev = hover_at(&mut a, lx, ly);
+        assert!(hover_event(&ev).is_none_or(|h| h["item"].is_null()), "{ev:?}");
+        // ... the kept one can
+        let (rx, ry) = a.rig.world_to_pixel([3.0, 5.0, 0.0], (800.0, 600.0));
+        let ev = hover_at(&mut a, rx, ry);
+        assert_eq!(hover_event(&ev).expect("hover")["item"], "a");
+        // analysis lists the root at x=2 only, not the one at -2 or the vertex at x=0
+        let ev = pick_at(&mut a, rx, ry);
+        let an = analysis(&ev).expect("an analysis event");
+        let roots = kinds(an, "root");
+        assert_eq!(roots.len(), 1, "{an}");
+        assert!((roots[0].0 - 2.0).abs() < 1e-6);
+        assert!(kinds(an, "minimum").is_empty(), "{an}");
     }
 
     fn ptr_at(a: &mut App, phase: &str, x: f64, y: f64) -> Vec<serde_json::Value> {

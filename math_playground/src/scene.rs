@@ -38,6 +38,7 @@ use math_core::mesh;
 use math_core::mesh_param;
 use math_core::parse::{parse_with, ParseCtx};
 use math_core::resolve::Defs;
+use math_core::restrict::{margin_expr, restrict_margin, Marker, Restrict};
 use math_core::slice::ResolvedSlice;
 use math_core::special::find_roots;
 use math_core::stats;
@@ -1366,7 +1367,7 @@ impl<'a> Builder<'a> {
         (min_cell, depth)
     }
 
-    fn contour(&mut self, f: &Expr, st: Style) -> Result<(), String> {
+    fn contour(&mut self, f: &Expr, st: Style, restrict: Option<&Restrict>) -> Result<(), String> {
         // `f` is in world coordinates; on logarithmic axes its zero set is traced in display ones.
         let f = &self.ext.map.display_expr(f);
         let p = self.prog(f, &["x", "y"])?;
@@ -1380,12 +1381,18 @@ impl<'a> Builder<'a> {
             depth,
             400_000,
         );
+        let (segs, marks) = match restrict {
+            Some(r) => r.clip_segments(&segs),
+            None => (segs, Vec::new()),
+        };
         if st.dash.is_some() {
             // Dashes need the pieces joined into curves so the pattern runs along them.
             let lines = chain_segments(&segs, min_cell * 1e-3);
             self.add_lines2(&lines, st);
+            self.draw_markers(&marks, st);
             return Ok(());
         }
+        self.draw_markers(&marks, st);
         for s in segs {
             self.seg(
                 [s[0][0], s[0][1], 0.0],
@@ -1559,7 +1566,7 @@ impl<'a> Builder<'a> {
     }
 
     /// The curve `y = rhs(x)` over the window.
-    fn explicit_y_2d(&mut self, rhs: &Expr, defs: &Defs, st: Style) -> Result<(), String> {
+    fn explicit_y_2d(&mut self, rhs: &Expr, defs: &Defs, st: Style, restrict: Option<&Restrict>) -> Result<(), String> {
         let w = self.win;
         let resolved = defs.resolve(rhs).map_err(|e| e.to_string())?;
         // A constant that is not a number (`y = 1/0`) has nothing to draw: say so.
@@ -1574,22 +1581,44 @@ impl<'a> Builder<'a> {
             m.display_of(1, m.display_expr(&resolved))
         };
         let p = self.prog(&resolved, &["x"])?;
-        let lines = mesh::sample_explicit(
-            &p,
-            w.min[0],
-            w.max[0],
-            self.vw.max(1.0) as usize,
-            (w.min[1], w.max[1]),
-        );
+        let (lines, marks) = match restrict {
+            Some(r) => r.sample_explicit(&p, w.min[0], w.max[0], self.vw.max(1.0) as usize, (w.min[1], w.max[1])),
+            None => (
+                mesh::sample_explicit(&p, w.min[0], w.max[0], self.vw.max(1.0) as usize, (w.min[1], w.max[1])),
+                Vec::new(),
+            ),
+        };
         self.add_lines2(&lines, st);
+        self.draw_markers(&marks, st);
         Ok(())
     }
 
+    /// The `{x>0}`-style box of an explicit or implicit item (see `math_core::restrict`), or
+    /// `None` when it has none or its kind does not take one.
+    fn restriction(&self, pr: &Prepared, defs: &Defs) -> Result<Option<Restrict>, String> {
+        if pr.domain.is_empty() || !restrictable(pr) {
+            return Ok(None);
+        }
+        Restrict::from_ranges(&pr.domain, &|e| eval_bound(e, defs, self.angle)).map(Some)
+    }
+
+    /// Endpoint markers of a restricted curve: an OPEN circle at a strict bound, a FILLED dot at
+    /// a non-strict one, in the item's colour and point size (and without a point label).
+    fn draw_markers(&mut self, marks: &[Marker], st: Style) {
+        let labels = self.ext.labels.take();
+        for m in marks {
+            let ms = Style { point: if m.open { PointStyle::Circle } else { PointStyle::Dot }, ..st };
+            self.point([m.pos[0], m.pos[1], 0.0], ms);
+        }
+        self.ext.labels = labels;
+    }
+
     fn draw_2d(&mut self, pr: &Prepared, defs: &Defs, st: Style) -> Result<(), String> {
+        let rs = self.restriction(pr, defs)?;
         match &pr.kind {
             // A bare expression of x alone (`x^2`, `d/dx x^2`, `sin(x)`) is the curve y = expr.
             Kind::Field { expr } if pr.dims[0] && !pr.dims[1] && !pr.dims[2] => {
-                self.explicit_y_2d(expr, defs, st)
+                self.explicit_y_2d(expr, defs, st, rs.as_ref())
             }
             Kind::Field { expr } => self.field(expr, defs, FieldKind::Hue, st.color),
             Kind::VectorField { components } => {
@@ -1600,17 +1629,23 @@ impl<'a> Builder<'a> {
                 }
             }
             _ if pr.dims[2] => Ok(()),
-            Kind::ExplicitY { rhs } => self.explicit_y_2d(rhs, defs, st),
+            Kind::ExplicitY { rhs } => self.explicit_y_2d(rhs, defs, st, rs.as_ref()),
             Kind::ExplicitX { rhs } => {
                 let r = defs.resolve(rhs).map_err(|e| e.to_string())?;
-                self.contour(&Expr::bin(BinOp::Sub, Expr::var("x"), r), st)
+                self.contour(&Expr::bin(BinOp::Sub, Expr::var("x"), r), st, rs.as_ref())
             }
             Kind::Implicit { f } => {
                 let r = defs.resolve(f).map_err(|e| e.to_string())?;
-                self.contour(&r, st)
+                self.contour(&r, st, rs.as_ref())
             }
             Kind::Inequality { rel, f } => {
-                self.inequality_field(*rel, f, defs, st)?;
+                // The fill is cut to the {x..}/{y..} box through its margin; the boundary curve
+                // is clipped like any other, so the box edges themselves are not drawn.
+                let fill_f = match (&rs, margin_expr(&pr.domain)) {
+                    (Some(_), Some(m)) => restrict_margin(f.clone(), matches!(rel, Rel::Gt | Rel::Ge), m),
+                    _ => f.clone(),
+                };
+                self.inequality_field(*rel, &fill_f, defs, st)?;
                 let r = defs.resolve(f).map_err(|e| e.to_string())?;
                 // A strict boundary (`<`, `>`) is not part of the region: draw it dashed unless
                 // the item picked a line style itself.
@@ -1622,7 +1657,7 @@ impl<'a> Builder<'a> {
                     };
                     bst.dash = Style::for_item(&dashed, st.color).dash;
                 }
-                self.contour(&r, bst)
+                self.contour(&r, bst, rs.as_ref())
             }
             Kind::Polar { rhs } => {
                 let r = defs.resolve(rhs).map_err(|e| e.to_string())?;
@@ -1681,7 +1716,7 @@ impl<'a> Builder<'a> {
         let Some(curve) = fit.curve_expr("x") else {
             return Ok(()); // several data lists: no single curve to draw
         };
-        self.explicit_y_2d(&curve, defs, st)?;
+        self.explicit_y_2d(&curve, defs, st, None)?;
         if pr.item.style.residuals {
             let xs = fit.data_vars.first().and_then(|n| {
                 let body = defs.resolve(&Expr::var(n)).ok()?;
@@ -2646,6 +2681,18 @@ fn log_unsupported(pr: &Prepared) -> Option<&'static str> {
         _ => None,
     }
 }
+/// Items whose `{x..}` / `{y..}` range clips the curve: `y=f(x)`, `x=g(y)`, implicit equations,
+/// inequalities and a bare expression of `x`, in 2D (no `z`).
+fn restrictable(pr: &Prepared) -> bool {
+    pr.complex.is_none()
+        && !pr.dims[2]
+        && match &pr.kind {
+            Kind::ExplicitY { .. } | Kind::ExplicitX { .. } | Kind::Implicit { .. } | Kind::Inequality { .. } => true,
+            Kind::Field { .. } => pr.dims[0] && !pr.dims[1],
+            _ => false,
+        }
+}
+
 fn is_drawable_kind(k: ItemKind) -> bool {
     !matches!(k, ItemKind::Folder | ItemKind::Note | ItemKind::Action)
 }
@@ -3008,7 +3055,14 @@ pub fn build_scene_mapped(
                 continue;
             }
         }
-        if !pr.domain.is_empty() && !matches!(pr.kind, Kind::Parametric { .. } | Kind::Polar { .. }) {
+        if !pr.domain.is_empty() && restrictable(pr) && mode != Mode::D2 {
+            diags.push((pr.item.id.clone(), "a {range} on x or y restricts curves in 2D only".into()));
+        } else if !pr.domain.is_empty() && restrictable(pr) && !map.is_linear() {
+            diags.push((pr.item.id.clone(), "a {range} on x or y needs linear axes".into()));
+        } else if !pr.domain.is_empty()
+            && !restrictable(pr)
+            && !matches!(pr.kind, Kind::Parametric { .. } | Kind::Polar { .. })
+        {
             diags.push((
                 pr.item.id.clone(),
                 "a {range} applies to parametric curves, polar curves and parametric surfaces".into(),
@@ -3479,6 +3533,8 @@ pub struct ExplicitCurve {
     /// `f'` and `f''` when they have a symbolic form (otherwise analysis differences `f`).
     pub d1: Option<Program>,
     pub d2: Option<Program>,
+    /// The `{x..}`/`{y..}` box of the item: hover, pick and analysis ignore the curve outside it.
+    pub restrict: Option<Restrict>,
 }
 
 /// The visible `y = f(x)` items of `doc` (an equation `y=...` or a bare expression of `x`), the
@@ -3500,12 +3556,20 @@ pub fn explicit_curves(doc: &Doc) -> Vec<ExplicitCurve> {
         };
         let Ok(resolved) = defs.resolve(rhs) else { continue };
         let Ok(prog) = compile(&resolved, &["x"], angle) else { continue };
+        let restrict = if p.domain.is_empty() {
+            None
+        } else {
+            match Restrict::from_ranges(&p.domain, &|e| eval_bound(e, &defs, angle)) {
+                Ok(r) => Some(r),
+                Err(_) => continue, // reported as a diagnostic by the build; nothing is drawn
+            }
+        };
         let nth = |n: usize| {
             math_core::calculus::nth_deriv_angle(&resolved, "x", n, angle)
                 .ok()
                 .and_then(|e| compile(&e, &["x"], angle).ok())
         };
-        out.push(ExplicitCurve { id: p.item.id.clone(), prog, d1: nth(1), d2: nth(2) });
+        out.push(ExplicitCurve { id: p.item.id.clone(), prog, d1: nth(1), d2: nth(2), restrict });
     }
     out
 }
@@ -3643,6 +3707,8 @@ pub fn drag_curve(doc: &Doc, id: &str) -> Option<DragCurve> {
 pub struct ShapeCurve {
     pub id: String,
     pub kind: ShapeKind,
+    /// The `{x..}`/`{y..}` box of an implicit item (world coordinates; none on logarithmic axes).
+    pub restrict: Option<Restrict>,
 }
 
 pub enum ShapeKind {
@@ -3707,7 +3773,15 @@ pub fn shape_curves(doc: &Doc, map: AxisMap) -> Vec<ShapeCurve> {
             }
         })();
         if let Some(kind) = kind {
-            out.push(ShapeCurve { id: p.item.id.clone(), kind });
+            let restrict = if p.domain.is_empty() || !restrictable(p) {
+                None
+            } else {
+                match Restrict::from_ranges(&p.domain, &|e| eval_bound(e, &defs, angle)) {
+                    Ok(r) if map.is_linear() => Some(r),
+                    _ => continue, // an invalid range draws nothing, so nothing to pick
+                }
+            };
+            out.push(ShapeCurve { id: p.item.id.clone(), kind, restrict });
         }
     }
     out
@@ -3730,10 +3804,12 @@ pub fn shape_lines(c: &ShapeCurve, win: Window3, vp: (f64, f64)) -> Vec<Vec<[f64
             } else {
                 10
             };
-            mesh::contour_2d(p, (w.min[0], w.max[0]), (w.min[1], w.max[1]), min_cell, depth, 100_000)
-                .into_iter()
-                .map(|s| vec![s[0], s[1]])
-                .collect()
+            let segs = mesh::contour_2d(p, (w.min[0], w.max[0]), (w.min[1], w.max[1]), min_cell, depth, 100_000);
+            let segs = match &c.restrict {
+                Some(r) => r.clip_segments(&segs).0,
+                None => segs,
+            };
+            segs.into_iter().map(|s| vec![s[0], s[1]]).collect()
         }
     }
 }
