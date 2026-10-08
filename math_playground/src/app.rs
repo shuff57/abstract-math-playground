@@ -3800,6 +3800,25 @@ mod tests {
     }
 
     #[test]
+    fn intersections_respect_a_range_restriction() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=x^2-4 {x>0}"}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"b","latex":"y=x"}"#);
+        let (px, py) = a.rig.world_to_pixel([3.0, 5.0, 0.0], (800.0, 600.0));
+        let an = analysis(&pick_at(&mut a, px, py)).cloned().expect("selected");
+        assert_eq!(an["item"], "a");
+        // y=x meets y=x^2-4 at (1±sqrt(17))/2; only the x>0 one is on the drawn curve
+        let xs: Vec<f64> = kinds(&an, "intersection").iter().map(|p| p.0).collect();
+        assert_eq!(xs.len(), 1, "{an}");
+        assert!((xs[0] - (1.0 + 17f64.sqrt()) / 2.0).abs() < 1e-6, "{an}");
+        // and from the other side: picking y=x lists the same single point with a
+        let (bx, by) = a.rig.world_to_pixel([-3.0, -3.0, 0.0], (800.0, 600.0));
+        let an = analysis(&pick_at(&mut a, bx, by)).cloned().expect("selected");
+        assert_eq!(an["item"], "b");
+        assert_eq!(kinds(&an, "intersection").len(), 1, "{an}");
+    }
+
+    #[test]
     fn a_picked_implicit_curve_lists_its_intersections() {
         let mut a = app();
         cmd(&mut a, r#"{"t":"setExpr","id":"c","latex":"x^2+y^2=25"}"#);
