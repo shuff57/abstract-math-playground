@@ -101,7 +101,7 @@ Every event has a `t` field.
 
 | `t` | Fields | Meaning |
 | --- | --- | --- |
-| `diagnostics` | `items`: `[{id, message}]` | Per-item problems (parse errors, unsupported constructs). |
+| `diagnostics` | `items`: `[{id, message}]` | Per-item problems (parse errors, unsupported constructs). Examples for the newer forms: `a {range} applies to parametric curves, polar curves and parametric surfaces` (a range on an item that cannot take one, such as `z=f(x,y)`), `a {range} on 'q' does not apply here (an explicit or implicit item is restricted by x or y)`, `empty range: 2 is not below 1`, `a {range} on x or y restricts curves in 2D only` (3D) and `... needs linear axes` (log axes), `a '!=' comparison ... is not a scalar expression` (`x!=3` alone), `in a piecewise {..} only the last value may have no condition`. |
 | `info` | `items`: `[ItemInfo]` | Read-outs: derivative, scalar value, regression fit. The full current list, sent whenever it changes; an empty list clears them. |
 | `colors` | `items`: `[{id, color}]` | Resolved `#rrggbb` colour of each drawn item. Sent only when it changes. |
 | `view` | `mode`, `min` `[x,y,z]`, `max` `[x,y,z]`, `grid`, `axes`, `axisNumbers` | Current mode, window and view flags, plus `weight` (`normal`, `bold` or `extra`). |

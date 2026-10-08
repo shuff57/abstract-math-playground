@@ -119,3 +119,15 @@ VertexParabola -> SimplifiedParabola {
 TODO: I think the two-way sync syntax is confusing because it appears to be completely
 symmetric, but it's not. The second struct is  *initally* updated to match the first.
 (After initialization, the syncing is symmetric in both directions.)
+
+
+# --- Calculator input that is implemented today (see docs/syntax.md for the full rules) ---
+# This file is design notes, but these forms work in the calculator now:
+#   y=x^2 {x>0}                      domain restriction (open endpoint at x=0)
+#   y=x^2 {-1<=x<2}                  filled dot at -1, open circle at 2
+#   x=y^2 {y>=0}                     restriction on y
+#   y={x<0: -x, x}                   piecewise (last value is the default)
+#   y={x<-1: x, x>1: x}              NaN where no branch matches: a gap
+#   y={x!=2: x}                      != is a condition: a hole at x=2
+#   {x%2=0: 1, 0}                    % is mod(a, b)
+#   n!=3  is  n != 3,   n! = 3  is  (n!) = 3

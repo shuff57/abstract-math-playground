@@ -64,6 +64,7 @@ fn rel_text(r: Rel) -> &'static str {
         Rel::Le => "<=",
         Rel::Gt => ">",
         Rel::Ge => ">=",
+        Rel::Ne => "!=",
     }
 }
 
@@ -246,6 +247,7 @@ fn rel_latex(r: Rel) -> &'static str {
         Rel::Le => "\\le ",
         Rel::Gt => ">",
         Rel::Ge => "\\ge ",
+        Rel::Ne => "\\ne ",
     }
 }
 

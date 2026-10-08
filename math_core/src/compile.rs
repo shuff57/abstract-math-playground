@@ -3,7 +3,7 @@
 //! The compiler only ever emits opcodes from a closed set and constants from the AST, so no
 //! user text can reach an evaluator or a generated shader: unknown names are errors, not code.
 
-use crate::ast::{constant_value, BinOp, Expr};
+use crate::ast::{constant_value, BinOp, Expr, Rel};
 use crate::calculus;
 use crate::interval::Interval;
 use std::f64::consts::PI;
@@ -198,7 +198,7 @@ pub enum Op {
     /// variables are this program's followed by the bound variable (the last slot).
     Reduce(ReduceKind, usize),
     /// Pops `b` then `a`, pushes 1 when `a rel b` holds and 0 otherwise (also when either is NaN).
-    Cmp(crate::ast::Rel),
+    Cmp(Rel),
     /// Pops two truth values, pushes 1 when both are true. A truth value is non-zero and not NaN.
     And,
     /// Piecewise: the stack holds `pairs` condition/value pairs (condition first, deepest first)
@@ -397,6 +397,9 @@ fn emit(e: &Expr, vars: &[String], cx: &mut Cx) -> Result<(), CompileError> {
         }
         Expr::Tuple(_) => return Err(CompileError::NotScalar("a point")),
         Expr::List(_) => return Err(CompileError::NotScalar("a list")),
+        Expr::Rel(Rel::Ne, ..) => {
+            return Err(CompileError::NotScalar("a '!=' comparison (use it as a condition inside a piecewise {..})"))
+        }
         Expr::Rel(..) => return Err(CompileError::NotScalar("a relation")),
     }
     Ok(())
@@ -448,22 +451,24 @@ fn truth(c: f64) -> bool {
     c != 0.0 && !c.is_nan()
 }
 
-fn cmp_f64(r: crate::ast::Rel, a: f64, b: f64) -> f64 {
-    use crate::ast::Rel;
+fn cmp_f64(r: Rel, a: f64, b: f64) -> f64 {
+    use Rel;
     let t = match r {
         Rel::Eq => a == b,
         Rel::Lt => a < b,
         Rel::Le => a <= b,
         Rel::Gt => a > b,
         Rel::Ge => a >= b,
+        Rel::Ne => a != b,
     };
-    t as u8 as f64
+    // an undefined operand makes every comparison false, `!=` included
+    (t && !a.is_nan() && !b.is_nan()) as u8 as f64
 }
 
 /// Interval of a comparison: exactly 0 or 1 when the boxes decide it, else [0, 1]. An empty
 /// (undefined) operand makes the comparison false, as in the f64 evaluator.
-fn cmp_i(r: crate::ast::Rel, a: Interval, b: Interval) -> Interval {
-    use crate::ast::Rel;
+fn cmp_i(r: Rel, a: Interval, b: Interval) -> Interval {
+    use Rel;
     if a.is_empty() || b.is_empty() {
         return Interval::point(0.0);
     }
@@ -473,6 +478,7 @@ fn cmp_i(r: crate::ast::Rel, a: Interval, b: Interval) -> Interval {
         Rel::Gt => (a.lo > b.hi, a.hi <= b.lo),
         Rel::Ge => (a.lo >= b.hi, a.hi < b.lo),
         Rel::Eq => (a.lo == a.hi && b.lo == b.hi && a.lo == b.lo, a.hi < b.lo || a.lo > b.hi),
+        Rel::Ne => (a.hi < b.lo || a.lo > b.hi, a.lo == a.hi && b.lo == b.hi && a.lo == b.lo),
     };
     match (yes, no) {
         (true, _) => Interval::point(1.0),

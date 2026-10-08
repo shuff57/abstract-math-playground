@@ -226,6 +226,9 @@ pub fn ranges_of(clauses: &[Expr]) -> Result<Vec<Range>, String> {
             if *rel == Rel::Eq {
                 return Err("a range uses <= or >=, not =".into());
             }
+            if *rel == Rel::Ne {
+                return Err("a range cannot use != (write a piecewise {x!=0: ...} instead)".into());
+            }
             // which side is the parameter
             let var_on_left = match (&**l, &**r) {
                 (Expr::Var(_), Expr::Var(_)) if is_known(l) || !is_known(r) => true,

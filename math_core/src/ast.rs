@@ -19,6 +19,8 @@ pub enum Rel {
     Le,
     Gt,
     Ge,
+    /// `!=` / `≠`. A condition only (piecewise, list masks): not an inequality region.
+    Ne,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,7 +86,7 @@ pub fn piece_parts(e: &Expr) -> Option<(Vec<(&Expr, &Expr)>, Option<&Expr>)> {
 pub fn rel_chain(e: &Expr) -> Option<&[Expr]> {
     match e {
         Expr::Call(n, args)
-            if n == CHAIN_FN && (2..=3).contains(&args.len()) && args.iter().all(|a| matches!(a, Expr::Rel(r, ..) if *r != Rel::Eq)) =>
+            if n == CHAIN_FN && (2..=3).contains(&args.len()) && args.iter().all(|a| matches!(a, Expr::Rel(r, ..) if *r != Rel::Eq && *r != Rel::Ne)) =>
         {
             Some(args)
         }

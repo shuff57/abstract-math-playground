@@ -131,7 +131,7 @@ fn classify(e: &Expr) -> Kind {
                 _ => Kind::Implicit { f: sub(lhs, rhs) },
             }
         }
-        Expr::Rel(rel, lhs, rhs) => Kind::Inequality { rel: *rel, f: sub(lhs, rhs) },
+        Expr::Rel(rel, lhs, rhs) if *rel != Rel::Ne => Kind::Inequality { rel: *rel, f: sub(lhs, rhs) },
         Expr::Call(..) if rel_chain(e).is_some() => {
             let margins = rel_chain(e).unwrap().iter().filter_map(|p| match p {
                 Expr::Rel(Rel::Gt | Rel::Ge, l, r) => Some(sub(r, l)),

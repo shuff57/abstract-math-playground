@@ -165,6 +165,7 @@ fn compare(rel: Rel, a: f64, b: f64) -> bool {
         Rel::Le => a <= b,
         Rel::Gt => a > b,
         Rel::Ge => a >= b,
+        Rel::Ne => a != b,
     }
 }
 

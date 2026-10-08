@@ -25,7 +25,8 @@ A plain list of what does not work yet or has not been checked. Items marked "fr
 - **Integrals, sums and products have no GPU form.** In fields and inequalities they are rasterised on the CPU at coarse resolution (about 50 ms budget). Statistical distribution functions are CPU-only too.
 - **`int` and `sum`/`prod` limits:** no indefinite integrals; `sum` and `prod` give NaN past 1,000,000 terms; a list holds at most 10,000 elements.
 - **Lists are flat.** Lists cannot contain lists (so no matrices as nested lists).
-- **No `!=` or `≠`**, and no `%` operator (`mod(a, b)` exists).
+- **`!=` / `≠` are conditions only** (piecewise `{x!=2: ...}`, list masks); there is no `!=` region or curve. `n!=3` is the relation, not a factorial (write `n! = 3`). `%` is `mod(a, b)`, not a percent sign.
+- **Piecewise `{c: v, ...}` has no GPU form.** Fills and fields that contain one use the CPU raster; a jump between branches is joined by a near-vertical line when it is smaller than the view height.
 - **Multi-letter names parse as products** (`ab` is `a*b`), and a name that starts with a built-in function name is read as that function. Use subscripts for names. This is a parser design choice, not a bug, but it differs from some other calculators.
 - **Symbolic differentiation has gaps.** A term that cannot be differentiated becomes NaN or an error ("cannot differentiate ..."). Which functions are covered is defined in `calculus.rs`; this has not been listed here.
 - **Regression** supports one dependent list and the fit methods described in `regress.rs` (linear least squares, Levenberg-Marquardt). Other fit types, weights, and residual plots beyond ticks are not built.
@@ -40,6 +41,7 @@ A plain list of what does not work yet or has not been checked. Items marked "fr
 
 ## Parametric forms
 
+- **Restriction `{x>0}` is 2D, linear axes only**, and the box edge is not drawn on inequality fills. Its endpoint markers are rings and dots drawn with the point renderer: an open circle does not hide the curve end inside it.
 - **Slices ignore parametric ranges.** The slice overlay (`slice_draw.rs`) finds where a parametric or polar curve crosses the slice plane over the default parameter span, not over a `{a<=t<=b}` range, and parametric surfaces are not cut by a slice plane at all.
 - **Parametric surface sampling is a uniform grid.** The resolution is chosen from the surface size in the window (96 to 640 cells per direction, about 180,000 vertices at most) but is not adaptive per region, so a very fast-varying surface can still alias, and an asymptote is only caught by the long-edge guard.
 - **A full `[0, 2pi]` range may cover a surface twice** (the sphere formula does), which draws two coincident sheets with opposite normals; write the range to cover it once.

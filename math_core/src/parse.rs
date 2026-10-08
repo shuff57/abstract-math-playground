@@ -323,7 +323,8 @@ fn is_piece_group(inner: &str) -> bool {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
             ':' if depth <= 0 => return true,
-            '<' | '>' | '\u{2264}' | '\u{2265}' if depth <= 0 => return true,
+            '<' | '>' | '=' | '\u{2264}' | '\u{2265}' | '\u{2260}' if depth <= 0 => return true,
+            '!' if depth <= 0 && chars.get(i + 1) == Some(&'=') => return true,
             '\\' => {
                 let start = i + 1;
                 let mut j = start;
@@ -343,7 +344,7 @@ fn is_piece_group(inner: &str) -> bool {
                 match name.as_str() {
                     "lbrace" => depth += 1,
                     "rbrace" => depth -= 1,
-                    "le" | "leq" | "leqslant" | "ge" | "geq" | "geqslant" | "lt" | "gt" if depth <= 0 => return true,
+                    "le" | "leq" | "leqslant" | "ge" | "geq" | "geqslant" | "lt" | "gt" | "ne" | "neq" if depth <= 0 => return true,
                     _ => {}
                 }
                 i = j;
@@ -402,6 +403,8 @@ fn transform(chars: &[char], i: &mut usize, _nested: bool) -> Result<String, Par
                             '}' => out.push(')'),
                             // Thin/medium spaces separate tokens (`x^2\,dx`).
                             ',' | ';' | ':' | ' ' | '!' => out.push(' '),
+                            // `\%` is MathLive's typed percent sign: the modulo operator
+                            '%' => out.push('%'),
                             _ => {}
                         }
                     }
@@ -445,9 +448,7 @@ fn transform(chars: &[char], i: &mut usize, _nested: bool) -> Result<String, Par
                         out.push(glyph);
                         out.push_str(&format!("({})({}) ", sub_normalize(&lo)?, sub_normalize(&hi)?));
                     }
-                    "ne" | "neq" => {
-                        return Err(ParseError::new(*i, "'\u{2260}' (not equal) is not supported; use <, <=, > or >="))
-                    }
+                    "ne" | "neq" => out.push_str(" != "),
                     // MathLive writes a typed `[` and `]` as these (lists: `[(1,2),(3,4)]`).
                     "lbrack" => out.push('['),
                     "rbrack" => out.push(']'),
@@ -581,6 +582,9 @@ enum Tok {
     Le,
     Gt,
     Ge,
+    /// `!=` (the `!` directly followed by `=`) or `≠`.
+    Ne,
+    Percent,
     Tilde,
     Prime,
     Bang,
@@ -781,6 +785,19 @@ fn lex(s: &str) -> Result<Vec<Token>, ParseError> {
                 push(&mut out, Tok::Tilde, pos);
                 i += 1;
             }
+            // `!` directly followed by `=` is the relation; `n! = 3` (a space) stays a factorial.
+            '!' if chars.get(i + 1).map(|c| c.1) == Some('=') => {
+                push(&mut out, Tok::Ne, pos);
+                i += 2;
+            }
+            '\u{2260}' => {
+                push(&mut out, Tok::Ne, pos);
+                i += 1;
+            }
+            '%' => {
+                push(&mut out, Tok::Percent, pos);
+                i += 1;
+            }
             '!' => {
                 push(&mut out, Tok::Bang, pos);
                 i += 1;
@@ -885,6 +902,7 @@ fn is_rel(t: &Tok) -> Option<Rel> {
         Tok::Le => Some(Rel::Le),
         Tok::Gt => Some(Rel::Gt),
         Tok::Ge => Some(Rel::Ge),
+        Tok::Ne => Some(Rel::Ne),
         _ => None,
     }
 }
@@ -952,6 +970,15 @@ impl<'a> Parser<'a> {
                     let op = if t == Tok::Star { BinOp::Mul } else { BinOp::Div };
                     lhs = Expr::bin(op, lhs, rhs);
                 }
+                // `a % b` is `mod(a, b)`, at the level of `*` and `/` (left associative)
+                Tok::Percent => {
+                    if 30 < min_bp {
+                        break;
+                    }
+                    self.bump();
+                    let rhs = self.expr(31)?;
+                    lhs = Expr::call("mod", vec![lhs, rhs]);
+                }
                 Tok::Caret => {
                     if 40 < min_bp {
                         break;
@@ -1011,10 +1038,10 @@ impl<'a> Parser<'a> {
             self.bump();
             operands.push(self.expr(11)?);
         }
-        if rels.contains(&Rel::Eq) {
+        if rels.contains(&Rel::Eq) || rels.contains(&Rel::Ne) {
             return Err(ParseError::new(
                 self.peek().pos,
-                "'=' cannot be part of a chained comparison; chain only <, <=, > and >=",
+                "'=' and '!=' cannot be part of a chained comparison; chain only <, <=, > and >=",
             ));
         }
         let parts = rels
@@ -1637,8 +1664,10 @@ mod tests {
         assert_eq!(p("x^n/n!"), Expr::bin(Div, Expr::bin(Pow, v("x"), v("n")), f(v("n"))));
         assert_eq!(p("|x|!"), f(Expr::call("abs", vec![v("x")])));
         assert_eq!(p("sum(x^n/n!,n,0,6)").called_functions().len(), 2);
-        // there is no `!=`: `x!=3` is (x!) = 3
-        assert_eq!(p("x!=3"), Expr::Rel(Rel::Eq, Box::new(f(v("x"))), Box::new(n(3.0))));
+        // `!` directly followed by `=` is the relation `!=`; with a space it is a factorial
+        assert_eq!(p("x!=3"), Expr::Rel(Rel::Ne, Box::new(v("x")), Box::new(n(3.0))));
+        assert_eq!(p("x! = 3"), Expr::Rel(Rel::Eq, Box::new(f(v("x"))), Box::new(n(3.0))));
+        assert_eq!(p("(x!)=3"), Expr::Rel(Rel::Eq, Box::new(f(v("x"))), Box::new(n(3.0))));
         assert!(parse("!x").is_err());
         assert_eq!(p("nCr(5,2)"), Expr::call("nCr", vec![n(5.0), n(2.0)]));
         assert_eq!(p("nPr(n,k)"), Expr::call("nPr", vec![v("n"), v("k")]));
@@ -1797,7 +1826,7 @@ mod tests {
         assert_eq!(p(r"y\ge x"), p("y>=x"));
         assert_eq!(p(r"y\geq x"), p("y>=x"));
         assert_eq!(p(r"y\le x"), p("y<=x"));
-        let e = parse(r"x\ne 2").unwrap_err();
-        assert!(e.msg.contains("not supported"), "{e}");
+        // `\ne` used to be rejected; it is the relation `!=` now
+        assert_eq!(p(r"x\ne 2"), p("x!=2"));
     }
 }

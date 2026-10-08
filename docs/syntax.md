@@ -13,12 +13,19 @@ If a rule here disagrees with the code, the code is right. Please fix this file.
 | `x y`, `2x`, `(x+1)(x-1)` | implicit multiplication |
 | `n!` | factorial, binds tighter than `*`, `/`, `^` and unary minus: `2^3!` is `2^(3!)`, `-n!` is `-(n!)` |
 | `\|x\|` | absolute value (can nest: `\|\|x\|-1\|`) |
-| `= < <= > >=` | relations. `≤`, `≥` also accepted |
+| `= < <= > >= !=` | relations. `≤`, `≥`, `≠` also accepted. `!=` is only a condition (see "Not equal" below), not a region |
+| `a % b` | modulo, exactly `mod(a, b)`: the result has the sign of `b` (`-7 % 3` is 2). `\%` from MathLive works |
 | `~` | regression (see below) |
 
-Precedence, loosest to tightest: relations, `+ -`, `* /` and implicit multiplication, prefix minus, function argument without parentheses, `^`. There is no `!=`: `x!=3` parses as `(x!) = 3`. `≠` is rejected with an error. Parentheses nest to a depth of 128; deeper input is an error, not a crash.
+Precedence, loosest to tightest: relations (including `!=`), `+ -`, `* / %` and implicit multiplication, prefix minus, function argument without parentheses, `^`. `%` is left associative at the level of `*` and `/`: `2*7%4` is `(2*7)%4` and `-7%3` is `(-7)%3`. Parentheses nest to a depth of 128; deeper input is an error, not a crash.
 
 Numbers: `3`, `.5`, `1.5`, `1e3`. The exponent form needs digits right after the `e`, so `2e` is `2*e`.
+
+### Not equal: `!=`
+
+`!` immediately followed by `=` (no space) is the relation not-equal, so `n!=3` means `n != 3`, `5!=120` is true, and `x≠3` / `x\ne 3` are the same. A factorial that is then compared needs a space or brackets: `n! = 120`, `(n!)=120` or `factorial(n)=120`. `n!` on its own, `(n+1)!`, `3!!` and `2^3!` are unchanged.
+
+`!=` is a condition, not a region or a curve. It works in piecewise conditions (`y={x!=2: x}` leaves a hole at x=2, `{x%2=0: 1, 0}` is a parity test) and in list masks (`L[L!=3]`). As an item on its own (`x!=3`) it reports "a '!=' comparison ... use it as a condition inside a piecewise", it cannot be chained (`1<x!=3`) and a `{...}` restriction range cannot use it (a hole is `y=x {x!=0}`, which reads as a piecewise condition because it is not a range). A comparison with an undefined operand (`sqrt(-4)!=1`) is false.
 
 ## Functions
 
@@ -361,7 +368,7 @@ Items of kind `note` and `folder` carry text and grouping only; they are not par
 ## Known limits
 
 - Multi-letter names are products (see above); use subscripts for named variables.
-- No `!=`, no `≠`, no indefinite integrals, no nested lists, no `mod` operator symbol (use `mod(a, b)`).
+- No indefinite integrals and no nested lists. `!=` is a condition only (not a region), `%` is modulo.
 - Input length is capped at 2000 characters per item; a document holds at most 500 items and 200 sliders, and the JSON is limited to 100,000 bytes.
 - Fields use `x` and `y` only; `z` is not supported in a field expression.
 - `int`/`sum`/`prod` in fields are drawn by a coarse CPU raster, and are not available in complex items.
