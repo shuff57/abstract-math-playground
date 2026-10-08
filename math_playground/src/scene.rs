@@ -38,7 +38,7 @@ use math_core::mesh;
 use math_core::mesh_param;
 use math_core::parse::{parse_with, ParseCtx};
 use math_core::resolve::Defs;
-use math_core::restrict::{margin_expr, restrict_margin, Marker, Restrict};
+use math_core::restrict::{margin_expr, piecewise_markers, restrict_margin, Marker, Restrict};
 use math_core::slice::ResolvedSlice;
 use math_core::special::find_roots;
 use math_core::stats;
@@ -1597,6 +1597,16 @@ impl<'a> Builder<'a> {
                 Vec::new(),
             ),
         };
+        let mut marks = marks;
+        // Only curves with a piecewise node get breakpoint markers (sqrt, ln, tan do not).
+        if m.is_linear() && resolved.called_functions().contains(math_core::ast::PIECE_FN) {
+            let found = piecewise_markers(&p, w.min[0], w.max[0], (w.min[1], w.max[1]), self.vw.max(1.0) as usize);
+            for mk in found {
+                if restrict.map_or(true, |r| r.contains(mk.pos[0], mk.pos[1])) && !marks.iter().any(|o| o.pos == mk.pos && o.open == mk.open) {
+                    marks.push(mk);
+                }
+            }
+        }
         self.add_lines2(&lines, st);
         self.draw_markers(&marks, st);
         Ok(())

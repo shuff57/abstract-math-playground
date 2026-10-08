@@ -266,6 +266,95 @@ impl Restrict {
     }
 }
 
+/// A number with at most six decimals: the boundary a user typed (`-1`, `0.5`), as opposed to
+/// the double next to it that bisection also lands on.
+fn typed_number(c: f64) -> bool {
+    c.is_finite() && c == (c * 1e6).round() / 1e6
+}
+
+/// Breakpoint markers of a piecewise explicit curve `y = f(x)` over `[x0, x1]` (call it only for
+/// expressions that contain a piecewise node). Where the curve goes from defined to undefined,
+/// or jumps between two finite values, the edge is found by bisection and marked at the
+/// one-sided limit: OPEN when the function value at the edge is not that limit (a strict
+/// condition), FILLED when it is (a non-strict one). Edges with an infinite limit or outside the
+/// window get none. `samples` is the number of probe intervals.
+pub fn piecewise_markers(f: &Program, x0: f64, x1: f64, y_range: (f64, f64), samples: usize) -> Vec<Marker> {
+    let mut out = Vec::new();
+    if !(x0.is_finite() && x1.is_finite() && x1 > x0) {
+        return out;
+    }
+    let (ylo, yhi) = (y_range.0.min(y_range.1), y_range.0.max(y_range.1));
+    let n = samples.clamp(16, 8192);
+    let dx = (x1 - x0) / n as f64;
+    let span = (yhi - ylo).max(1e-9);
+    let ev = |x: f64| f.eval(&[x]);
+    let mut xa = x0;
+    let mut ya = ev(xa);
+    let put = |out: &mut Vec<Marker>, x: f64, y: f64, open: bool| {
+        if y.is_finite() && x >= x0 && x <= x1 && y >= ylo && y <= yhi {
+            push_marker(out, Marker { pos: [x, y], open });
+        }
+    };
+    for i in 1..=n {
+        let xb = if i == n { x1 } else { x0 + dx * i as f64 };
+        let yb = ev(xb);
+        match (ya.is_finite(), yb.is_finite()) {
+            (true, false) | (false, true) => {
+                // d: the defined end, u: the undefined end
+                let (mut d, mut u) = if ya.is_finite() { (xa, xb) } else { (xb, xa) };
+                for _ in 0..1200 {
+                    let m = 0.5 * (d + u);
+                    if m == d || m == u {
+                        break;
+                    }
+                    if ev(m).is_finite() {
+                        d = m;
+                    } else {
+                        u = m;
+                    }
+                }
+                let b = if typed_number(u) { u } else if typed_number(d) { d } else { u };
+                put(&mut out, b, ev(d), b != d);
+            }
+            (true, true) if (yb - ya).abs() > 0.02 * span => {
+                let (mut lo, mut hi, mut ylo_, mut yhi_) = (xa, xb, ya, yb);
+                for _ in 0..1200 {
+                    let m = 0.5 * (lo + hi);
+                    if m == lo || m == hi {
+                        break;
+                    }
+                    let ym = ev(m);
+                    if !ym.is_finite() {
+                        break;
+                    }
+                    if (ym - ylo_).abs() >= (yhi_ - ym).abs() {
+                        hi = m;
+                        yhi_ = ym;
+                    } else {
+                        lo = m;
+                        ylo_ = ym;
+                    }
+                }
+                let big = ylo_.abs().max(yhi_.abs());
+                if (yhi_ - ylo_).abs() > 1e-6 * (1.0 + big) && big < 1e6 {
+                    // the typed number is where the edge belongs: its value is the filled dot
+                    if typed_number(lo) && !typed_number(hi) {
+                        put(&mut out, lo, ylo_, false);
+                        put(&mut out, lo, yhi_, true);
+                    } else {
+                        put(&mut out, hi, yhi_, false);
+                        put(&mut out, hi, ylo_, true);
+                    }
+                }
+            }
+            _ => {}
+        }
+        xa = xb;
+        ya = yb;
+    }
+    out
+}
+
 fn push_marker(marks: &mut Vec<Marker>, m: Marker) {
     if marks.len() >= MAX_MARKERS || !m.pos.iter().all(|v| v.is_finite()) {
         return;
@@ -465,5 +554,32 @@ mod tests {
         // `>` regions are where the margin is positive: outside the box it must not be
         assert!(gt.eval(&[1.0, 5.0]) > 0.0 && gt.eval(&[-1.0, 5.0]) <= 0.0);
         assert!(margin_expr(&[]).is_none());
+    }
+
+    fn pw(src: &str) -> Vec<Marker> {
+        let p = compile(&parse(src).unwrap(), &["x"], Angle::Rad).unwrap();
+        piecewise_markers(&p, -10.0, 10.0, (-8.0, 8.0), 800)
+    }
+
+    #[test]
+    fn piecewise_gap_edges_get_open_or_filled_markers() {
+        let m = pw("{x<-1:-x, x>1:x}");
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(m.iter().all(|k| k.open));
+        assert!(m.iter().any(|k| (k.pos[0] + 1.0).abs() < 1e-9 && (k.pos[1] - 1.0).abs() < 1e-6));
+        assert!(m.iter().any(|k| (k.pos[0] - 1.0).abs() < 1e-9 && (k.pos[1] - 1.0).abs() < 1e-6));
+        let m = pw("{x<=-1:-x, x>=1:x}");
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(m.iter().all(|k| !k.open));
+    }
+
+    #[test]
+    fn piecewise_jump_has_an_open_and_a_filled_marker() {
+        let m = pw("{x<0:x^2, x^2+1}");
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(m.iter().any(|k| k.open && k.pos[0].abs() < 1e-9 && k.pos[1].abs() < 1e-6));
+        assert!(m.iter().any(|k| !k.open && k.pos[0].abs() < 1e-9 && (k.pos[1] - 1.0).abs() < 1e-9));
+        // continuous join: nothing
+        assert!(pw("{x<0:-x, x}").is_empty());
     }
 }

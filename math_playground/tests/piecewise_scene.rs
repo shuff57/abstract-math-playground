@@ -55,3 +55,59 @@ fn bad_piecewise_reports_a_diagnostic() {
     let (_, dg, _) = run("y={x<0: 1, 2, 3}");
     assert!(!dg.is_empty());
 }
+
+/// (open interiors, filled dots) of the endpoint markers, in absolute coordinates.
+fn markers(src: &str) -> (Vec<[f64; 2]>, Vec<[f64; 2]>) {
+    let d = make_doc(&[src], &[]);
+    let (g, o) = build(&d, Mode::D2, win());
+    let bg = math_playground_lib::geometry::Theme::light().background;
+    let abs = |p: [f32; 3]| [p[0] as f64 + o[0], p[1] as f64 + o[1]];
+    let (mut open, mut filled) = (Vec::new(), Vec::new());
+    for s in g.segments.iter().skip(g.backdrop_segments).filter(|s| s.p0 == s.p1 && s.width > 8.0) {
+        if s.color == bg {
+            open.push(abs(s.p0));
+        } else {
+            filled.push(abs(s.p0));
+        }
+    }
+    (open, filled)
+}
+
+fn has(v: &[[f64; 2]], p: [f64; 2]) -> bool {
+    v.iter().any(|q| (q[0] - p[0]).abs() < 0.05 && (q[1] - p[1]).abs() < 0.05)
+}
+
+#[test]
+fn strict_piecewise_ends_get_open_markers() {
+    let (open, filled) = markers("y={x<-1:-x, x>1:x}");
+    assert_eq!(open.len(), 2, "{open:?}");
+    assert!(filled.is_empty());
+    assert!(has(&open, [-1.0, 1.0]) && has(&open, [1.0, 1.0]));
+}
+
+#[test]
+fn non_strict_piecewise_ends_get_filled_markers() {
+    let (open, filled) = markers("y={x<=-1:-x, x>=1:x}");
+    assert!(open.is_empty(), "{open:?}");
+    assert_eq!(filled.len(), 2, "{filled:?}");
+    assert!(has(&filled, [-1.0, 1.0]) && has(&filled, [1.0, 1.0]));
+}
+
+#[test]
+fn piecewise_jump_is_open_at_one_branch_and_filled_at_the_other() {
+    let (open, filled) = markers("y={x<0:x^2, x^2+1}");
+    assert!(has(&open, [0.0, 0.0]), "{open:?}");
+    assert!(has(&filled, [0.0, 1.0]), "{filled:?}");
+    assert_eq!((open.len(), filled.len()), (1, 1));
+    // a continuous join has no marker
+    let (open, filled) = markers("y={x<0:-x, x}");
+    assert!(open.is_empty() && filled.is_empty());
+}
+
+#[test]
+fn non_piecewise_functions_gain_no_markers() {
+    for src in ["y=sqrt(x)", "y=ln(x)", "y=1/x", "y=tan(x)"] {
+        let (open, filled) = markers(src);
+        assert!(open.is_empty() && filled.is_empty(), "{src}: {open:?} {filled:?}");
+    }
+}
