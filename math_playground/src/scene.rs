@@ -1645,6 +1645,74 @@ impl<'a> Builder<'a> {
         self.ext.labels = labels;
     }
 
+    /// The edges where a restriction box cuts an inequality fill (`f < 0`, or `f > 0` when
+    /// `greater`): each bound's line is drawn only where the fill reaches it, in the style
+    /// `style_for(strict)` gives (dashed for a strict bound, solid for a non-strict one).
+    fn clip_edges(
+        &mut self,
+        f: &Expr,
+        greater: bool,
+        rs: &Restrict,
+        style_for: &dyn Fn(bool) -> Style,
+    ) -> Result<(), String> {
+        if !self.ext.map.is_linear() {
+            return Ok(());
+        }
+        let p = self.prog(f, &["x", "y"])?;
+        let w = self.win;
+        let (vw, vh) = self.px();
+        for a in 0..2usize {
+            let o = 1 - a;
+            let n = (if o == 0 { vw } else { vh }).ceil().clamp(64.0, 4000.0) as usize;
+            for upper in [false, true] {
+                let Some(b) = (if upper { rs.hi[a] } else { rs.lo[a] }) else { continue };
+                if b.value < w.min[a] || b.value > w.max[a] {
+                    continue;
+                }
+                let at = |t: f64| if a == 0 { [b.value, t] } else { [t, b.value] };
+                let ok = |t: f64| {
+                    let q = at(t);
+                    let v = p.eval(&q);
+                    rs.axis_ok(o, t) && v.is_finite() && if greater { v > 0.0 } else { v < 0.0 }
+                };
+                let (t0, t1) = (w.min[o], w.max[o]);
+                let tt = |i: usize| t0 + (t1 - t0) * i as f64 / n as f64;
+                // Moves from `inside` towards `outside` to the last inside point.
+                let refine = |mut inside: f64, mut outside: f64| {
+                    for _ in 0..40 {
+                        let m = 0.5 * (inside + outside);
+                        if ok(m) {
+                            inside = m;
+                        } else {
+                            outside = m;
+                        }
+                    }
+                    inside
+                };
+                let mut i = 0;
+                let mut lines: Vec<Vec<[f64; 2]>> = Vec::new();
+                while i <= n {
+                    if !ok(tt(i)) {
+                        i += 1;
+                        continue;
+                    }
+                    let start = i;
+                    while i <= n && ok(tt(i)) {
+                        i += 1;
+                    }
+                    let end = i - 1;
+                    let ta = if start == 0 { tt(0) } else { refine(tt(start), tt(start - 1)) };
+                    let tb = if end == n { tt(n) } else { refine(tt(end), tt(end + 1)) };
+                    if tb > ta {
+                        lines.push(vec![at(ta), at(tb)]);
+                    }
+                }
+                self.add_lines2(&lines, style_for(b.strict));
+            }
+        }
+        Ok(())
+    }
+
     fn draw_2d(&mut self, pr: &Prepared, defs: &Defs, st: Style) -> Result<(), String> {
         let rs = self.restriction(pr, defs)?;
         match &pr.kind {
@@ -1681,15 +1749,25 @@ impl<'a> Builder<'a> {
                 let r = defs.resolve(f).map_err(|e| e.to_string())?;
                 // A strict boundary (`<`, `>`) is not part of the region: draw it dashed unless
                 // the item picked a line style itself.
-                let mut bst = st;
-                if matches!(rel, Rel::Lt | Rel::Gt) && pr.item.style.line_style.is_none() {
-                    let dashed = ItemStyle {
-                        line_style: Some(LineStyle::Dashed),
-                        ..pr.item.style.clone()
-                    };
-                    bst.dash = Style::for_item(&dashed, st.color).dash;
+                let dashed_if = |strict: bool| {
+                    let mut s2 = st;
+                    if strict && pr.item.style.line_style.is_none() {
+                        let dashed = ItemStyle {
+                            line_style: Some(LineStyle::Dashed),
+                            ..pr.item.style.clone()
+                        };
+                        s2.dash = Style::for_item(&dashed, st.color).dash;
+                    }
+                    s2
+                };
+                let bst = dashed_if(matches!(rel, Rel::Lt | Rel::Gt));
+                self.contour(&r, bst, rs.as_ref())?;
+                // The cut edge of the fill: dashed for a strict bound, solid for a non-strict
+                // one, along the filled part only.
+                if let Some(rb) = &rs {
+                    self.clip_edges(&r, matches!(rel, Rel::Gt | Rel::Ge), rb, &dashed_if)?;
                 }
-                self.contour(&r, bst, rs.as_ref())
+                Ok(())
             }
             Kind::Polar { rhs } => {
                 let r = defs.resolve(rhs).map_err(|e| e.to_string())?;

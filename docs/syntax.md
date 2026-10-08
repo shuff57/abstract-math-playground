@@ -273,6 +273,7 @@ y=sin(x) {0<=x<=2pi, y>0}    bounds on both axes
 
 * Bounds are on `x` and/or `y` (a range on another name is a diagnostic). Bounds are expressions of constants, `pi`, sliders and definitions. The curve is clipped to the box, so no sample lies outside it; hover, click-to-select and the special points of a selected curve respect the clip too.
 * Endpoints are marked as in Desmos: a strict bound (`<`, `>`) gets an OPEN circle where the curve ends, a non-strict one (`<=`, `>=`, `≤`, `≥`) a FILLED dot. The markers use the item's colour and point size and are drawn with the ordinary point renderer. A curve that crosses a bound (a circle cut at `y>0`) gets a marker at each crossing; a bound at which the function is undefined (`y=1/x {x>0}`) gets none.
+* An inequality fill cut by a range (`y<x {x>0}`) draws the cut edge along the filled part only: DASHED for a strict bound (`<`, `>`), SOLID for a non-strict one, in the item's colour (an explicit line style on the item wins).
 * An inequality fill is cut to the box. The edge of the box itself is not drawn, only the inequality's own boundary curve, clipped.
 * An empty box (`{x>2, x<1}`) is a diagnostic and draws nothing. Restrictions apply in 2D with linear axes; in 3D or on logarithmic axes they are reported and ignored.
 

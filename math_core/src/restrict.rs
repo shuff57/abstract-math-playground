@@ -95,7 +95,8 @@ impl Restrict {
         self.lo.iter().chain(self.hi.iter()).all(Option::is_none)
     }
 
-    fn axis_ok(&self, a: usize, v: f64) -> bool {
+    /// Whether `v` satisfies the bounds on axis `a` (0 = x, 1 = y); strict bounds exclude their value.
+    pub fn axis_ok(&self, a: usize, v: f64) -> bool {
         if let Some(b) = self.lo[a] {
             if v < b.value || (b.strict && v == b.value) {
                 return false;

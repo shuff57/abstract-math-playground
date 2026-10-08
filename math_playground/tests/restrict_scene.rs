@@ -193,3 +193,56 @@ fn endpoint_markers_are_larger_than_a_point_with_a_thick_ring() {
     let dot = c.g.segments.iter().find(|s| s.p0 == s.p1 && s.width > 8.0).unwrap();
     assert!(dot.width >= 12.0, "filled marker diameter {}", dot.width);
 }
+
+/// The vertical segments on x = 0 (the cut edge), as (y_lo, y_hi) spans.
+fn edge_spans(d: &Drawn) -> Vec<(f64, f64)> {
+    let o = win().centre();
+    d.g.segments
+        .iter()
+        .skip(d.g.backdrop_segments)
+        .filter(|s| s.p0 != s.p1 && !is_ring(s.width) && s.width >= 2.2)
+        .filter(|s| (s.p0[0] as f64 + o[0]).abs() < 1e-3 && (s.p1[0] as f64 + o[0]).abs() < 1e-3)
+        .map(|s| {
+            let (a, b) = (s.p0[1] as f64 + o[1], s.p1[1] as f64 + o[1]);
+            (a.min(b), a.max(b))
+        })
+        .collect()
+}
+
+#[test]
+fn clipped_fill_edge_is_dashed_for_a_strict_bound_over_the_filled_part_only() {
+    // y<x {x>0}: at x = 0 the fill is y < 0 (down to the window bottom, -8)
+    let d = drawn(&["y<x {x>0}"]);
+    let spans = edge_spans(&d);
+    assert!(spans.len() > 3, "a dashed edge is several segments: {spans:?}");
+    assert!(spans.iter().all(|s| s.1 <= 0.1), "edge drawn above the filled part: {spans:?}");
+    assert!(spans.iter().any(|s| s.0 < -7.0) && spans.iter().any(|s| s.1 > -1.5), "{spans:?}");
+}
+
+#[test]
+fn clipped_fill_edge_is_solid_for_a_non_strict_bound() {
+    let d = drawn(&["y<x {x>=0}"]);
+    let spans = edge_spans(&d);
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    assert!(spans[0].0 < -7.9 && spans[0].1 > -0.1 && spans[0].1 < 0.1, "{spans:?}");
+    // `>` fills the other side
+    let d = drawn(&["y>x {x>=0}"]);
+    let spans = edge_spans(&d);
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    assert!(spans[0].0 > -0.1 && spans[0].0 < 0.1 && spans[0].1 > 7.9, "{spans:?}");
+}
+
+#[test]
+fn unrestricted_fill_has_no_edge_and_a_y_bound_draws_a_horizontal_edge() {
+    assert!(edge_spans(&drawn(&["y<x"])).is_empty());
+    let d = drawn(&["y<x+20 {y>=1}"]);
+    let o = win().centre();
+    let horiz: Vec<_> = d
+        .g
+        .segments
+        .iter()
+        .skip(d.g.backdrop_segments)
+        .filter(|s| s.p0 != s.p1 && s.width >= 2.2 && ((s.p0[1] as f64 + o[1]) - 1.0).abs() < 1e-3 && ((s.p1[1] as f64 + o[1]) - 1.0).abs() < 1e-3)
+        .collect();
+    assert_eq!(horiz.len(), 1);
+}
