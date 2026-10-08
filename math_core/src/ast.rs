@@ -62,6 +62,24 @@ pub const CHAIN_FN: &str = "and";
 /// for `body {a<=t<=b, ...}` (see [`crate::param`]). Not a builtin function name.
 pub const DOMAIN_FN: &str = "domain";
 
+/// The name of the call a piecewise group `{x<0: -x, x}` desugars to:
+/// `piece(c1, v1, c2, v2, ..., [default])`. Conditions are comparisons (or chains); a trailing
+/// odd argument is the value used when no condition holds, otherwise the value is undefined
+/// (NaN, so the graph has a gap). Not a builtin function name.
+pub const PIECE_FN: &str = "piece";
+
+/// The branches of a piecewise node: `(condition, value)` pairs and the optional default value.
+pub fn piece_parts(e: &Expr) -> Option<(Vec<(&Expr, &Expr)>, Option<&Expr>)> {
+    match e {
+        Expr::Call(n, args) if n == PIECE_FN && !args.is_empty() => {
+            let pairs = args.chunks_exact(2).map(|c| (&c[0], &c[1])).collect();
+            let default = (args.len() % 2 == 1).then(|| &args[args.len() - 1]);
+            Some((pairs, default))
+        }
+        _ => None,
+    }
+}
+
 /// The comparisons of a chained-comparison node, if `e` is one.
 pub fn rel_chain(e: &Expr) -> Option<&[Expr]> {
     match e {

@@ -252,6 +252,110 @@ fn is_call_form(chars: &[char], at: usize) -> bool {
     false
 }
 
+/// Private-use markers the normaliser leaves for a piecewise group `{c: v, ...}`.
+const PIECE_OPEN: char = '\u{2983}';
+const PIECE_CLOSE: char = '\u{2984}';
+
+/// For a brace group whose content starts at `from`: the index where the content ends (before
+/// the closing brace, `\}` or `\rbrace`) and the index after the closer. Counts `{`, `\{`
+/// and `\lbrace` as openers.
+fn find_brace_close(chars: &[char], from: usize) -> Option<(usize, usize)> {
+    let mut depth = 0usize;
+    let mut i = from;
+    while i < chars.len() {
+        match chars[i] {
+            '{' => depth += 1,
+            '}' => {
+                if depth == 0 {
+                    return Some((i, i + 1));
+                }
+                depth -= 1;
+            }
+            '\\' => {
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && chars[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                if j == start {
+                    match chars.get(j) {
+                        Some('{') => depth += 1,
+                        Some('}') => {
+                            if depth == 0 {
+                                return Some((i, j + 1));
+                            }
+                            depth -= 1;
+                        }
+                        _ => {}
+                    }
+                    i = j + 1;
+                    continue;
+                }
+                let name: String = chars[start..j].iter().collect();
+                match name.as_str() {
+                    "lbrace" => depth += 1,
+                    "rbrace" => {
+                        if depth == 0 {
+                            return Some((i, j));
+                        }
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+                i = j;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A brace group is a piecewise value when, outside every bracket, it has a `:` or a comparison
+/// (`{x<0: -x, x}`, `{x>0}`). Other groups (`{x}`) stay plain parentheses.
+fn is_piece_group(inner: &str) -> bool {
+    let chars: Vec<char> = inner.chars().collect();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ':' if depth <= 0 => return true,
+            '<' | '>' | '\u{2264}' | '\u{2265}' if depth <= 0 => return true,
+            '\\' => {
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && chars[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                if j == start {
+                    match chars.get(j) {
+                        Some('{') => depth += 1,
+                        Some('}') => depth -= 1,
+                        _ => {}
+                    }
+                    i = j + 1;
+                    continue;
+                }
+                let name: String = chars[start..j].iter().collect();
+                match name.as_str() {
+                    "lbrace" => depth += 1,
+                    "rbrace" => depth -= 1,
+                    "le" | "leq" | "leqslant" | "ge" | "geq" | "geqslant" | "lt" | "gt" if depth <= 0 => return true,
+                    _ => {}
+                }
+                i = j;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 fn skip_spaces(chars: &[char], i: &mut usize) {
     while *i < chars.len() && chars[*i] == ' ' {
         *i += 1;
@@ -281,6 +385,18 @@ fn transform(chars: &[char], i: &mut usize, _nested: bool) -> Result<String, Par
                     if *i < chars.len() {
                         let p = chars[*i];
                         *i += 1;
+                        if p == '{' {
+                            if let Some((end, after)) = find_brace_close(chars, *i) {
+                                let inner: String = chars[*i..end].iter().collect();
+                                if is_piece_group(&inner) {
+                                    out.push(PIECE_OPEN);
+                                    out.push_str(&sub_normalize(&inner)?);
+                                    out.push(PIECE_CLOSE);
+                                    *i = after;
+                                    continue;
+                                }
+                            }
+                        }
                         match p {
                             '{' => out.push('('),
                             '}' => out.push(')'),
@@ -292,6 +408,26 @@ fn transform(chars: &[char], i: &mut usize, _nested: bool) -> Result<String, Par
                     continue;
                 }
                 match name.as_str() {
+ "lbrace" | "rbrace" => {
+                        // MathLive's typed brace: the same as `\{` / `\}`
+                        let open = name == "lbrace";
+                        let mut handled = false;
+                        if open {
+                            if let Some((end, after)) = find_brace_close(chars, *i) {
+                                let inner: String = chars[*i..end].iter().collect();
+                                if is_piece_group(&inner) {
+                                    out.push(PIECE_OPEN);
+                                    out.push_str(&sub_normalize(&inner)?);
+                                    out.push(PIECE_CLOSE);
+                                    *i = after;
+                                    handled = true;
+                                }
+                            }
+                        }
+                        if !handled {
+                            out.push(if open { '(' } else { ')' });
+                        }
+                    }
                     "left" | "right" | "limits" | "nolimits" | "displaystyle" | "textstyle" | "quad" | "qquad" => {}
                     "int" | "sum" | "prod" if is_call_form(chars, *i) => {
                         // Pasted call form `\int(x^2,x,0,2)`: the plain `int(...)` call.
@@ -393,6 +529,16 @@ fn transform(chars: &[char], i: &mut usize, _nested: bool) -> Result<String, Par
                 }
             }
             '{' => {
+                if let Some((end, after)) = find_brace_close(chars, *i + 1) {
+                    let inner: String = chars[*i + 1..end].iter().collect();
+                    if is_piece_group(&inner) {
+                        out.push(PIECE_OPEN);
+                        out.push_str(&sub_normalize(&inner)?);
+                        out.push(PIECE_CLOSE);
+                        *i = after;
+                        continue;
+                    }
+                }
                 out.push('(');
                 *i += 1;
             }
@@ -438,6 +584,10 @@ enum Tok {
     Tilde,
     Prime,
     Bang,
+    /// Piecewise group `{ ... }` (the normaliser's private markers) and its `:`.
+    LBrace,
+    RBrace,
+    Colon,
     Eof,
 }
 
@@ -639,6 +789,18 @@ fn lex(s: &str) -> Result<Vec<Token>, ParseError> {
                 push(&mut out, Tok::Prime, pos);
                 i += 1;
             }
+            '\u{2983}' => {
+                push(&mut out, Tok::LBrace, pos);
+                i += 1;
+            }
+            '\u{2984}' => {
+                push(&mut out, Tok::RBrace, pos);
+                i += 1;
+            }
+            ':' => {
+                push(&mut out, Tok::Colon, pos);
+                i += 1;
+            }
             '≤' => {
                 push(&mut out, Tok::Le, pos);
                 i += 1;
@@ -751,7 +913,7 @@ impl<'a> Parser<'a> {
 
     fn starts_primary(&self, t: &Tok) -> bool {
         match t {
-            Tok::Num(_) | Tok::Ident(_) | Tok::LParen | Tok::LBracket | Tok::BigOp(_) => true,
+            Tok::Num(_) | Tok::Ident(_) | Tok::LParen | Tok::LBracket | Tok::LBrace | Tok::BigOp(_) => true,
             Tok::Pipe => self.abs_depth == 0,
             _ => false,
         }
@@ -918,9 +1080,56 @@ impl<'a> Parser<'a> {
                 Ok(Expr::call("abs", vec![inner]))
             }
             Tok::BigOp(g) => self.big_op(g, t.pos),
+            Tok::LBrace => self.piecewise(t.pos),
             Tok::Eof => Err(ParseError::new(t.pos, "unexpected end of input")),
             _ => Err(ParseError::new(t.pos, "unexpected token")),
         }
+    }
+
+    /// `{c1: v1, c2: v2, d}` after the opening brace: `piece(c1, v1, c2, v2, d)`. A branch without
+    /// a colon is a default value when it is last, and `1` under its condition when it is a
+    /// comparison (`{x>0}`).
+    fn piecewise(&mut self, pos: usize) -> Result<Expr, ParseError> {
+        let mut args: Vec<Expr> = Vec::new();
+        let mut has_default = false;
+        loop {
+            if self.peek().tok == Tok::RBrace {
+                break;
+            }
+            let e = self.expr(0)?;
+            if self.peek().tok == Tok::Colon {
+                self.bump();
+                let v = self.expr(0)?;
+                args.push(e);
+                args.push(v);
+            } else if matches!(e, Expr::Rel(..)) || crate::ast::rel_chain(&e).is_some() {
+                args.push(e);
+                args.push(Expr::Num(1.0));
+            } else {
+                if self.peek().tok != Tok::RBrace {
+                    return Err(ParseError::new(
+                        self.peek().pos,
+                        "in a piecewise {..} only the last value may have no condition (write condition: value)",
+                    ));
+                }
+                args.push(e);
+                has_default = true;
+                break;
+            }
+            match self.peek().tok {
+                Tok::Comma => {
+                    self.bump();
+                }
+                Tok::RBrace => break,
+                _ => return Err(ParseError::new(self.peek().pos, "expected ',' or '}' in a piecewise {..}")),
+            }
+        }
+        self.expect(Tok::RBrace, "'}'")?;
+        if args.is_empty() {
+            return Err(ParseError::new(pos, "an empty piecewise {} has no values"));
+        }
+        let _ = has_default;
+        Ok(Expr::Call(crate::ast::PIECE_FN.to_string(), args))
     }
 
     /// `\\int_a^b body\\,dx`, `\\sum_{n=a}^b body`, `\\prod_{n=a}^b body` (the normaliser left

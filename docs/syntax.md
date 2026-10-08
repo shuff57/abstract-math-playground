@@ -293,6 +293,22 @@ y=sin(x) {0<=x<=2pi, y>0}    bounds on both axes
 * In 2D mode a parametric surface draws nothing and reports nothing (the same as `z=f(x,y)` in 2D: the same expression is drawn per mode, see ROADMAP). In 1D it draws nothing.
 * A curve or surface in a tuple with both `t` and `u`/`v` is a curve in `t`; `(u, 2)` and `(a, b, c)` stay points. Not supported: intersection curves of two surfaces, filled volumes, slicing a parametric surface with the slice plane.
 
+## Piecewise: `{x<0: -x, x}`
+
+```
+y={x<0: -x, x}                    absolute value: the last value has no condition and is the default
+y={x<0: -x, x>=0: x}              the same with two conditions
+y={x<-1: x, x>1: x}               nothing is defined for -1<=x<=1: the graph has a gap there
+y={0<x<1: 5, 7}                   a chained condition
+y=2{x<0: -x, x}+1                 pieces are ordinary values: they can be added, multiplied, ...
+y={x<0: -x, x} {x>-3}             a piecewise value, restricted by a range
+```
+
+* A `{...}` group holding `condition: value` entries separated by `,`. The first entry whose condition holds gives the value; a last entry with no condition is the default; with no default and no matching condition the value is undefined (NaN), so a curve has a gap. A condition alone (`{x>0}`) is 1 where it holds and undefined elsewhere. LaTeX `\left\{ ... \right\}` works (MathLive writes `\lbrace`/`\rbrace` for a typed brace).
+* How `{...}` is read: a group is a range (restriction) when it is last, is not a `^{...}`/`_{...}` script, has a comparison and has NO `:` outside brackets. A group with a `:` is piecewise, wherever it stands. A group without a `:` that has a comparison but is not a range (`{x>0}` inside a longer expression) is a piecewise too. A group with neither (`{x}`) is plain parentheses.
+* Conditions are comparisons (`<`, `<=`, `>`, `>=`, `=`) or chains of them; a condition that is undefined (NaN) counts as false. Every branch is evaluated and then selected, so a branch that is not taken may be undefined without harm (`{x>0: sqrt(x), 0}`).
+* Where it works: curves (`y={...}`, `x={...}`, bare expressions of `x`), implicit curves, inequality fills and fields. Fills and fields that contain a piecewise are drawn by the CPU raster (the shader has no reliable NaN), at the same coarse resolution as `sum` and `int`. Not supported: complex items (reported as an unknown function) and the GPU path used by plain fills. A jump at a branch boundary is joined by a near-vertical line when the jump is smaller than the view height, unlike Desmos, which leaves a gap.
+
 ## Tuples and vector fields
 
 ```

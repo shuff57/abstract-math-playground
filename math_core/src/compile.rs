@@ -197,6 +197,14 @@ pub enum Op {
     /// Pops `hi` then `lo` and reduces `Program::subs[index]` over them. The sub-program's
     /// variables are this program's followed by the bound variable (the last slot).
     Reduce(ReduceKind, usize),
+    /// Pops `b` then `a`, pushes 1 when `a rel b` holds and 0 otherwise (also when either is NaN).
+    Cmp(crate::ast::Rel),
+    /// Pops two truth values, pushes 1 when both are true. A truth value is non-zero and not NaN.
+    And,
+    /// Piecewise: the stack holds `pairs` condition/value pairs (condition first, deepest first)
+    /// and, when `default`, one more value on top. Pushes the value of the first true condition,
+    /// else the default, else NaN. Every branch is evaluated (no side effects), then selected.
+    Piece { pairs: usize, default: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -313,6 +321,18 @@ fn emit(e: &Expr, vars: &[String], cx: &mut Cx) -> Result<(), CompileError> {
                 BinOp::Pow => Op::Pow,
             });
         }
+        Expr::Call(name, args) if name == crate::ast::PIECE_FN && !args.is_empty() => {
+            let pairs = args.len() / 2;
+            for c in args.chunks_exact(2) {
+                emit_cond(&c[0], vars, cx)?;
+                emit(&c[1], vars, cx)?;
+            }
+            let default = args.len() % 2 == 1;
+            if default {
+                emit(&args[args.len() - 1], vars, cx)?;
+            }
+            cx.out.push(Op::Piece { pairs, default });
+        }
         Expr::Call(name, args) => {
             let n = name.as_str();
             if n == "deriv" {
@@ -382,6 +402,28 @@ fn emit(e: &Expr, vars: &[String], cx: &mut Cx) -> Result<(), CompileError> {
     Ok(())
 }
 
+/// A condition of a piecewise branch: a comparison, a chained comparison (`and`), or any scalar
+/// (non-zero is true).
+fn emit_cond(e: &Expr, vars: &[String], cx: &mut Cx) -> Result<(), CompileError> {
+    match e {
+        Expr::Rel(r, a, b) => {
+            emit(a, vars, cx)?;
+            emit(b, vars, cx)?;
+            cx.out.push(Op::Cmp(*r));
+        }
+        _ if crate::ast::rel_chain(e).is_some() => {
+            for (i, part) in crate::ast::rel_chain(e).unwrap().iter().enumerate() {
+                emit_cond(part, vars, cx)?;
+                if i > 0 {
+                    cx.out.push(Op::And);
+                }
+            }
+        }
+        _ => emit(e, vars, cx)?,
+    }
+    Ok(())
+}
+
 /// Compiles `expr` with `vars` as the input slots (in order).
 pub fn compile(expr: &Expr, vars: &[&str], angle: Angle) -> Result<Program, CompileError> {
     let vars: Vec<String> = vars.iter().map(|s| s.to_string()).collect();
@@ -400,6 +442,73 @@ fn sign0(x: f64) -> f64 {
     } else {
         f64::NAN
     }
+}
+
+fn truth(c: f64) -> bool {
+    c != 0.0 && !c.is_nan()
+}
+
+fn cmp_f64(r: crate::ast::Rel, a: f64, b: f64) -> f64 {
+    use crate::ast::Rel;
+    let t = match r {
+        Rel::Eq => a == b,
+        Rel::Lt => a < b,
+        Rel::Le => a <= b,
+        Rel::Gt => a > b,
+        Rel::Ge => a >= b,
+    };
+    t as u8 as f64
+}
+
+/// Interval of a comparison: exactly 0 or 1 when the boxes decide it, else [0, 1]. An empty
+/// (undefined) operand makes the comparison false, as in the f64 evaluator.
+fn cmp_i(r: crate::ast::Rel, a: Interval, b: Interval) -> Interval {
+    use crate::ast::Rel;
+    if a.is_empty() || b.is_empty() {
+        return Interval::point(0.0);
+    }
+    let (yes, no) = match r {
+        Rel::Lt => (a.hi < b.lo, a.lo >= b.hi),
+        Rel::Le => (a.hi <= b.lo, a.lo > b.hi),
+        Rel::Gt => (a.lo > b.hi, a.hi <= b.lo),
+        Rel::Ge => (a.lo >= b.hi, a.hi < b.lo),
+        Rel::Eq => (a.lo == a.hi && b.lo == b.hi && a.lo == b.lo, a.hi < b.lo || a.lo > b.hi),
+    };
+    match (yes, no) {
+        (true, _) => Interval::point(1.0),
+        (_, true) => Interval::point(0.0),
+        _ => Interval::new(0.0, 1.0),
+    }
+}
+
+fn hull(a: Interval, b: Interval) -> Interval {
+    if a.is_empty() {
+        b
+    } else if b.is_empty() {
+        a
+    } else {
+        Interval::new(a.lo.min(b.lo), a.hi.max(b.hi))
+    }
+}
+
+/// Enclosure of a piecewise value: the hull of every branch that may be taken, up to and
+/// including the first one that surely is. `st` holds the pairs (and the default) in order.
+fn piece_i(st: &[Interval], pairs: usize, default: bool) -> Interval {
+    let mut acc = Interval::EMPTY;
+    for k in 0..pairs {
+        let (c, v) = (st[2 * k], st[2 * k + 1]);
+        if c.is_empty() || (c.lo == 0.0 && c.hi == 0.0) {
+            continue; // surely false
+        }
+        acc = hull(acc, v);
+        if c.lo > 0.0 {
+            return acc; // surely true: later branches are never reached
+        }
+    }
+    if default {
+        acc = hull(acc, st[2 * pairs]);
+    }
+    acc
 }
 
 fn mod_f64(a: f64, b: f64) -> f64 {
@@ -531,6 +640,28 @@ impl Program {
                     let lo = st.pop().unwrap();
                     st.push(self.reduce(kind, &self.subs[si], vars, lo, hi));
                 }
+                Op::Cmp(r) => {
+                    let b = st.pop().unwrap();
+                    let a = st.pop().unwrap();
+                    st.push(cmp_f64(r, a, b));
+                }
+                Op::And => {
+                    let b = st.pop().unwrap();
+                    let a = st.pop().unwrap();
+                    st.push((truth(a) && truth(b)) as u8 as f64);
+                }
+                Op::Piece { pairs, default } => {
+                    let at = st.len() - 2 * pairs - default as usize;
+                    let mut v = if default { st[at + 2 * pairs] } else { f64::NAN };
+                    for k in 0..pairs {
+                        if truth(st[at + 2 * k]) {
+                            v = st[at + 2 * k + 1];
+                            break;
+                        }
+                    }
+                    st.truncate(at);
+                    st.push(v);
+                }
             }
         }
         st.pop().unwrap_or(f64::NAN)
@@ -599,6 +730,29 @@ impl Program {
                     let hi = st.pop().unwrap();
                     let lo = st.pop().unwrap();
                     st.push(reduce_enclosure(kind, &self.subs[si], &vars[..self.vars.len()], lo, hi));
+                }
+                Op::Cmp(r) => {
+                    let b = st.pop().unwrap();
+                    let a = st.pop().unwrap();
+                    st.push(cmp_i(r, a, b));
+                }
+                Op::And => {
+                    let b = st.pop().unwrap();
+                    let a = st.pop().unwrap();
+                    let (fa, fb) = (a.is_empty() || (a.lo == 0.0 && a.hi == 0.0), b.is_empty() || (b.lo == 0.0 && b.hi == 0.0));
+                    st.push(if fa || fb {
+                        Interval::point(0.0)
+                    } else if a.lo > 0.0 && b.lo > 0.0 {
+                        Interval::point(1.0)
+                    } else {
+                        Interval::new(0.0, 1.0)
+                    });
+                }
+                Op::Piece { pairs, default } => {
+                    let at = st.len() - 2 * pairs - default as usize;
+                    let r = piece_i(&st[at..], pairs, default);
+                    st.truncate(at);
+                    st.push(r);
                 }
             }
         }

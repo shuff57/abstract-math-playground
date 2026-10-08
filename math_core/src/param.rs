@@ -156,6 +156,10 @@ pub fn split_domain_src(src: &str) -> Option<(&str, &str)> {
         return None;
     }
     let inner = &src[cs..ce];
+    // `{x<0: -x, x}` is a piecewise value, not a range
+    if has_top_level_colon(inner) {
+        return None;
+    }
     let relational = inner.contains('<')
         || inner.contains('>')
         || inner.contains("\\le")
@@ -164,6 +168,21 @@ pub fn split_domain_src(src: &str) -> Option<(&str, &str)> {
         || inner.contains('\u{2265}');
     let body = src[..start].trim_end();
     (relational && !body.is_empty()).then_some((body, inner))
+}
+
+/// Whether `text` has a `:` outside every bracket that is not an escaped `\\:` (a thin space).
+pub fn has_top_level_colon(text: &str) -> bool {
+    let (mut depth, mut prev_backslash) = (0i32, false);
+    for c in text.chars() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ':' if depth <= 0 && !prev_backslash => return true,
+            _ => {}
+        }
+        prev_backslash = c == '\\';
+    }
+    false
 }
 
 /// Splits `text` at commas and semicolons that are outside every bracket.

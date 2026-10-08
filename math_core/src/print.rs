@@ -131,8 +131,20 @@ fn deriv_form<'a>(name: &str, args: &'a [Expr]) -> Option<(&'a Expr, &'a str)> {
     }
 }
 
+/// `{c1: v1, c2: v2, d}` for a piecewise node, through `f` for the parts.
+fn piece_body(args: &[Expr], f: impl Fn(&Expr) -> String, colon: &str, sep: &str) -> String {
+    let mut parts: Vec<String> = args.chunks_exact(2).map(|c| format!("{}{colon}{}", f(&c[0]), f(&c[1]))).collect();
+    if args.len() % 2 == 1 {
+        parts.push(f(&args[args.len() - 1]));
+    }
+    parts.join(sep)
+}
+
 pub fn to_text(e: &Expr) -> String {
     match e {
+        Expr::Call(name, args) if name == crate::ast::PIECE_FN && !args.is_empty() => {
+            format!("{{{}}}", piece_body(args, to_text, ": ", ", "))
+        }
         Expr::Call(name, args) if name == crate::ast::DOMAIN_FN && args.len() >= 2 => {
             let clauses: Vec<String> = args[1..].iter().map(to_text).collect();
             format!("{} {{{}}}", to_text(&args[0]), clauses.join(", "))
@@ -261,6 +273,9 @@ fn is_big_op(e: &Expr) -> bool {
 
 pub fn to_latex(e: &Expr) -> String {
     match e {
+        Expr::Call(name, args) if name == crate::ast::PIECE_FN && !args.is_empty() => {
+            format!("\\left\\{{{}\\right\\}}", piece_body(args, to_latex, ":", ",\\,"))
+        }
         Expr::Call(name, args) if name == crate::ast::DOMAIN_FN && args.len() >= 2 => {
             let clauses: Vec<String> = args[1..].iter().map(to_latex).collect();
             format!("{}\\left\\{{{}\\right\\}}", to_latex(&args[0]), clauses.join(",\\,"))

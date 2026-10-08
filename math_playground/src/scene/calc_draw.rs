@@ -53,10 +53,10 @@ fn children(e: &Expr) -> Vec<&Expr> {
     }
 }
 
-/// True if the expression calls `int`, `sum` or `prod` (CPU only).
+/// True if the expression calls `int`, `sum` or `prod`, or has a piecewise `{..}` (CPU only).
 pub(super) fn uses_reduce(e: &Expr) -> bool {
     match e {
-        Expr::Call(n, _) if matches!(n.as_str(), "int" | "sum" | "prod") => true,
+        Expr::Call(n, _) if matches!(n.as_str(), "int" | "sum" | "prod") || n == math_core::ast::PIECE_FN => true,
         _ => children(e).into_iter().any(uses_reduce),
     }
 }

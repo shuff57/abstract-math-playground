@@ -185,6 +185,8 @@ pub enum WgslError {
     NonFiniteConstant,
     /// Malformed program (stack underflow, leftover values, bad `Load` index, empty).
     BadProgram(&'static str),
+    /// A construct with no shader form (piecewise).
+    Unsupported(&'static str),
 }
 
 impl std::fmt::Display for WgslError {
@@ -194,6 +196,7 @@ impl std::fmt::Display for WgslError {
             WgslError::DuplicateName => write!(f, "duplicate WGSL function name"),
             WgslError::NonFiniteConstant => write!(f, "constant is not finite in f32"),
             WgslError::BadProgram(m) => write!(f, "malformed program: {m}"),
+            WgslError::Unsupported(m) => write!(f, "{m}"),
         }
     }
 }
@@ -341,6 +344,9 @@ pub fn emit_function(name: &str, p: &Program) -> Result<String, WgslError> {
             }
             Op::Reduce(..) => {
                 return Err(WgslError::BadProgram("integrals, sums and products are not supported on the GPU"))
+            }
+            Op::Cmp(..) | Op::And | Op::Piece { .. } => {
+                return Err(WgslError::Unsupported("piecewise {..} is not supported on the GPU (NaN gaps are unreliable in shaders)"))
             }
         };
         let _ = writeln!(out, "    let t{n} = {rhs};");
