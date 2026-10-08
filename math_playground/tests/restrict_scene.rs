@@ -4,7 +4,8 @@
 mod common;
 use common::*;
 use math_core::view::{Mode, Window3};
-use math_playground_lib::geometry::SceneGeometry;
+use math_playground_lib::geometry::{SceneGeometry, Theme};
+use math_playground_lib::scene::build_scene;
 
 fn win() -> Window3 {
     Window3::new([-10.0, -8.0, -8.0], [10.0, 8.0, 8.0])
@@ -17,17 +18,27 @@ struct Drawn {
     filled: Vec<[f64; 2]>,
     /// centres of open rings (mean of the ring's segment ends)
     open: Vec<[f64; 2]>,
+    /// centres of opaque background-coloured discs (the interior of an open ring)
+    interiors: Vec<[f64; 2]>,
     diags: Vec<String>,
     g: SceneGeometry,
 }
 
 fn drawn(lines: &[&str]) -> Drawn {
+    drawn_in(lines, &Theme::light())
+}
+
+fn drawn_in(lines: &[&str], theme: &Theme) -> Drawn {
     let d = make_doc(lines, &[]);
-    let (g, o) = build(&d, Mode::D2, win());
+    let c = win().centre();
+    let o = c;
+    let g = build_scene(&d, Mode::D2, win(), c, VIEWPORT, theme);
     let abs = |p: [f32; 3]| [p[0] as f64 + o[0], p[1] as f64 + o[1]];
-    let (mut curve, mut filled, mut ring) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut curve, mut filled, mut ring, mut interiors) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for s in g.segments.iter().skip(g.backdrop_segments) {
-        if s.p0 == s.p1 && s.width > 6.0 {
+        if s.p0 == s.p1 && s.width > 6.0 && s.color == theme.background {
+            interiors.push(abs(s.p0));
+        } else if s.p0 == s.p1 && s.width > 6.0 {
             filled.push(abs(s.p0));
         } else if s.width < 2.2 {
             ring.push(abs(s.p0));
@@ -50,7 +61,7 @@ fn drawn(lines: &[&str]) -> Drawn {
         }
     }
     let diags = g.diagnostics.iter().map(|d| d.1.clone()).collect();
-    Drawn { curve, filled, open: open.into_iter().map(|o| o.0).collect(), diags, g }
+    Drawn { curve, filled, interiors, open: open.into_iter().map(|o| o.0).collect(), diags, g }
 }
 
 fn near(a: [f64; 2], b: [f64; 2]) -> bool {
@@ -139,4 +150,29 @@ fn restricted_items_without_a_range_are_unchanged() {
     let a = drawn(&["y=x^2"]);
     assert!(a.open.is_empty() && a.filled.is_empty());
     assert!(a.curve.iter().any(|p| p[0] < -2.5));
+}
+
+#[test]
+fn open_marker_has_an_opaque_background_interior_in_both_themes() {
+    for theme in [Theme::light(), Theme::dark()] {
+        let d = drawn_in(&["y=x^2 {x>0}"], &theme);
+        assert_eq!(d.open.len(), 1);
+        assert_eq!(d.interiors.len(), 1, "one opaque interior for the open ring");
+        assert!(near(d.interiors[0], [0.0, 0.0]));
+        // the interior is in the background colour, fully opaque, and drawn after the curve
+        let i = d.g.segments.iter().position(|s| s.p0 == s.p1 && s.color == theme.background && s.width > 6.0).unwrap();
+        assert_eq!(d.g.segments[i].color[3], 1.0);
+        let last_curve = d.g.segments.iter().rposition(|s| s.p0 != s.p1 && s.width >= 2.2).unwrap();
+        assert!(i > last_curve, "interior must cover the curve end");
+        // the ring is drawn over the interior
+        assert!(d.g.segments[i + 1..].iter().any(|s| s.width < 2.2 && s.p0 != s.p1));
+        // the interior is as wide as the ring's outer diameter
+        let ring_w = d.g.segments[i + 1].width;
+        let ring_d = d.g.segments[i + 1..].iter().find(|s| s.width < 2.2).unwrap();
+        assert!(d.g.segments[i].width > 2.0 * ring_w && ring_d.width >= 1.5);
+        // a closed marker has no such interior
+        let c = drawn_in(&["y=x^2 {x>=0}"], &theme);
+        assert!(c.interiors.is_empty());
+        assert_eq!(c.filled.len(), 1);
+    }
 }

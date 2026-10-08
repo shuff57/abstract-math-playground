@@ -459,5 +459,30 @@ mod tests {
         let differs = (ry..ry + rh).step_by(7).any(|y| (rx..rx + rw).step_by(7).any(|x| px(&with, size.0, x, y) != px(&without, size.0, x, y)));
         assert!(differs);
     }
-}
 
+    #[test]
+    fn open_endpoint_ring_centre_is_background_not_axis() {
+        let mut gpu = match Headless::new() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED open_endpoint_ring_centre_is_background_not_axis: no GPU adapter ({e})");
+                return;
+            }
+        };
+        let size = (400u32, 300u32);
+        for theme in [crate::geometry::Theme::light(), crate::geometry::Theme::dark()] {
+            let mut doc = Doc::new_default();
+            doc.add_item(Item::new("a", ItemKind::Equation, "y=x^2 {x>0}")).unwrap();
+            let mut rig = Rig::new(Window3::new([-5.0, -3.75, -1.0], [5.0, 3.75, 1.0]), Mode::D2);
+            rig.set_aspect(size.0 as f64 / size.1 as f64);
+            let g = build_scene(&doc, Mode::D2, rig.window(), rig.render_origin(), size, &theme);
+            let layers = [Layer { geometry: &g, fade: 1.0, origin: rig.render_origin(), lift: 1.0 }];
+            let img = gpu.render_rgba(size, &rig, &layers, theme.background);
+            let bg: Vec<u8> = theme.background.iter().map(|c| (c * 255.0).round() as u8).collect();
+            let at = px(&img, size.0, size.0 / 2, size.1 / 2);
+            for k in 0..3 {
+                assert!((at[k] as i32 - bg[k] as i32).abs() <= 2, "ring centre {at:?} vs background {bg:?}");
+            }
+        }
+    }
+}

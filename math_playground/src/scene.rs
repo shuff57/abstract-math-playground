@@ -1392,7 +1392,6 @@ impl<'a> Builder<'a> {
             self.draw_markers(&marks, st);
             return Ok(());
         }
-        self.draw_markers(&marks, st);
         for s in segs {
             self.seg(
                 [s[0][0], s[0][1], 0.0],
@@ -1401,6 +1400,8 @@ impl<'a> Builder<'a> {
                 st.color,
             );
         }
+        // After the curve, so an open ring's opaque interior covers the curve's own end.
+        self.draw_markers(&marks, st);
         Ok(())
     }
 
@@ -1608,6 +1609,15 @@ impl<'a> Builder<'a> {
         let labels = self.ext.labels.take();
         for m in marks {
             let ms = Style { point: if m.open { PointStyle::Circle } else { PointStyle::Dot }, ..st };
+            if m.open {
+                // Opaque background-coloured interior (as Desmos does): the axes, grid and the
+                // curve's own end must not show through the ring.
+                let p = self.ext.map.fwd3([m.pos[0], m.pos[1], 0.0]);
+                if p.iter().all(|v| v.is_finite()) {
+                    let size = self.point_px(st.point_size);
+                    self.seg_raw(p, p, size, self.theme.background);
+                }
+            }
             self.point([m.pos[0], m.pos[1], 0.0], ms);
         }
         self.ext.labels = labels;
