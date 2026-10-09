@@ -914,6 +914,7 @@ pub fn build_panel(
         }
     }
     let mut b = Builder {
+        hosts: Vec::new(),
         out: SceneGeometry::default(),
         origin,
         win: panel_win,

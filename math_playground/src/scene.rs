@@ -293,6 +293,9 @@ struct Style {
     /// Marker of the item's points and its diameter in pixels.
     point: PointStyle,
     point_size: f32,
+    /// The item gave no `pointSize`: a point lying on a curve takes its size from that curve's
+    /// line width (see [`Host`]).
+    auto_size: bool,
     /// Effective opacity of an inequality fill (`None`: the built-in shading).
     fill: Option<f32>,
 }
@@ -306,6 +309,7 @@ impl Style {
             dash: None,
             point: PointStyle::Dot,
             point_size: DOT_W,
+            auto_size: false,
             fill: None,
         }
     }
@@ -330,6 +334,7 @@ impl Style {
             dash,
             point: s.point_style.unwrap_or(PointStyle::Dot),
             point_size: s.point_size.map(|v| v as f32).unwrap_or(DOT_W),
+            auto_size: s.point_size.is_none(),
             fill: s.fill_opacity.map(|v| v.clamp(0.0, 1.0) as f32),
         }
     }
@@ -411,8 +416,25 @@ struct TableData<'a> {
     cols: Vec<ParsedColumn>,
 }
 
+/// A 2D curve that points lying on it follow in thickness: a point with no `pointSize` on the
+/// line grows and shrinks with the line's width.
+struct Host {
+    prog: Program,
+    /// `y = f(x)` (one input) or `F(x, y) = 0` (two inputs).
+    explicit: bool,
+    line_w: f32,
+}
+
+/// Dot diameter that goes with a line `line_w` px thick (the default 2.5 px line gives the default
+/// dot).
+fn dot_for_line(line_w: f32) -> f32 {
+    (line_w * (DOT_W / CURVE_W)).clamp(4.0, 36.0)
+}
+
 struct Builder<'a> {
     out: SceneGeometry,
+    /// Curves that points lying on them follow in thickness (2D, linear axes).
+    hosts: Vec<Host>,
     origin: [f64; 3],
     win: Window3,
     vw: f64,
@@ -777,6 +799,35 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Line width of the thickest host curve that the world point `w` lies on (within the line's
+    /// own half width plus 2 px), if any.
+    fn host_line_w(&self, w: [f64; 3]) -> Option<f32> {
+        if self.hosts.is_empty() || self.ext.mode != Mode::D2 {
+            return None;
+        }
+        let k = self.px_per_unit();
+        let mut best: Option<f32> = None;
+        for h in &self.hosts {
+            let tol = h.line_w as f64 * 0.5 + 2.0;
+            let on = if h.explicit {
+                let y = h.prog.eval(&[w[0]]);
+                y.is_finite() && (y - w[1]).abs() * k[1] <= tol
+            } else {
+                let f = h.prog.eval(&[w[0], w[1]]);
+                let e = 1e-5 * (1.0 + w[0].abs().max(w[1].abs()));
+                let gx = (h.prog.eval(&[w[0] + e, w[1]]) - h.prog.eval(&[w[0] - e, w[1]])) / (2.0 * e);
+                let gy = (h.prog.eval(&[w[0], w[1] + e]) - h.prog.eval(&[w[0], w[1] - e])) / (2.0 * e);
+                // Distance in pixels: F / |grad F| with each axis scaled to pixels.
+                let g = (gx / k[0]).hypot(gy / k[1]);
+                f.is_finite() && g.is_finite() && g > 1e-12 && f.abs() / g <= tol
+            };
+            if on && best.is_none_or(|b| h.line_w > b) {
+                best = Some(h.line_w);
+            }
+        }
+        best
+    }
+
     /// One point marker in the item's style (`pointStyle`, `pointSize`), plus its `showLabel`
     /// label. Open shapes are sized in pixels; in 3D every style is a dot. `p` is in WORLD
     /// coordinates (mapped onto logarithmic axes; a point that cannot be shown there is skipped).
@@ -784,6 +835,12 @@ impl<'a> Builder<'a> {
         let p = self.ext.map.fwd3(p);
         if !p.iter().all(|v| v.is_finite()) {
             return;
+        }
+        let mut st = st;
+        if st.auto_size {
+            if let Some(w) = self.host_line_w(self.ext.map.inv3(p)) {
+                st.point_size = dot_for_line(w);
+            }
         }
         let size = self.point_px(st.point_size) as f64;
         let k = self.px_per_unit();
@@ -3228,6 +3285,7 @@ pub fn build_scene_mapped(
     let scale = RENDER_SCALE.get();
     let (lm, gm, pm) = weight_mul(doc.view.weight);
     let mut b = Builder {
+        hosts: Vec::new(),
         out: SceneGeometry::default(),
         origin,
         win: window.sanitized(),
@@ -3270,6 +3328,19 @@ pub fn build_scene_mapped(
     let (items, defs, pdefs, tables, fits) = prepare_fitted(doc, &mut diags);
     b.out.infos = calc_draw::collect_infos(&items, &fits, &defs, &pdefs, b.angle);
     b.pdefs = pdefs;
+    if mode == Mode::D2 && map.is_linear() {
+        for pr in items.iter().filter(|p| !p.item.hidden) {
+            let line_w = pr.item.style.line_width.map(|w| w as f32).unwrap_or(CURVE_W);
+            let (e, vars, explicit): (Option<Expr>, &[&str], bool) = match &pr.kind {
+                Kind::ExplicitY { rhs } => (defs.resolve(rhs).ok(), &["x"], true),
+                Kind::Implicit { f } => (defs.resolve(f).ok(), &["x", "y"], false),
+                _ => continue,
+            };
+            if let Some(Ok(prog)) = e.map(|e| compile(&e, vars, b.angle)) {
+                b.hosts.push(Host { prog, explicit, line_w });
+            }
+        }
+    }
     let mut visible_idx = 0usize;
     for pr in items.iter().filter(|p| !p.item.hidden) {
         if matches!(pr.kind, Kind::Definition { .. }) {
@@ -6379,4 +6450,26 @@ mod tests {
             matches!(self, std::borrow::Cow::Borrowed(_))
         }
     }
+    #[test]
+    fn a_point_on_a_curve_follows_the_curve_thickness() {
+        let width_of_point = |curve_w: Option<f64>, point: &str, size: Option<f64>| -> f32 {
+            let mut d = Doc::new_default();
+            d.items.push(Item::new("c", ItemKind::Equation, "y=x^2"));
+            d.items[0].style.line_width = curve_w;
+            d.items.push(Item::new("p", ItemKind::Points, point));
+            d.items[1].style.point_size = size;
+            let g = build(&d, Mode::D2);
+            let segs = g.segments.iter().filter(|s| s.p0 == s.p1);
+            segs.map(|s| s.width).fold(0.0, f32::max) - 2.0 * HALO_PX
+        };
+        // Default thickness: the default dot. Thicker: bigger. Thinner: smaller.
+        let base = width_of_point(None, "(1,1)", None);
+        assert_eq!(base, DOT_W);
+        assert!(width_of_point(Some(6.0), "(1,1)", None) >= base * 1.8);
+        assert!(width_of_point(Some(1.0), "(1,1)", None) < base * 0.6);
+        // Off the curve, or with its own size, nothing follows.
+        assert_eq!(width_of_point(Some(6.0), "(1,3)", None), DOT_W);
+        assert_eq!(width_of_point(Some(6.0), "(1,1)", Some(20.0)), 20.0);
+    }
+
 }
