@@ -250,7 +250,14 @@ pub struct ItemStyle {
     /// regression panel's "plot" button).
     #[serde(default, skip_serializing_if = "is_false")]
     pub residual_plot: bool,
+    // Label offset `[dx, dy]` in CSS pixels (y down), each within `+-LABEL_OFFSET_MAX`; absent
+    // = the default place. (A plain comment: the schema's prompt copy has a size budget.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_offset: Option<[f64; 2]>,
 }
+
+/// Largest `labelOffset` component in either direction, in CSS pixels.
+pub const LABEL_OFFSET_MAX: f64 = 400.0;
 
 /// Valid range of [`ItemStyle::point_size`].
 pub const POINT_SIZE_RANGE: std::ops::RangeInclusive<f64> = 1.0..=40.0;
@@ -281,6 +288,9 @@ impl ItemStyle {
         }
         if self.fill_opacity.is_some_and(|o| !unit(o)) {
             e.push("fillOpacity must be in [0,1]".to_string());
+        }
+        if self.label_offset.is_some_and(|o| o.iter().any(|v| !v.is_finite())) {
+            e.push("labelOffset must be two finite numbers".to_string());
         }
         if e.is_empty() {
             Ok(())
@@ -858,6 +868,7 @@ mod tests {
                     fill_opacity: Some(0.4),
                     show_label: true,
                     residual_plot: i % 4 == 0,
+                    label_offset: Some([12.0, -30.5]),
                 };
             }
             d.add_item(it).unwrap();
@@ -1248,6 +1259,7 @@ mod tests {
             "pointSize",
             "fillOpacity",
             "showLabel",
+            "labelOffset",
         ] {
             assert!(!j.contains(k), "{k} in {j}");
         }
@@ -1270,6 +1282,7 @@ mod tests {
         assert!(j.contains("\"grid\":false") && j.contains("\"axisNumbers\":false"));
         assert!(j.contains("\"pointSize\":12.0") && j.contains("\"fillOpacity\":0.4"));
         assert!(j.contains("\"showLabel\":true"));
+        assert!(j.contains("\"labelOffset\":[12.0,-30.5]"), "{j}");
         assert_eq!(from_json(&j).unwrap(), d);
         assert_eq!(decode_hash(&encode_hash(&d)).unwrap(), d);
         let mut d = rich_doc();

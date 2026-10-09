@@ -54,6 +54,10 @@ pub struct Label {
     pub pos: [f64; 3],
     pub text: String,
     pub axis: u8,
+    /// Id of the item an item label (`showLabel`) belongs to.
+    pub item: Option<String>,
+    /// The item's `labelOffset` (CSS pixels, y down, already clamped); `[0, 0]` when none.
+    pub offset: [f64; 2],
 }
 
 /// How a [`FieldSpec`] is shaded by the GPU.

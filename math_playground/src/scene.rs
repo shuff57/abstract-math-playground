@@ -31,7 +31,7 @@ use math_core::ast::{BinOp, Expr, Rel};
 use math_core::compile::{compile, Angle, Program};
 use math_core::complex::{compile_complex, parse_complex};
 use math_core::doc::{
-    AngleMode, Doc, Item, ItemKind, ItemStyle, LineStyle, PointStyle, Weight,
+    AngleMode, Doc, Item, ItemKind, ItemStyle, LineStyle, PointStyle, Weight, LABEL_OFFSET_MAX,
 };
 use math_core::list::{eval_value, Bindings, Value};
 use math_core::mesh;
@@ -111,6 +111,13 @@ const BOX_HALF_PX: f64 = 18.0;
 const MAX_BINS: usize = 2000;
 /// Most dots stacked in one dot-plot bin.
 const MAX_STACK: usize = 300;
+/// A style's `labelOffset` as the scene applies it: each component clamped to
+/// `+-LABEL_OFFSET_MAX`, non-finite values counting as 0, `[0, 0]` when none.
+pub fn clamp_label_offset(o: Option<[f64; 2]>) -> [f64; 2] {
+    let c = |v: f64| if v.is_finite() { v.clamp(-LABEL_OFFSET_MAX, LABEL_OFFSET_MAX) } else { 0.0 };
+    o.map_or([0.0; 2], |o| [c(o[0]), c(o[1])])
+}
+
 /// Number lists up to this long get a value label per dot on the 1D line.
 const MAX_LABELLED: usize = 20;
 /// Safety cap on grid lines per direction.
@@ -362,6 +369,8 @@ struct BuildExt {
     /// `showLabel` of the item being drawn: custom text (or `None` for coordinates) and how many
     /// labels it may still place.
     labels: Option<(Option<String>, usize)>,
+    /// Id and clamped `labelOffset` of the item whose labels are being placed.
+    label_item: Option<(String, [f64; 2])>,
     /// Print weight multiplier of line widths (curves, axes, ticks, arrows; dashes follow).
     line_mul: f32,
     /// Print weight multiplier of the grid lines (and the 3D box edges); gentler than `line_mul`
@@ -389,6 +398,7 @@ impl Default for BuildExt {
             map: AxisMap::LINEAR,
             world_in: false,
             labels: None,
+            label_item: None,
             line_mul: 1.0,
             grid_mul: 1.0,
             point_mul: 1.0,
@@ -733,7 +743,12 @@ impl<'a> Builder<'a> {
 
     fn label(&mut self, pos: [f64; 3], text: String, axis: u8) {
         if !text.is_empty() && pos.iter().all(|v| v.is_finite()) {
-            self.out.labels.push(Label { pos, text, axis });
+            // Item labels carry their item and its `labelOffset`; tick labels have neither.
+            let (item, offset) = match (&self.ext.label_item, axis == ITEM_LABEL_AXIS) {
+                (Some((id, off)), true) => (Some(id.clone()), *off),
+                _ => (None, [0.0; 2]),
+            };
+            self.out.labels.push(Label { pos, text, axis, item, offset });
         }
     }
 
@@ -1027,7 +1042,8 @@ impl<'a> Builder<'a> {
     }
 
     /// Arms `showLabel` point labels for the item about to be drawn.
-    fn begin_item_labels(&mut self, s: &ItemStyle) {
+    fn begin_item_labels(&mut self, id: &str, s: &ItemStyle) {
+        self.ext.label_item = Some((id.to_string(), clamp_label_offset(s.label_offset)));
         self.ext.labels = s.show_label.then(|| {
             let text = s.label.clone().filter(|t| !t.trim().is_empty());
             (text, MAX_POINT_LABELS)
@@ -3424,6 +3440,7 @@ pub fn build_scene_mapped(
             map,
             world_in: false,
             labels: None,
+            label_item: None,
             line_mul: lm * scale,
             grid_mul: gm * scale,
             point_mul: pm * scale,
@@ -3470,7 +3487,7 @@ pub fn build_scene_mapped(
             color[3] *= o.clamp(0.0, 1.0) as f32;
         }
         let st = Style::for_item(&pr.item.style, color);
-        b.begin_item_labels(&pr.item.style);
+        b.begin_item_labels(&pr.item.id, &pr.item.style);
         let seg0 = b.out.segments.len();
         if !map.is_linear() {
             if let Some(why) = log_unsupported(pr) {
@@ -3541,7 +3558,7 @@ pub fn build_scene_mapped(
         let default_cs = ColumnStyle::default();
         let mut first = None;
         let mut errs: Vec<String> = Vec::new();
-        b.begin_item_labels(&t.item.style);
+        b.begin_item_labels(&t.item.id, &t.item.style);
         // Table rows are world coordinates: mapped onto logarithmic axes as they are drawn.
         b.ext.world_in = true;
         for (k, &yc) in ys.iter().enumerate() {
@@ -6445,6 +6462,40 @@ mod tests {
         // 3D region fill too.
         let g = build(&styled("y<x", |s| s.fill_opacity = Some(0.5)), Mode::D3);
         assert!((g.fields[0].color[3] * FILL_SHADER_ALPHA - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn label_offset_is_carried_by_item_labels_only_and_clamped() {
+        let g = build(&styled("[(1,2),(3,4)]", |s| {
+            s.show_label = true;
+            s.label_offset = Some([20.0, -35.0]);
+        }), Mode::D2);
+        let items: Vec<&Label> = g.labels.iter().filter(|l| l.item.is_some()).collect();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|l| l.offset == [20.0, -35.0] && l.item.as_deref() == Some("a")));
+        // The anchor (world position) is unchanged by the offset.
+        let plain = build(&styled("[(1,2),(3,4)]", |s| s.show_label = true), Mode::D2);
+        let pos = |g: &SceneGeometry| g.labels.iter().filter(|l| l.item.is_some()).map(|l| l.pos).collect::<Vec<_>>();
+        assert_eq!(pos(&g), pos(&plain));
+        assert!(plain.labels.iter().filter(|l| l.item.is_some()).all(|l| l.offset == [0.0; 2]));
+        // Tick labels never carry an offset or an item.
+        assert!(g.labels.iter().filter(|l| l.item.is_none()).all(|l| l.offset == [0.0; 2]));
+        // Out-of-range and non-finite values are pulled in.
+        assert_eq!(clamp_label_offset(None), [0.0; 2]);
+        assert_eq!(clamp_label_offset(Some([1e6, -1e6])), [400.0, -400.0]);
+        assert_eq!(clamp_label_offset(Some([f64::NAN, 5.0])), [0.0, 5.0]);
+        let g = build(&styled("(1,2)", |s| {
+            s.show_label = true;
+            s.label_offset = Some([999.0, 0.0]);
+        }), Mode::D2);
+        assert_eq!(g.labels.iter().find(|l| l.item.is_some()).unwrap().offset, [400.0, 0.0]);
+        // A curve's text label (placed at its first sample) carries it too.
+        let g = build(&styled("y=x", |s| {
+            s.show_label = true;
+            s.label = Some("f".into());
+            s.label_offset = Some([0.0, 10.0]);
+        }), Mode::D2);
+        assert_eq!(g.labels.iter().find(|l| l.item.is_some()).unwrap().offset, [0.0, 10.0]);
     }
 
     #[test]

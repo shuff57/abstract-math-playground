@@ -362,6 +362,13 @@ pub struct ScreenLabel {
     /// Rectangle `[x, y, w, h]` the label must stay inside (the inset's, for inset labels).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clip: Option<[f64; 4]>,
+    /// Id of the item an item label (`showLabel`, axis 4/6) belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item: Option<String>,
+    /// The item's `labelOffset` `[dx, dy]` in CSS pixels (y down, clamped): the overlay adds it
+    /// to `x`/`y` (canvas pixels / dpr) so the text is moved off its point. Absent when none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<[f64; 2]>,
 }
 
 /// A curve parameter and its value (see [`Event::CurveDrag`]).
@@ -1501,7 +1508,7 @@ impl App {
         id: &str,
         patch: serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), String> {
-        const KEYS: [&str; 10] = [
+        const KEYS: [&str; 11] = [
             "lineWidth",
             "lineStyle",
             "pointStyle",
@@ -1512,6 +1519,7 @@ impl App {
             "fillOpacity",
             "showLabel",
             "residualPlot",
+            "labelOffset",
         ];
         let Some(item) = self.doc.items.iter_mut().find(|i| i.id == id) else {
             return Err(format!("no item with id '{id}'"));
@@ -1536,6 +1544,11 @@ impl App {
         let style: doc::ItemStyle = serde_json::from_value(serde_json::Value::Object(merged))
             .map_err(|e| format!("setStyle: {e}"))?;
         style.validate().map_err(|m| format!("setStyle: {m}"))?;
+        let mut style = style;
+        // An offset beyond the limit is pulled back, not refused (a drag may overshoot).
+        style.label_offset = style
+            .label_offset
+            .map(|o| o.map(|v| v.clamp(-doc::LABEL_OFFSET_MAX, doc::LABEL_OFFSET_MAX)));
         if let Some(w) = patch.get("lineWidth").and(style.line_width) {
             if !(0.25..=20.0).contains(&w) {
                 return Err("setStyle: lineWidth must be in [0.25,20]".into());
@@ -2887,6 +2900,8 @@ impl App {
                 alpha,
                 inset: false,
                 clip: None,
+                item: l.item.clone(),
+                offset: (l.offset != [0.0; 2]).then_some(l.offset),
             })
         }));
     }
@@ -2965,6 +2980,8 @@ impl App {
                     alpha: 1.0,
                     inset: true,
                     clip: Some([r[0] as f64, r[1] as f64, pw, ph]),
+                    item: None,
+                    offset: None,
                 }
             })
             .collect()
@@ -3753,6 +3770,41 @@ mod tests {
         cmd(&mut a, r#"{"t":"setView","xScale":"linear","window":{"min":[-1,-7,-10],"max":[5,9,10]}}"#);
         assert_eq!(a.doc.view.window.min[0], -1.0);
         assert!(a.log_entry.is_none());
+    }
+
+    #[test]
+    fn item_labels_follow_a_point_drag_and_a_slider_within_the_same_event() {
+        let mut a = app();
+        let label = |a: &App, item: &str| {
+            a.screen_labels().into_iter().find(|l| l.item.as_deref() == Some(item)).unwrap()
+        };
+        cmd(&mut a, r#"{"t":"setSlider","name":"s","value":1,"min":-5,"max":5}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"p","latex":"(1,1)"}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"q","latex":"(s,2)"}"#);
+        cmd(&mut a, r#"{"t":"setStyle","id":"p","style":{"showLabel":true,"labelOffset":[10,10]}}"#);
+        cmd(&mut a, r#"{"t":"setStyle","id":"q","style":{"showLabel":true}}"#);
+        // A slider move relabels (and moves) the point built from it, with no frame in between.
+        let before = label(&a, "q");
+        assert_eq!(before.text, "(1, 2)");
+        cmd(&mut a, r#"{"t":"setSlider","name":"s","value":3}"#);
+        let after = label(&a, "q");
+        assert_eq!(after.text, "(3, 2)");
+        assert!(after.x > before.x && (after.y - before.y).abs() < 1e-9);
+        // Dragging a point updates its label on every move, offset kept.
+        let vp = (800.0, 600.0);
+        let (px, py) = a.rig.world_to_pixel(a.map.fwd3([1.0, 1.0, 0.0]), vp);
+        let start = label(&a, "p");
+        cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"down","x":{px},"y":{py}}}"#));
+        let mut last = start.x;
+        for k in 1..=3 {
+            cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"move","x":{},"y":{}}}"#, px + 20.0 * k as f64, py));
+            let l = label(&a, "p");
+            assert!(l.x > last, "step {k}: the label moved with the point");
+            assert_ne!(l.text, start.text, "step {k}: text is current");
+            assert_eq!(l.offset, Some([10.0, 10.0]));
+            last = l.x;
+        }
+        cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"up","x":{},"y":{py}}}"#, px + 60.0));
     }
 
     #[test]
@@ -5788,6 +5840,42 @@ mod tests {
     }
 
     #[test]
+    fn label_offset_is_set_clamped_cleared_and_reported_on_the_screen_label() {
+        let mut a = App::new((800, 600));
+        cmd(&mut a, r#"{"t":"addItem","id":"p","kind":"points","latex":"(1,2)"}"#);
+        let item_label = |a: &App| {
+            a.screen_labels()
+                .into_iter()
+                .find(|l| l.axis == crate::scene::ITEM_LABEL_AXIS || l.axis == crate::scene::ITEM_LABEL_LEFT_AXIS)
+        };
+        cmd(&mut a, r#"{"t":"setStyle","id":"p","style":{"showLabel":true}}"#);
+        let base = item_label(&a).unwrap();
+        assert_eq!((base.item.as_deref(), base.offset), (Some("p"), None));
+        // Set: the offset rides on the label, the anchor does not move.
+        let ev = cmd(&mut a, r#"{"t":"setStyle","id":"p","style":{"labelOffset":[30,-12.5]}}"#);
+        assert!(error_msg(&ev).is_none(), "{ev:?}");
+        assert_eq!(style_of(&a, "p").label_offset, Some([30.0, -12.5]));
+        let l = item_label(&a).unwrap();
+        assert_eq!((l.offset, l.x, l.y), (Some([30.0, -12.5]), base.x, base.y));
+        // Beyond the limit: clamped.
+        cmd(&mut a, r#"{"t":"setStyle","id":"p","style":{"labelOffset":[900,-1e9]}}"#);
+        assert_eq!(style_of(&a, "p").label_offset, Some([400.0, -400.0]));
+        assert_eq!(item_label(&a).unwrap().offset, Some([400.0, -400.0]));
+        // Saved in the document.
+        let ev = cmd(&mut a, r#"{"t":"export"}"#);
+        let json = ev.iter().find(|e| e["t"] == "doc").unwrap()["json"].as_str().unwrap().to_string();
+        assert!(json.contains("\"labelOffset\":[400.0,-400.0]"), "{json}");
+        // Updates when the point moves: the label keeps its item and offset.
+        cmd(&mut a, r#"{"t":"setExpr","id":"p","latex":"(3,4)"}"#);
+        let l = item_label(&a).unwrap();
+        assert_eq!((l.text.as_str(), l.offset), ("(3, 4)", Some([400.0, -400.0])));
+        // null clears it.
+        cmd(&mut a, r#"{"t":"setStyle","id":"p","style":{"labelOffset":null}}"#);
+        assert!(style_of(&a, "p").label_offset.is_none());
+        assert_eq!(item_label(&a).unwrap().offset, None);
+    }
+
+    #[test]
     fn set_style_merges_resets_and_validates() {
         let mut a = app();
         cmd(&mut a, r#"{"t":"setExpr","id":"p","latex":"(1,2)"}"#);
@@ -5833,6 +5921,9 @@ mod tests {
             r#"{"t":"setStyle","id":"p","style":{"lineStyle":"wavy"}}"#,
             r#"{"t":"setStyle","id":"p","style":{"showLabel":"yes"}}"#,
             r#"{"t":"setStyle","id":"p","style":{"colour":"red"}}"#,
+            r#"{"t":"setStyle","id":"p","style":{"labelOffset":[1]}}"#,
+            r#"{"t":"setStyle","id":"p","style":{"labelOffset":"up"}}"#,
+            r#"{"t":"setStyle","id":"p","style":{"labelOffset":[1,null]}}"#,
             r#"{"t":"setStyle","id":"p","style":{"opacity":0.2,"pointSize":99}}"#,
             r#"{"t":"setStyle","id":"nope","style":{"opacity":0.2}}"#,
             r#"{"t":"setStyle","id":"p","style":3}"#,
