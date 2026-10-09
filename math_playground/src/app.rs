@@ -320,6 +320,11 @@ pub enum Command {
     },
     /// Returns the inset to auto-follow (also a double-click on it).
     ResetSliceView,
+    /// Shows or hides the slice inset (default shown). Hidden, the slice plane is still drawn in
+    /// the 3D scene and the slice state is still reported; only the inset panel and its labels go.
+    SetSliceInset {
+        show: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -530,6 +535,49 @@ struct Built {
     parts: Option<Box<(SceneGeometry, SceneGeometry)>>,
 }
 
+/// A 3D scene's surfaces projected to the canvas: tick numbers inside them are not drawn.
+struct SurfaceCover {
+    tris: Vec<[[f64; 2]; 3]>,
+    /// Screen bounds `[x0, y0, x1, y1]` of all the triangles.
+    bounds: [f64; 4],
+}
+
+impl SurfaceCover {
+    /// Whether the text box of a tick label anchored at `(x, y)` lies on a surface (its centre or
+    /// the anchor point is inside a triangle).
+    fn covers(&self, axis: u8, text: &str, x: f64, y: f64) -> bool {
+        let tw = text.chars().count() as f64 * 7.5;
+        let centre = match axis {
+            0 => [x, y + 11.5],
+            1 => [x - 6.0 - tw / 2.0, y],
+            _ => [x, y],
+        };
+        [centre, [x, y]].iter().any(|p| self.hit(*p))
+    }
+
+    /// Whether the label's anchor lies inside the surface's screen bounds without being on it:
+    /// such a number floats beside the object, so it is faded rather than dropped.
+    fn near(&self, x: f64, y: f64) -> bool {
+        let b = self.bounds;
+        x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]
+    }
+
+    fn hit(&self, p: [f64; 2]) -> bool {
+        self.tris.iter().any(|t| {
+            if p[0] < t[0][0].min(t[1][0]).min(t[2][0])
+                || p[0] > t[0][0].max(t[1][0]).max(t[2][0])
+                || p[1] < t[0][1].min(t[1][1]).min(t[2][1])
+                || p[1] > t[0][1].max(t[1][1]).max(t[2][1])
+            {
+                return false;
+            }
+            let e = |a: [f64; 2], b: [f64; 2]| (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+            let (d0, d1, d2) = (e(t[0], t[1]), e(t[1], t[2]), e(t[2], t[0]));
+            (d0 >= 0.0 && d1 >= 0.0 && d2 >= 0.0) || (d0 <= 0.0 && d1 <= 0.0 && d2 <= 0.0)
+        })
+    }
+}
+
 /// `g` split at its backdrop: (grid and axes, everything else).
 fn split_flat(g: &SceneGeometry) -> (SceneGeometry, SceneGeometry) {
     let n = g.backdrop_segments.min(g.segments.len());
@@ -660,6 +708,10 @@ pub struct App {
     ticker_err: Option<String>,
     /// Secondary inset for the slice, rebuilt with the main scene.
     panel: Option<SlicePanel>,
+    /// The inset is folded away by the UI (the slice itself stays on).
+    inset_hidden: bool,
+    /// The 3D view was moved closer when the slice came on (undone when it goes).
+    slice_zoomed: bool,
     /// Last `Slice` event sent, so it is only repeated when it changes.
     last_slice: Option<Event>,
     /// Explicit inset view (`None` follows the main window).
@@ -729,11 +781,25 @@ fn view_mode(m: doc::Mode) -> Mode {
     }
 }
 
+/// Default 3D dolly: the cube fills about 85% of the canvas height (the bare bounding-sphere
+/// framing leaves it near half).
+const FIT_3D: f64 = 1.35;
+
+/// Extra dolly while a 3D slice is active.
+const SLICE_ZOOM_3D: f64 = 1.25;
+
+/// A rig framed for the default 3D view (see [`FIT_3D`]).
+fn fitted_rig(window: Window3, mode: Mode) -> Rig {
+    let mut rig = Rig::new(window, mode);
+    rig.dolly(FIT_3D);
+    rig
+}
+
 impl App {
     pub fn new(size: (u32, u32)) -> Self {
         let doc = Doc::new_default();
         let w = doc.view.window.clone();
-        let mut rig = Rig::new(Window3::new(w.min, w.max), view_mode(doc.view.mode));
+        let mut rig = fitted_rig(Window3::new(w.min, w.max), view_mode(doc.view.mode));
         rig.set_aspect(size.0 as f64 / size.1.max(1) as f64);
         rig.max_frame_dt_ms = MAX_FRAME_DT_MS;
         let mut app = App {
@@ -766,6 +832,8 @@ impl App {
             ticker_last_ms: None,
             ticker_err: None,
             panel: None,
+            inset_hidden: false,
+            slice_zoomed: false,
             last_slice: None,
             slice_view: None,
             inset_drag: None,
@@ -826,7 +894,7 @@ impl App {
     fn inset_rect(&self) -> Option<[u32; 4]> {
         self.panel
             .as_ref()
-            .filter(|_| !self.rig.is_animating())
+            .filter(|_| !self.rig.is_animating() && !self.inset_hidden)
             .map(|p| p.rect)
     }
 
@@ -1197,6 +1265,13 @@ impl App {
                     .and_then(|f| math_core::slice::SliceCfg::new(dim, f, mode));
                 match cfg {
                     Ok(c) => {
+                        // A slice makes the object the subject: a sphere of radius 3 should fill
+                        // about a quarter of the scene, not a sliver (undone on clear).
+                        if mode == Mode::D3 && self.doc.slice.is_none() && !self.slice_zoomed {
+                            self.rig.dolly(SLICE_ZOOM_3D);
+                            self.slice_zoomed = true;
+                            self.dirty = true;
+                        }
                         self.doc.slice = Some(c);
                         self.mark_doc_changed();
                     }
@@ -1204,6 +1279,11 @@ impl App {
                 }
             }
             Command::ClearSlice => {
+                if self.slice_zoomed {
+                    self.slice_zoomed = false;
+                    self.rig.dolly(1.0 / SLICE_ZOOM_3D);
+                    self.dirty = true;
+                }
                 self.doc.slice = None;
                 self.slice_view = None;
                 self.mark_doc_changed();
@@ -1228,6 +1308,12 @@ impl App {
                     }
                 }
             }
+            Command::SetSliceInset { show } => {
+                if self.inset_hidden == show {
+                    self.inset_hidden = !show;
+                    self.redraw = true;
+                }
+            }
             Command::ResetSliceView => {
                 if self.slice_view.take().is_some() {
                     self.rebuild_panel(self.rig.mode());
@@ -1235,6 +1321,8 @@ impl App {
             }
             Command::Reset => {
                 self.rig.reset();
+                self.rig.dolly(FIT_3D);
+                self.slice_zoomed = false;
                 self.dirty = true;
                 self.touch_input();
             }
@@ -1444,7 +1532,7 @@ impl App {
 
     fn load(&mut self, d: Doc) {
         let w = d.view.window.clone();
-        self.rig = Rig::new(Window3::new(w.min, w.max), view_mode(d.view.mode));
+        self.rig = fitted_rig(Window3::new(w.min, w.max), view_mode(d.view.mode));
         self.rig.set_aspect(self.size.0 as f64 / self.size.1 as f64);
         self.rig.max_frame_dt_ms = self.max_frame_dt_ms;
         self.doc = d;
@@ -2006,7 +2094,7 @@ impl App {
         } else {
             Window3::new(w.min, w.max)
         };
-        self.rig = Rig::new(shown, self.rig.mode());
+        self.rig = fitted_rig(shown, self.rig.mode());
         self.rig.set_aspect(aspect);
         self.rig.reduced_motion = self.reduced_motion;
         self.rig.max_frame_dt_ms = self.max_frame_dt_ms;
@@ -2577,7 +2665,7 @@ impl App {
     /// [`crate::render::Renderer::render_with_inset`]), or `None` when there is no slice, it does
     /// not fit the mode, or the camera is mid mode-switch.
     pub fn inset(&self) -> Option<Inset<'_>> {
-        let p = self.panel.as_ref().filter(|_| !self.rig.is_animating())?;
+        let p = self.panel.as_ref().filter(|_| !self.rig.is_animating() && !self.inset_hidden)?;
         Some(Inset {
             rect: p.rect,
             rig: &p.rig,
@@ -2681,8 +2769,10 @@ impl App {
         let rect = self.inset_rect();
         // Labels of a 3D scene ride the switch lift with its geometry.
         let lift = layer_lift(b.mode, self.rig.lift()) as f64;
+        // 3D tick numbers that would sit on a plotted surface are dropped, not haloed.
+        let cover = (b.mode == Mode::D3).then(|| self.surface_cover(b, aspect, (w, h), lift)).flatten();
         out.extend(b.geometry.labels.iter().filter_map(|l| {
-            let alpha = if l.axis == 4 { items } else { back } as f64;
+            let mut alpha = if l.axis == 4 { items } else { back } as f64;
             if alpha <= 0.003 {
                 return None;
             }
@@ -2692,6 +2782,15 @@ impl App {
             let (x, y) = ((ndc[0] * 0.5 + 0.5) * w, (1.0 - (ndc[1] * 0.5 + 0.5)) * h);
             let mut visible =
                 ndc[0].abs() <= 1.0 && ndc[1].abs() <= 1.0 && (0.0..=1.0).contains(&ndc[2]);
+            if let Some(c) = &cover {
+                if l.axis <= 2 {
+                    if c.covers(l.axis, &l.text, x, y) {
+                        visible = false;
+                    } else if self.doc.slice.is_some() && c.near(x, y) {
+                        alpha *= 0.35;
+                    }
+                }
+            }
             // Labels under the inset would show through it.
             if let Some(r) = rect {
                 if x >= r[0] as f64
@@ -2715,9 +2814,55 @@ impl App {
         }));
     }
 
+    /// The screen-space triangles of `b`'s lit surfaces (canvas pixels, y down), or `None` when
+    /// there are none.
+    fn surface_cover(&self, b: &Built, aspect: f64, (w, h): (f64, f64), lift: f64) -> Option<SurfaceCover> {
+        let g = &b.geometry;
+        if g.indices.len() < 3 || !g.labels.iter().any(|l| l.axis <= 2) {
+            return None;
+        }
+        let m = self.rig.view_proj(aspect);
+        let o = self.rig.render_origin();
+        let d = [b.origin[0] - o[0], b.origin[1] - o[1], b.origin[2] - o[2]];
+        let pts: Vec<[f64; 2]> = g
+            .vertices
+            .iter()
+            .map(|v| {
+                let q = [
+                    v.pos[0] as f64 + d[0],
+                    v.pos[1] as f64 + d[1],
+                    (v.pos[2] as f64 + b.origin[2]) * lift - o[2],
+                ];
+                let c = |r: usize| m[0][r] * q[0] + m[1][r] * q[1] + m[2][r] * q[2] + m[3][r];
+                let cw = c(3);
+                if !(cw.abs() > 1e-12 && cw.is_finite()) {
+                    return [f64::NAN; 2];
+                }
+                [(c(0) / cw * 0.5 + 0.5) * w, (1.0 - (c(1) / cw * 0.5 + 0.5)) * h]
+            })
+            .collect();
+        let tris = g
+            .indices
+            .chunks_exact(3)
+            .filter_map(|t| {
+                let tri = [pts.get(t[0] as usize)?, pts.get(t[1] as usize)?, pts.get(t[2] as usize)?];
+                if tri.iter().any(|p| !p[0].is_finite() || !p[1].is_finite()) {
+                    return None;
+                }
+                Some([*tri[0], *tri[1], *tri[2]])
+            })
+            .collect();
+        let tris: Vec<[[f64; 2]; 3]> = tris;
+        let mut bounds = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+        for p in tris.iter().flatten() {
+            bounds = [bounds[0].min(p[0]), bounds[1].min(p[1]), bounds[2].max(p[0]), bounds[3].max(p[1])];
+        }
+        Some(SurfaceCover { tris, bounds })
+    }
+
     /// Tick labels and axis names of the slice inset, in canvas pixels (empty without one).
     pub fn inset_screen_labels(&self) -> Vec<ScreenLabel> {
-        let Some(p) = self.panel.as_ref().filter(|_| !self.rig.is_animating()) else {
+        let Some(p) = self.panel.as_ref().filter(|_| !self.rig.is_animating() && !self.inset_hidden) else {
             return Vec::new();
         };
         let r = p.rect;
@@ -2766,6 +2911,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn surface_cover_hides_ticks_inside_a_triangle_only() {
+        let c = SurfaceCover { tris: vec![[[0.0, 0.0], [100.0, 0.0], [0.0, 100.0]]], bounds: [0.0, 0.0, 100.0, 100.0] };
+        assert!(c.covers(2, "5", 20.0, 20.0));
+        assert!(!c.covers(2, "5", 90.0, 90.0));
+        // An x tick's text hangs below its anchor: the box centre, not the anchor, decides.
+        assert!(c.covers(0, "5", 20.0, 10.0));
+    }
+
     use super::*;
 
     fn app() -> App {
@@ -4815,6 +4969,23 @@ mod tests {
     }
 
     #[test]
+    fn hiding_the_inset_keeps_the_slice() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"s","latex":"x^2+y^2+z^2=4"}"#);
+        cmd(&mut a, r#"{"t":"setSlice","dim":2,"fixed":{"z":1}}"#);
+        a.frame(0.0);
+        a.frame(10_000.0);
+        assert!(a.inset().is_some());
+        cmd(&mut a, r#"{"t":"setSliceInset","show":false}"#);
+        assert!(a.inset().is_none() && a.inset_rect().is_none());
+        assert!(a.inset_screen_labels().is_empty());
+        assert!(a.doc.slice.is_some(), "the slice plane stays in the 3D scene");
+        cmd(&mut a, r#"{"t":"setSliceInset","show":true}"#);
+        assert!(a.inset().is_some());
+    }
+
+    #[test]
     fn set_slice_3d_plane_reports_state_and_shows_inset() {
         let mut a = app();
         cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
@@ -5248,8 +5419,8 @@ mod tests {
         );
         assert_eq!(a.rig.window(), before);
         // Elsewhere it still pans.
-        cmd(&mut a, r#"{"t":"pointer","phase":"down","x":100,"y":100}"#);
-        cmd(&mut a, r#"{"t":"pointer","phase":"move","x":60,"y":100}"#);
+        cmd(&mut a, r#"{"t":"pointer","phase":"down","x":500,"y":400}"#);
+        cmd(&mut a, r#"{"t":"pointer","phase":"move","x":460,"y":400}"#);
         assert_ne!(a.rig.window(), before);
     }
 
@@ -5313,9 +5484,9 @@ mod tests {
         assert!(v2[1] - v2[0] < 0.6 * (v1[1] - v1[0]), "{v1:?} -> {v2:?}");
         assert_eq!(a.rig.window(), main);
         // The main window moving does not move an explicit inset view.
-        cmd(&mut a, r#"{"t":"pointer","phase":"down","x":100,"y":100}"#);
-        cmd(&mut a, r#"{"t":"pointer","phase":"move","x":60,"y":100}"#);
-        cmd(&mut a, r#"{"t":"pointer","phase":"up","x":60,"y":100}"#);
+        cmd(&mut a, r#"{"t":"pointer","phase":"down","x":500,"y":400}"#);
+        cmd(&mut a, r#"{"t":"pointer","phase":"move","x":460,"y":400}"#);
+        cmd(&mut a, r#"{"t":"pointer","phase":"up","x":460,"y":400}"#);
         a.frame(3000.0);
         assert_eq!(a.panel.as_ref().unwrap().view, v2);
         // Double-click returns to following.

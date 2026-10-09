@@ -13,7 +13,7 @@ use math_core::Interval;
 
 /// Plane quad, cut line and outline colour.
 pub const SLICE_COLOR: [f32; 4] = [0.95, 0.58, 0.08, 1.0];
-const PLANE_ALPHA: f32 = 0.16;
+const PLANE_ALPHA: f32 = 0.07;
 const SLICE_CURVE_W: f32 = 4.5;
 const SLICE_DOT_W: f32 = 13.0;
 const INSET_CURVE_W: f32 = 2.5;
@@ -648,8 +648,11 @@ impl<'a> Builder<'a> {
                         self.quad4([corners[0], corners[i], corners[i + 1], corners[i + 1]], fill);
                     }
                 }
+                // Thin (never above 1.6x) and in front of the box edges it runs along, so the
+                // plane's rim stays one clean line at the heavy print weights.
+                let rim = 1.0 * self.ext.line_mul.min(1.6) / self.ext.line_mul;
                 for i in 0..corners.len() {
-                    self.seg(corners[i], corners[(i + 1) % corners.len()], 2.0, SLICE_COLOR);
+                    self.seg_front(corners[i], corners[(i + 1) % corners.len()], rim, SLICE_COLOR, 4.0e-4);
                 }
             }
             for (it, segs) in items.iter().zip(&geo.curves) {
@@ -734,20 +737,29 @@ pub struct PanelCtx<'a> {
     pub view: Option<&'a ViewReq>,
 }
 
-/// Inset rectangle `[x, y, w, h]` (top-left origin) for a canvas of `size`, bottom-right corner.
+/// Inset rectangle `[x, y, w, h]` (top-left origin) for a canvas of `size`, top-left corner (the
+/// right edge belongs to the floating controls, the bottom-left to the phone sheet's button, and
+/// the plane's lower-left corner would sit under a bottom inset). At most 24% of the canvas width
+/// and 140 x 105 px; on a narrow canvas (480 px or less) at most 96 x 72 px.
 pub fn inset_rect(size: (u32, u32)) -> [u32; 4] {
     let (cw, ch) = (size.0.max(1) as f64, size.1.max(1) as f64);
     let m = (0.015 * cw.min(ch)).clamp(6.0, 18.0);
-    let mut w = (0.34 * cw)
-        .clamp(180.0, 440.0)
+    let narrow = cw <= 480.0;
+    let mut w = (if narrow { 0.26 } else { 0.18 } * cw)
+        .min(140.0)
+        .max(if narrow { 0.0 } else { 108.0_f64.min(0.3 * cw) })
         .min((cw - 2.0 * m).max(40.0));
     let mut h = w * 0.75;
-    if h > ch * 0.6 {
-        h = (ch * 0.6).max(30.0);
+    if narrow {
+        w = w.min(96.0);
+        h = (w * 0.75).min(72.0);
+    }
+    if h > ch * 0.45 {
+        h = (ch * 0.45).max(30.0);
         w = (h / 0.75).min(w);
     }
-    let x = (cw - w - m).max(0.0);
-    let y = (ch - h - m).max(0.0);
+    let x = m.min((cw - w).max(0.0));
+    let y = m.min((ch - h).max(0.0));
     [x as u32, y as u32, w.max(1.0) as u32, h.max(1.0) as u32]
 }
 
@@ -1508,9 +1520,9 @@ mod tests {
         let p = &out.panel;
         assert_eq!(p.axes, ["x".to_string(), "y".to_string()]);
         assert_eq!((p.curves, p.points), (1, 0));
-        // Inside the canvas, bottom-right, 4:3.
+        // Inside the canvas, top-left, 4:3, at most 180 px wide.
         assert!(p.rect[0] + p.rect[2] <= 900 && p.rect[1] + p.rect[3] <= 600);
-        assert!(p.rect[0] > 450 && p.rect[1] > 300);
+        assert!(p.rect[0] < 450 && p.rect[1] < 100 && p.rect[2] <= 180);
         let ring: Vec<_> = p
             .geometry
             .segments
@@ -1533,7 +1545,7 @@ mod tests {
             .labels
             .iter()
             .any(|l| l.text == "y" && l.axis == 1));
-        assert!(p.geometry.labels.iter().any(|l| l.text == "1"));
+        assert!(p.geometry.labels.iter().any(|l| l.text.parse::<f64>().is_ok()));
         // An opaque background quad so it reads over the 3D scene.
         assert_eq!(p.geometry.flat_indices.len(), 6);
     }
@@ -1608,6 +1620,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn inset_rect_is_capped_and_top_left_anchored() {
+        let r = inset_rect((1600, 900));
+        assert!(r[2] <= 140 && r[3] <= 105 && r[0] < 100 && r[1] < 40, "{r:?}");
+        let r = inset_rect((375, 700));
+        assert!(r[2] <= 96 && r[3] <= 72 && r[0] < 40);
+        // clear of the sheet and its button along the bottom
+        assert!(r[1] < 40 && r[1] + r[3] + 200 <= 700, "{r:?}");
     }
 
     #[test]

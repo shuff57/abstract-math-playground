@@ -84,7 +84,7 @@ const MAX_POINT_PX: f32 = 48.0;
 const WEIGHT_MUL: [(Weight, f32, f32, f32); 3] = [
     (Weight::Normal, 1.0, 1.0, 1.0),
     (Weight::Bold, 1.6, 1.3, 1.5),
-    (Weight::Extra, 2.2, 1.5, 2.0),
+    (Weight::Extra, 2.2, 1.5, 1.8),
 ];
 /// The multipliers `(lines, grid, points)` of a print weight.
 pub(crate) fn weight_mul(w: Weight) -> (f32, f32, f32) {
@@ -136,6 +136,8 @@ const MAX_DASH_PIECES: usize = 50_000;
 const MAX_POINT_LABELS: usize = 100;
 /// Label axis code of item labels (`showLabel`): 0/1 are x/y ticks, 2 the z ticks, 3 a title.
 pub const ITEM_LABEL_AXIS: u8 = 4;
+/// The same label anchored up-left of its point (where the curve through the point rises).
+pub const ITEM_LABEL_LEFT_AXIS: u8 = 6;
 /// Segments of an open-circle point.
 const RING_SIDES: usize = 20;
 /// Label axis code of the angle labels of the polar grid's spokes.
@@ -548,6 +550,16 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// A weighted line pulled towards the camera by `bias` of NDC depth, so it wins against a
+    /// grid line or box edge drawn at the same place instead of z-fighting into dashes.
+    fn seg_front(&mut self, a: [f64; 3], b: [f64; 3], w: f32, color: [f32; 4], bias: f32) {
+        let n = self.out.segments.len();
+        self.seg(a, b, w, color);
+        if let Some(s) = self.out.segments.get_mut(n) {
+            *s = s.with_depth_bias(bias);
+        }
+    }
+
     fn dot(&mut self, p: [f64; 3], color: [f32; 4]) {
         self.dseg(p, DOT_W, color);
     }
@@ -648,6 +660,42 @@ impl<'a> Builder<'a> {
         }
         for w in pts.windows(2) {
             self.seg(w[0], w[1], st.line_w, st.color);
+        }
+    }
+
+    /// Moves a point's label to the up-left side ([`ITEM_LABEL_LEFT_AXIS`]) where a curve through
+    /// the point rises to the right, so the label never sits on the line (up-right otherwise).
+    fn flip_item_labels(&mut self) {
+        let k = self.px_per_unit();
+        let from = self.out.backdrop_segments.min(self.out.segments.len());
+        let curves: Vec<([f64; 2], [f64; 2])> = self.out.segments[from..]
+            .iter()
+            .filter(|s| s.p0 != s.p1)
+            .map(|s| {
+                (
+                    [(s.p0[0] as f64 + self.origin[0]) * k[0], (s.p0[1] as f64 + self.origin[1]) * k[1]],
+                    [(s.p1[0] as f64 + self.origin[0]) * k[0], (s.p1[1] as f64 + self.origin[1]) * k[1]],
+                )
+            })
+            .collect();
+        for l in self.out.labels.iter_mut().filter(|l| l.axis == ITEM_LABEL_AXIS) {
+            let c = [l.pos[0] * k[0], l.pos[1] * k[1]];
+            let mut slope = 0.0f64;
+            for (a, b) in &curves {
+                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                let len2 = dx * dx + dy * dy;
+                if len2 < 1e-12 {
+                    continue;
+                }
+                let t = (((c[0] - a[0]) * dx + (c[1] - a[1]) * dy) / len2).clamp(0.0, 1.0);
+                let d = (a[0] + t * dx - c[0]).hypot(a[1] + t * dy - c[1]);
+                if d <= 12.0 {
+                    slope += dx * dy / len2;
+                }
+            }
+            if slope > 1e-6 {
+                l.axis = ITEM_LABEL_LEFT_AXIS;
+            }
         }
     }
 
@@ -1359,7 +1407,9 @@ impl<'a> Builder<'a> {
             let mut b = c;
             a[axis] = lo[axis];
             b[axis] = hi[axis];
-            self.seg(a, b, AXIS_W, axis_c);
+            // Pulled well towards the camera so a slice plane or grid through the axis does not
+            // z-fight it (dashed gaps, white seams).
+            self.seg_front(a, b, AXIS_W, axis_c, 2.5e-3);
             self.axis_labels(axis as u8, steps[axis], c, axis != 0);
         }
     }
@@ -3229,7 +3279,14 @@ pub fn build_scene_mapped(
             .as_deref()
             .and_then(parse_hex_color)
             .unwrap_or(auto);
-        visible_idx += 1;
+        // A pinned point (a coloured, labelled single point) is painted in its source curve's
+        // colour and takes no palette slot, so pinning never recolours the rows after it.
+        let pinned = matches!(pr.kind, Kind::Point { .. })
+            && pr.item.color.is_some()
+            && pr.item.style.show_label;
+        if !pinned {
+            visible_idx += 1;
+        }
         b.out.item_colors.push((pr.item.id.clone(), color));
         if let Some(o) = pr.item.style.opacity {
             color[3] *= o.clamp(0.0, 1.0) as f32;
@@ -3373,6 +3430,7 @@ pub fn build_scene_mapped(
     b.out.diagnostics = diags;
     if mode == Mode::D2 {
         b.drop_covered_ticks();
+        b.flip_item_labels();
     }
     b.out
 }
@@ -5559,8 +5617,8 @@ mod tests {
         };
         assert!(near(pt(None, Weight::Normal), DOT_W));
         assert!(near(pt(None, Weight::Bold), DOT_W * 1.5));
-        assert!(near(pt(None, Weight::Extra), DOT_W * 2.0));
-        assert!(near(pt(Some(20.0), Weight::Extra), 40.0));
+        assert!(near(pt(None, Weight::Extra), DOT_W * 1.8));
+        assert!(near(pt(Some(20.0), Weight::Extra), 36.0));
         assert!(near(pt(Some(30.0), Weight::Extra), 48.0), "clamped to 48");
         assert!(near(pt(Some(60.0), Weight::Extra), 60.0), "never below the request");
         assert!(near(pt(Some(60.0), Weight::Normal), 60.0));
@@ -6148,6 +6206,24 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_point_takes_no_palette_slot_and_its_label_leans_away_from_a_rising_curve() {
+        let mut d = doc_with(&[("a", "y=x"), ("b", "(1,1)"), ("c", "y=2")]);
+        let before = build(&d, Mode::D2).item_colors.iter().find(|c| c.0 == "c").unwrap().1;
+        d.items[1].color = Some("#112233".into());
+        d.items[1].style.show_label = true;
+        let g = build(&d, Mode::D2);
+        let after = g.item_colors.iter().find(|c| c.0 == "c").unwrap().1;
+        assert_ne!(before, after, "an unpinned point holds a slot");
+        let mut plain = doc_with(&[("a", "y=x"), ("c", "y=2")]);
+        plain.items[1].id = "c".into();
+        let base = build(&plain, Mode::D2).item_colors.iter().find(|c| c.0 == "c").unwrap().1;
+        assert_eq!(base, after, "the later rows keep their colours");
+        // y = x rises to the right: the label of the point on it goes up-left.
+        let l = g.labels.iter().find(|l| l.text.contains('1') && l.axis >= 4 && l.axis != 5).unwrap();
+        assert_eq!(l.axis, ITEM_LABEL_LEFT_AXIS);
+    }
+
+    #[test]
     fn fill_opacity_scales_the_inequality_shading() {
         let g = build(&styled("y<x", |_| {}), Mode::D2);
         assert_eq!(g.fields[0].color[3], 1.0, "default unchanged");
@@ -6184,7 +6260,7 @@ mod tests {
         let pl = |g: &SceneGeometry| -> Vec<Label> {
             g.labels
                 .iter()
-                .filter(|l| l.axis == ITEM_LABEL_AXIS)
+                .filter(|l| l.axis == ITEM_LABEL_AXIS || l.axis == ITEM_LABEL_LEFT_AXIS)
                 .cloned()
                 .collect()
         };
