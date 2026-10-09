@@ -17,9 +17,10 @@ const PLANE_ALPHA: f32 = 0.18;
 /// Extra room around the slice curve when the inset auto-fits it.
 const INSET_FIT_PAD: f64 = 0.2;
 /// Weight of the cut (plane / surface intersection) in the main scene, before its halo.
-const CUT_MIN_W: f32 = 5.0;
-/// Extra width of the cut's plane-tinted halo (under the light halo and the dark ring).
-const CUT_TINT_HALO: f32 = 12.0;
+const CUT_MIN_W: f32 = 3.0;
+const CUT_MAX_W: f32 = 4.0;
+/// The cut: opaque dark navy, which separates from a surface of any hue and from the plane's orange.
+const CUT_COLOR: [f32; 4] = [0.07, 0.09, 0.22, 1.0];
 const SLICE_CURVE_W: f32 = 4.5;
 const SLICE_DOT_W: f32 = 13.0;
 const INSET_CURVE_W: f32 = 2.5;
@@ -664,28 +665,16 @@ impl<'a> Builder<'a> {
                 }
             }
             for (it, segs) in items.iter().zip(&geo.curves) {
-                // Three passes (light halo, dark outline, item colour) so the curve reads even on a
-                // surface of its own colour.
-                let mut ring = self.theme.axis;
-                ring[3] = 1.0;
-                let w = it.line_w.max(CUT_MIN_W);
-                let mut tint = SLICE_COLOR;
-                tint[3] = 0.55;
+                // One opaque 3-4 px line in the contrasting slice colour, pulled towards the camera, with a
+                // 1 px halo of the background colour: no dark groove, no white sliver.
+                let w = it.line_w.clamp(CUT_MIN_W, CUT_MAX_W);
                 for s in segs {
                     let (a, b) = (rs.lift(&s[0]), rs.lift(&s[1]));
-                    self.biased_seg(a, b, w + CUT_TINT_HALO, tint, CUT_BIAS);
+                    self.biased_seg(a, b, w + 2.0, halo, CUT_BIAS);
                 }
                 for s in segs {
                     let (a, b) = (rs.lift(&s[0]), rs.lift(&s[1]));
-                    self.biased_seg(a, b, w + 9.0, halo, CUT_BIAS);
-                }
-                for s in segs {
-                    let (a, b) = (rs.lift(&s[0]), rs.lift(&s[1]));
-                    self.biased_seg(a, b, w + 3.0, ring, CUT_BIAS);
-                }
-                for s in segs {
-                    let (a, b) = (rs.lift(&s[0]), rs.lift(&s[1]));
-                    self.biased_seg(a, b, w, it.color, CUT_BIAS);
+                    self.biased_seg(a, b, w, CUT_COLOR, CUT_BIAS);
                 }
             }
         } else if free.len() == 1 && in_window {
@@ -755,7 +744,7 @@ pub struct PanelCtx<'a> {
 /// Inset rectangle `[x, y, w, h]` (top-left origin) for a canvas of `size`, top-left corner (the
 /// right edge belongs to the floating controls, the bottom-left to the phone sheet's button, and
 /// the plane's lower-left corner would sit under a bottom inset). At most 24% of the canvas width
-/// and 180 x 180 px (square, so a round curve fills it); on a narrow canvas (480 px or less) 120 x 90 px (less only on a canvas too small for it).
+/// and 180 x 180 px (square, so a round curve fills it); on a narrow canvas (480 px or less) about 110 x 88 px, so it does not cover the scene (less only on a canvas too small for it).
 pub fn inset_rect(size: (u32, u32)) -> [u32; 4] {
     let (cw, ch) = (size.0.max(1) as f64, size.1.max(1) as f64);
     let m = (0.015 * cw.min(ch)).clamp(6.0, 18.0);
@@ -766,7 +755,7 @@ pub fn inset_rect(size: (u32, u32)) -> [u32; 4] {
         .min((cw - 2.0 * m).max(40.0));
     let mut h = w;
     if narrow {
-        w = (0.4 * cw).clamp(120.0, 160.0).min((cw - 2.0 * m).max(40.0));
+        w = (0.3 * cw).clamp(100.0, 110.0).min((cw - 2.0 * m).max(40.0));
         h = w * 0.8;
     }
     if h > ch * 0.45 {
@@ -1694,7 +1683,7 @@ mod tests {
         let r = inset_rect((1600, 900));
         assert!(r[2] <= 180 && r[3] <= 180 && r[3] >= 160 && r[0] < 100 && r[1] < 40, "{r:?}");
         let r = inset_rect((375, 700));
-        assert!(r[2] >= 140 && r[2] <= 160 && r[3] <= 128 && r[0] < 40, "{r:?}");
+        assert!(r[2] >= 100 && r[2] <= 110 && r[3] <= 90 && r[0] < 40, "{r:?}");
         // clear of the sheet and its button along the bottom
         assert!(r[1] < 40 && r[1] + r[3] + 200 <= 700, "{r:?}");
     }

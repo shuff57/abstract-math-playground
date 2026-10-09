@@ -434,7 +434,6 @@ struct Host {
     line_w: f32,
 }
 
-#[derive(Clone, Copy, PartialEq)]
 enum HostKind {
     /// `y = f(x)`.
     ExplicitY,
@@ -444,7 +443,13 @@ enum HostKind {
     Implicit,
     /// `r = f(theta)`.
     Polar,
+    /// `(x(t), y(t))` over `[t0, t1]`, the range the engine draws. `samples` (cached when the
+    /// host is built) are `PARAM_HOST_SAMPLES + 1` points `(t, x, y)` spread evenly over it.
+    Parametric { px: Program, py: Program, samples: Vec<[f64; 3]> },
 }
+
+/// Samples of a parametric host curve used to find the nearest point to a dot.
+const PARAM_HOST_SAMPLES: usize = 400;
 
 /// Dot diameter that goes with a line `line_w` px thick (the default 2.5 px line gives the default
 /// dot).
@@ -462,6 +467,13 @@ fn build_hosts(items: &[Prepared], defs: &Defs, angle: Angle) -> Vec<(String, Ho
             Kind::ExplicitX { rhs } => (defs.resolve(rhs).ok(), &["y"], HostKind::ExplicitX),
             Kind::Implicit { f } => (defs.resolve(f).ok(), &["x", "y"], HostKind::Implicit),
             Kind::Polar { rhs } => (defs.resolve(rhs).ok(), &["theta"], HostKind::Polar),
+            Kind::Parametric { components } if components.len() == 2 => {
+                // (the compiled `prog` is unused for this kind: the curve lives in the kind's own programs)
+                if let (Some(kind), Ok(prog)) = (parametric_host(components, &pr.domain, defs, angle), compile(&Expr::Num(0.0), &[], angle)) {
+                    out.push((pr.item.id.clone(), Host { prog, kind, line_w }));
+                }
+                continue;
+            }
             _ => continue,
         };
         if let Some(Ok(prog)) = e.map(|e| compile(&e, vars, angle)) {
@@ -469,6 +481,22 @@ fn build_hosts(items: &[Prepared], defs: &Defs, angle: Angle) -> Vec<(String, Ho
         }
     }
     out
+}
+
+/// The parametric host `(x(t), y(t))`: both components compiled, and `PARAM_HOST_SAMPLES + 1`
+/// samples over the `t` range the engine draws (`[0, 2 pi]` by default, or the item's `{a<=t<=b}`).
+fn parametric_host(components: &[Expr], domain: &[math_core::param::Range], defs: &Defs, angle: Angle) -> Option<HostKind> {
+    let turn = if angle == Angle::Deg { 360.0 } else { 2.0 * PI };
+    let [t0, t1] = range_values(domain, &["t"], "t", defs, angle, [0.0, turn]).ok()?;
+    let px = compile(&defs.resolve(&components[0]).ok()?, &["t"], angle).ok()?;
+    let py = compile(&defs.resolve(&components[1]).ok()?, &["t"], angle).ok()?;
+    let samples = (0..=PARAM_HOST_SAMPLES)
+        .map(|i| {
+            let t = t0 + (t1 - t0) * i as f64 / PARAM_HOST_SAMPLES as f64;
+            [t, px.eval(&[t]), py.eval(&[t])]
+        })
+        .collect();
+    Some(HostKind::Parametric { px, py, samples })
 }
 
 /// Which curve each point item lies on: `(point item id, curve item id)`, the first curve that
@@ -526,7 +554,7 @@ pub fn point_hosts(doc: &Doc, mode: Mode, win: Window3, px: (f64, f64)) -> Vec<(
 /// pixels per world unit.
 fn host_hit(h: &Host, w: [f64; 3], k: [f64; 3], angle: Angle) -> bool {
     let tol = h.line_w as f64 * 0.5 + 2.0;
-    match h.kind {
+    match &h.kind {
                 HostKind::ExplicitY => {
                     let y = h.prog.eval(&[w[0]]);
                     y.is_finite() && (y - w[1]).abs() * k[1] <= tol
@@ -543,6 +571,41 @@ fn host_hit(h: &Host, w: [f64; 3], k: [f64; 3], angle: Angle) -> bool {
                     // Distance in pixels: F / |grad F| with each axis scaled to pixels.
                     let g = (gx / k[0]).hypot(gy / k[1]);
                     f.is_finite() && g.is_finite() && g > 1e-12 && f.abs() / g <= tol
+                }
+                HostKind::Parametric { px, py, samples } => {
+                    // Nearest sample in pixels, then a local refinement of t between its neighbours.
+                    let dist = |x: f64, y: f64| ((x - w[0]) * k[0]).hypot((y - w[1]) * k[1]);
+                    let mut best = (f64::INFINITY, 0usize);
+                    for (i, s) in samples.iter().enumerate() {
+                        let d = dist(s[1], s[2]);
+                        if d < best.0 {
+                            best = (d, i);
+                        }
+                    }
+                    let (i0, i1) = (best.1.saturating_sub(1), (best.1 + 1).min(samples.len() - 1));
+                    // the true nearest point lies within one sample step of the best sample
+                    let step = {
+                        let c = samples[best.1];
+                        let d = |s: &[f64; 3]| ((s[1] - c[1]) * k[0]).hypot((s[2] - c[2]) * k[1]);
+                        d(&samples[i0]).max(d(&samples[i1]))
+                    };
+                    if !best.0.is_finite() || !step.is_finite() || best.0 > tol + step {
+                        return false;
+                    }
+                    let (mut lo, mut hi) = (samples[i0][0], samples[i1][0]);
+                    let at = |t: f64| {
+                        let d = dist(px.eval(&[t]), py.eval(&[t]));
+                        if d.is_finite() { d } else { f64::INFINITY }
+                    };
+                    for _ in 0..24 {
+                        let (a, b) = (lo + (hi - lo) / 3.0, hi - (hi - lo) / 3.0);
+                        if at(a) < at(b) {
+                            hi = b;
+                        } else {
+                            lo = a;
+                        }
+                    }
+                    best.0.min(at((lo + hi) / 2.0)) <= tol
                 }
                 HostKind::Polar => {
                     // r may be negative, and theta repeats: try theta and theta + pi.
@@ -6644,6 +6707,18 @@ mod tests {
         // A list: only the member on the curve follows (the biggest dot is the one on it).
         let both = size(&[("y=x^2", Some(8.0))], "[(1,1),(1,3)]", ItemKind::Points);
         assert!(both > base * 2.0);
+        // A parametric curve (cos t, sin t) over its default range [0, 2 pi]: (1, 0) is its start.
+        for pt in ["(1,0)", "(0,1)", "(-0.7071067811865476,0.7071067811865476)"] {
+            let thick = size(&[("(cos(t),sin(t))", Some(8.0))], pt, ItemKind::Points);
+            assert!(thick > base * 2.0, "{pt}: {thick}");
+            let thin = size(&[("(cos(t),sin(t))", Some(1.0))], pt, ItemKind::Points);
+            assert!(thin < base * 0.6, "{pt}: {thin}");
+        }
+        // Off the curve (inside the circle) and outside the t range: the default dot.
+        let off = size(&[("(cos(t),sin(t))", Some(8.0))], "(0.5,0)", ItemKind::Points);
+        assert!((off - base).abs() < 1e-3, "{off}");
+        let cut = size(&[("(cos(t),sin(t)) {0<=t<=1}", Some(8.0))], "(-1,0)", ItemKind::Points);
+        assert!((cut - base).abs() < 1e-3, "{cut}");
     }
 
     #[test]

@@ -1327,7 +1327,17 @@ impl App {
                     Ok(c) => {
                         // A slice makes the object the subject: a sphere of radius 3 should fill
                         // about a quarter of the scene, not a sliver (undone on clear).
-                        if mode == Mode::D3 && self.doc.slice.is_none() && !self.slice_zoomed {
+                        // (not for content that already fills the box, like a paraboloid in its z = -1..8 box: the
+                        // extra zoom would push its top out of view)
+                        let fills = self
+                            .current
+                            .as_ref()
+                            .and_then(|b| content_extent(&b.geometry, b.origin))
+                            .is_some_and(|(m, _)| {
+                                let w = self.rig.window();
+                                m >= 0.75 * w.min.iter().chain(w.max.iter()).fold(0.0f64, |a, v| a.max(v.abs()))
+                            });
+                        if mode == Mode::D3 && self.doc.slice.is_none() && !self.slice_zoomed && !fills {
                             self.rig.dolly(SLICE_ZOOM_3D);
                             self.slice_zoomed = true;
                             self.dirty = true;
@@ -3270,6 +3280,26 @@ mod tests {
         assert!(a.swap.is_none(), "no blend");
         cmd(&mut a, r#"{"t":"setLegacyTransition","on":false}"#);
         assert_eq!(a.rig.max_frame_dt_ms, MAX_FRAME_DT_MS);
+    }
+
+    #[test]
+    fn a_slice_does_not_zoom_in_on_content_that_fills_the_box() {
+        // a paraboloid fills its z = -1..8 box: the slice zoom would cut its top off
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"z=x^2+y^2"}"#);
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        a.frame(0.0);
+        run_until_refined(&mut a, 16.0);
+        cmd(&mut a, r#"{"t":"setSlice","dim":2,"fixed":{"y":0}}"#);
+        assert!(!a.slice_zoomed, "paraboloid zoomed");
+        // a small sphere still gets the zoom
+        let mut b = app();
+        cmd(&mut b, r#"{"t":"setExpr","id":"a","latex":"x^2+y^2+z^2=4"}"#);
+        cmd(&mut b, r#"{"t":"setMode","mode":"3d"}"#);
+        b.frame(0.0);
+        run_until_refined(&mut b, 16.0);
+        cmd(&mut b, r#"{"t":"setSlice","dim":2,"fixed":{"y":0}}"#);
+        assert!(b.slice_zoomed, "sphere not zoomed");
     }
 
     #[test]
