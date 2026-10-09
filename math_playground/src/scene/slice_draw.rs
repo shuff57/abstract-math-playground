@@ -15,7 +15,7 @@ use math_core::Interval;
 pub const SLICE_COLOR: [f32; 4] = [0.95, 0.58, 0.08, 1.0];
 const PLANE_ALPHA: f32 = 0.16;
 const SLICE_CURVE_W: f32 = 4.5;
-const SLICE_DOT_W: f32 = 10.0;
+const SLICE_DOT_W: f32 = 13.0;
 const INSET_CURVE_W: f32 = 2.5;
 /// Samples used to estimate the value range of a 1D graph.
 /// NDC depth the slice curves are pulled towards the camera.
@@ -594,8 +594,8 @@ impl<'a> Builder<'a> {
         halo[3] = 0.95;
         let mut ring = self.theme.axis;
         ring[3] = 1.0;
-        self.biased_seg(p, p, w + 3.0, halo, DEPTH_BIAS);
-        self.biased_seg(p, p, w + 1.5, ring, DEPTH_BIAS);
+        self.biased_seg(p, p, w + 4.0, halo, DEPTH_BIAS);
+        self.biased_seg(p, p, w + 2.5, ring, DEPTH_BIAS);
         self.biased_seg(p, p, w, color, DEPTH_BIAS);
     }
 
@@ -682,13 +682,13 @@ impl<'a> Builder<'a> {
             self.seg(rs.lift(&[lo[u]]), rs.lift(&[hi[u]]), 3.0, SLICE_COLOR);
             for (it, roots) in items.iter().zip(&geo.roots) {
                 for r in roots {
-                    self.halo_dot(rs.lift(&[*r]), it.color, SLICE_DOT_W);
+                    self.halo_dot(rs.lift(&[*r]), it.color, self.point_px(SLICE_DOT_W));
                 }
             }
         }
         for it in items {
             for p in &it.points {
-                self.halo_dot(*p, it.color, SLICE_DOT_W);
+                self.halo_dot(*p, it.color, self.point_px(SLICE_DOT_W));
             }
         }
     }

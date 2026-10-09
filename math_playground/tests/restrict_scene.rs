@@ -24,9 +24,9 @@ struct Drawn {
     g: SceneGeometry,
 }
 
-/// Width of an open marker's ring outline (just under the 2.5 px curve).
+/// Width of an open marker's ring outline (just under the 3.2 px curve).
 fn is_ring(w: f32) -> bool {
-    (w - 2.4).abs() < 0.02
+    (w - 3.0).abs() < 0.02
 }
 
 fn drawn(lines: &[&str]) -> Drawn {
@@ -188,7 +188,7 @@ fn endpoint_markers_are_larger_than_a_point_with_a_thick_ring() {
     let disc = d.g.segments.iter().find(|s| s.p0 == s.p1 && s.color == Theme::light().background && s.width > 8.0).unwrap();
     assert!(disc.width >= 12.0, "open marker diameter {}", disc.width);
     let ring = d.g.segments.iter().find(|s| is_ring(s.width) && s.p0 != s.p1).unwrap();
-    assert!((ring.width - 2.4).abs() < 0.02);
+    assert!((ring.width - 3.0).abs() < 0.02);
     let c = drawn(&["y=x^2 {x>=0}"]);
     let dot = c.g.segments.iter().find(|s| s.p0 == s.p1 && s.width > 8.0).unwrap();
     assert!(dot.width >= 12.0, "filled marker diameter {}", dot.width);

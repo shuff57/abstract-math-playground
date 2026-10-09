@@ -73,6 +73,12 @@ pub enum Command {
         id: String,
         hidden: bool,
     },
+    /// Selects a curve by item id (as a click on it does) so its special points are sent as
+    /// `analysis`; a null id clears the selection. For keyboard users, who cannot click.
+    SelectItem {
+        #[serde(default)]
+        id: Option<String>,
+    },
     SetColor {
         id: String,
         color: Option<String>,
@@ -926,6 +932,13 @@ impl App {
                     return;
                 }
                 self.mark_doc_changed();
+            }
+            Command::SelectItem { id } => {
+                let known = id.as_ref().is_none_or(|id| self.doc.items.iter().any(|i| &i.id == id));
+                if known && self.selected != id {
+                    self.selected = id;
+                    self.refresh_analysis();
+                }
             }
             Command::SetHidden { id, hidden } => {
                 if let Some(i) = self.doc.items.iter_mut().find(|i| i.id == id) {
@@ -3819,6 +3832,18 @@ mod tests {
     }
 
     #[test]
+    fn selecting_an_item_by_id_sends_its_special_points() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"y=x^2-4"}"#);
+        let ev = cmd(&mut a, r#"{"t":"selectItem","id":"a"}"#);
+        let an = analysis(&ev).expect("analysis sent");
+        assert_eq!(an["item"], "a");
+        assert!(!kinds(an, "root").is_empty(), "{an}");
+        let ev = cmd(&mut a, r#"{"t":"selectItem","id":null}"#);
+        assert_eq!(analysis(&ev).expect("cleared")["item"], serde_json::Value::Null);
+    }
+
+    #[test]
     fn a_picked_implicit_curve_lists_its_intersections() {
         let mut a = app();
         cmd(&mut a, r#"{"t":"setExpr","id":"c","latex":"x^2+y^2=25"}"#);
@@ -4320,7 +4345,7 @@ mod tests {
                 .geometry
                 .segments
                 .iter()
-                .filter(|s| s.p0 == s.p1 && s.width == 9.0)
+                .filter(|s| s.p0 == s.p1 && s.width == 12.0)
                 .count(),
             2
         );
@@ -4357,7 +4382,7 @@ mod tests {
                 .geometry
                 .segments
                 .iter()
-                .filter(|s| s.width == 9.0)
+                .filter(|s| s.width == 12.0)
                 .count(),
             0
         );
@@ -4394,7 +4419,7 @@ mod tests {
             r#"{"t":"addTable","id":"t","columns":["x_1","y_1","y_2"],"data":[[1,1,5],[2,2,6],[3,4,7]]}"#,
         );
         // Every y column is its own point set, each with its own palette colour.
-        assert_eq!(dots(&a, 9.0), 6);
+        assert_eq!(dots(&a, 12.0), 6);
         let colors = ev.iter().find(|e| e["t"] == "colors").expect("colors event");
         let color_of = |id: &str| {
             colors["items"]
@@ -4418,15 +4443,15 @@ mod tests {
         assert!(t["columns"][1].get("style").is_none(), "defaults are not echoed");
         let segs = a.layers()[0].geometry.segments.clone();
         let red = |s: &&crate::geometry::SegmentInstance| (s.color[0] - 0.78).abs() < 0.01 && s.color[1] < 0.3;
-        assert!(segs.iter().filter(red).any(|s| s.width == 2.5 && s.p0 != s.p1), "lines between the y_2 points");
-        assert!(segs.iter().filter(red).any(|s| s.p0 != s.p1 && s.width != 2.5), "square markers");
-        assert_eq!(dots(&a, 9.0), 3, "y_1 keeps its dots");
-        // Points off for y_1; an outline ring for y_2 (drawn as a larger background dot).
+        assert!(segs.iter().filter(red).any(|s| s.width == crate::scene::CURVE_W && s.p0 != s.p1), "lines between the y_2 points");
+        assert!(segs.iter().filter(red).any(|s| s.p0 != s.p1 && s.width != crate::scene::CURVE_W), "square markers");
+        assert_eq!(dots(&a, 12.0), 3, "y_1 keeps its dots");
+        // Points off for y_1; an outline ring for y_2 (a larger darker dot under the halo).
         cmd(&mut a, r#"{"t":"setTableColumnStyle","id":"t","col":1,"style":{"points":false}}"#);
-        assert_eq!(dots(&a, 9.0), 0);
+        assert_eq!(dots(&a, 12.0), 0);
         cmd(&mut a, r#"{"t":"setTableColumnStyle","id":"t","col":2,"style":{"outline":true,"pointStyle":null}}"#);
         assert_eq!(dots(&a, 14.0), 3);
-        assert_eq!(dots(&a, 18.0), 3);
+        assert_eq!(dots(&a, 22.0), 3);
         // Hidden draws nothing for that column; the lists stay defined.
         cmd(&mut a, r#"{"t":"setTableColumnStyle","id":"t","col":2,"style":{"hidden":true}}"#);
         assert_eq!(dots(&a, 14.0), 0);
@@ -4460,7 +4485,7 @@ mod tests {
         let t = ev.iter().find(|e| e["t"] == "table").expect("table event on load");
         assert_eq!(t["columns"][1]["style"]["lines"], true);
         assert_eq!(t["style"], "line", "legacy summary for old shells");
-        assert!(c.layers()[0].geometry.segments.iter().any(|s| s.p0 != s.p1 && s.width == 2.5 && s.color[3] > 0.9 && s.color[0] > 0.7));
+        assert!(c.layers()[0].geometry.segments.iter().any(|s| s.p0 != s.p1 && s.width == crate::scene::CURVE_W && s.color[3] > 0.9 && s.color[0] > 0.7));
     }
 
     #[test]

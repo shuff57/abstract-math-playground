@@ -540,7 +540,7 @@ mod tests {
         let g = build(&d, Mode::D2);
         assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
         // At a = 1 the tangent is y = 3x - 2: it crosses y = -2 at x = 0.
-        let hit = g.segments.iter().any(|s| s.p0[0].abs() < 0.2 && (s.p0[1] + 2.0).abs() < 0.2 && s.width == 2.5);
+        let hit = g.segments.iter().any(|s| s.p0[0].abs() < 0.2 && (s.p0[1] + 2.0).abs() < 0.2 && s.width == crate::scene::CURVE_W);
         assert!(hit, "tangent passes through (0, -2)");
     }
 
@@ -551,7 +551,7 @@ mod tests {
         let g = build(&d, Mode::D2);
         assert!(g.diagnostics.is_empty());
         // d/dx sin(x deg) = (pi/180) cos(x): tiny, so the curve hugs the x axis.
-        assert!(g.segments.iter().filter(|s| s.width == 2.5).all(|s| s.p0[1].abs() < 0.05));
+        assert!(g.segments.iter().filter(|s| s.width == crate::scene::CURVE_W).all(|s| s.p0[1].abs() < 0.05));
     }
 
     #[test]
@@ -589,7 +589,7 @@ mod tests {
         assert!((i.r2.unwrap() - 1.0).abs() < 1e-9 && i.rmse.unwrap() < 1e-9 && i.n == Some(5));
         assert!(i.latex.as_deref().unwrap().contains("approx"));
         // Curve + downstream item `y=a*x+b+1` (a, b defined by the visible regression).
-        assert!(g.segments.iter().filter(|s| s.width == 2.5).count() > 100);
+        assert!(g.segments.iter().filter(|s| s.width == crate::scene::CURVE_W).count() > 100);
         // The curve passes through (3, 7) and the downstream line through (3, 8).
         let near = |x: f32, y: f32| g.segments.iter().any(|s| (s.p0[0] - x).abs() < 0.1 && (s.p0[1] - y).abs() < 0.1);
         assert!(near(3.0, 7.0) && near(3.0, 8.0));
@@ -650,7 +650,7 @@ mod tests {
         assert!(build(&d, Mode::D1).diagnostics.is_empty());
         let g = build(&d, Mode::D3);
         assert!(g.diagnostics.is_empty());
-        assert!(g.segments.iter().any(|s| s.width == 2.5));
+        assert!(g.segments.iter().any(|s| s.width == crate::scene::CURVE_W));
     }
 
     #[test]
@@ -755,8 +755,8 @@ mod tests {
         let ink = Theme::light().axis;
         let c = g.item_colors.iter().find(|c| c.0 == "r").unwrap().1;
         assert_eq!(&c[..3], &ink[..3], "black regression line on a light theme");
-        assert!(g.segments.iter().any(|s| s.p0 != s.p1 && s.width == 2.5 && s.color[..3] == ink[..3]));
-        let dots = |g: &SceneGeometry| g.segments.iter().filter(|s| s.p0 == s.p1 && s.width == 9.0).count();
+        assert!(g.segments.iter().any(|s| s.p0 != s.p1 && s.width == crate::scene::CURVE_W && s.color[..3] == ink[..3]));
+        let dots = |g: &SceneGeometry| g.segments.iter().filter(|s| s.p0 == s.p1 && s.width == 12.0).count();
         let before = dots(&g);
         d.items.iter_mut().find(|i| i.id == "r").unwrap().style.residual_plot = true;
         let g = build(&d, Mode::D2);
@@ -765,7 +765,7 @@ mod tests {
         let ys: Vec<f32> = g
             .segments
             .iter()
-            .filter(|s| s.p0 == s.p1 && s.width == 9.0 && s.color[..3] == ink[..3])
+            .filter(|s| s.p0 == s.p1 && s.width == 12.0 && s.color[..3] == ink[..3])
             .map(|s| s.p0[1])
             .collect();
         assert_eq!(ys.len(), 4);

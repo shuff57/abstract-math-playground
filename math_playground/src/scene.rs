@@ -64,23 +64,27 @@ mod calc_draw;
 const MINOR_W: f32 = 1.0;
 const MAJOR_W: f32 = 1.5;
 const AXIS_W: f32 = 2.0;
-const CURVE_W: f32 = 2.5;
-const DOT_W: f32 = 9.0;
+pub(crate) const CURVE_W: f32 = 3.2;
+const DOT_W: f32 = 12.0;
 /// Range-endpoint markers are this much larger than a point of the same item, and their ring
 /// outline is [`MARKER_RING_W`] pixels (just under the curve width, so scene tests can tell them apart).
-const MARKER_SCALE: f32 = 1.35;
-const MARKER_RING_W: f32 = 2.4;
+const MARKER_SCALE: f32 = 1.4;
+const MARKER_RING_W: f32 = 3.0;
+/// Most pixels a marker may grow beyond a plain point of the same item (at the print weight).
+const MARKER_GROW_MAX: f32 = 6.0;
 /// Width of a table column's point outline ring (pixels on each side).
-const OUTLINE_W: f32 = 2.0;
+const OUTLINE_W: f32 = 2.5;
 const TICK_PX: f64 = 4.0;
+/// Background-coloured halo under every point (pixels on each side).
+const HALO_PX: f32 = 1.5;
 /// Largest point size (pixels) the print weight enlarges to.
-const MAX_POINT_PX: f32 = 40.0;
+const MAX_POINT_PX: f32 = 48.0;
 /// Print weight multipliers of (curve/axis/tick line widths, grid line widths, point sizes). The
 /// grid scales less than the curves so that "extra bold" does not bury the plot in grid.
 const WEIGHT_MUL: [(Weight, f32, f32, f32); 3] = [
     (Weight::Normal, 1.0, 1.0, 1.0),
-    (Weight::Bold, 1.6, 1.3, 1.3),
-    (Weight::Extra, 2.2, 1.5, 1.6),
+    (Weight::Bold, 1.6, 1.3, 1.5),
+    (Weight::Extra, 2.2, 1.5, 2.0),
 ];
 /// The multipliers `(lines, grid, points)` of a print weight.
 pub(crate) fn weight_mul(w: Weight) -> (f32, f32, f32) {
@@ -335,6 +339,8 @@ struct BuildExt {
     grid: bool,
     axes: bool,
     axis_numbers: bool,
+    /// 3D with a slice plane: every other tick label is dropped to keep the view clear.
+    sparse_labels: bool,
     minor_grid: bool,
     arrows: bool,
     /// Axis names (x, y) and fixed major steps (x, y) from the view.
@@ -367,6 +373,7 @@ impl Default for BuildExt {
             grid: true,
             axes: true,
             axis_numbers: true,
+            sparse_labels: false,
             minor_grid: true,
             arrows: false,
             axis_names: [None, None],
@@ -580,6 +587,48 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Drops axis tick labels (not the origin's "0") that a big dot (12 px or more) would sit on,
+    /// so numbers never vanish under a point or an endpoint marker.
+    fn drop_covered_ticks(&mut self) {
+        let k = self.px_per_unit();
+        let dots: Vec<([f64; 2], f64)> = self
+            .out
+            .segments
+            .iter()
+            .filter(|s| s.p0 == s.p1 && s.width >= DOT_W)
+            .map(|s| {
+                (
+                    [
+                        (s.p0[0] as f64 + self.origin[0]) * k[0],
+                        (s.p0[1] as f64 + self.origin[1]) * k[1],
+                    ],
+                    s.width as f64 * 0.5,
+                )
+            })
+            .collect();
+        if dots.is_empty() {
+            return;
+        }
+        self.out.labels.retain(|l| {
+            if l.axis > 1 || l.text == "0" {
+                return true;
+            }
+            let (w, h) = (l.text.chars().count() as f64 * 7.5, 13.0);
+            let (px, py) = (l.pos[0] * k[0], l.pos[1] * k[1]);
+            // The label box in pixels (y up), as the overlay anchors it.
+            let (x0, x1, y0, y1) = if l.axis == 0 {
+                (px - w / 2.0, px + w / 2.0, py - 5.0 - h, py - 5.0)
+            } else {
+                (px - 6.0 - w, px - 6.0, py - h / 2.0, py + h / 2.0)
+            };
+            !dots.iter().any(|(c, r)| {
+                let dx = c[0].clamp(x0, x1) - c[0];
+                let dy = c[1].clamp(y0, y1) - c[1];
+                dx * dx + dy * dy < r * r
+            })
+        });
+    }
+
     fn polyline(&mut self, pts: &[[f64; 3]], st: Style) {
         if self.ext.world_in && !self.ext.map.is_linear() {
             // World points on logarithmic axes: straight in display space between mapped points;
@@ -692,18 +741,36 @@ impl<'a> Builder<'a> {
         let k = self.px_per_unit();
         let off = |dx: f64, dy: f64| [p[0] + dx / k[0], p[1] + dy / k[1], p[2]];
         match (st.point, self.ext.mode) {
-            (PointStyle::Dot, _) | (_, Mode::D3) => self.seg_raw(p, p, size as f32, st.color),
-            (PointStyle::Circle, _) => self.ring(p, size, (size * 0.22).max(1.5), st.color),
+            (PointStyle::Dot, _) | (_, Mode::D3) => {
+                if self.ext.mode != Mode::D3 {
+                    self.seg_raw(p, p, size as f32 + 2.0 * HALO_PX, self.theme.background);
+                }
+                self.seg_raw(p, p, size as f32, st.color)
+            }
+            (PointStyle::Circle, _) => {
+                let rw = (size * 0.28).max(2.5);
+                let bg = self.theme.background;
+                self.ring(p, size + 2.0 * HALO_PX as f64, rw + 2.0 * HALO_PX as f64, bg);
+                self.ring(p, size, rw, st.color);
+            }
             (PointStyle::Cross, _) => {
-                let cw = (size * 0.22).max(1.5);
+                let cw = (size * 0.28).max(2.5);
                 let h = ((size - cw) * 0.5).max(0.5);
+                let bg = self.theme.background;
+                for (a, b) in [(off(-h, -h), off(h, h)), (off(-h, h), off(h, -h))] {
+                    self.seg_raw(a, b, cw as f32 + 2.0 * HALO_PX, bg);
+                }
                 self.seg_raw(off(-h, -h), off(h, h), cw as f32, st.color);
                 self.seg_raw(off(-h, h), off(h, -h), cw as f32, st.color);
             }
             (PointStyle::Square, _) => {
-                let sw = (size * 0.18).max(1.5);
+                let sw = (size * 0.24).max(2.5);
                 let h = ((size - sw) * 0.5).max(0.5);
                 let c = [off(-h, -h), off(h, -h), off(h, h), off(-h, h), off(-h, -h)];
+                let bg = self.theme.background;
+                for w in c.windows(2) {
+                    self.seg_raw(w[0], w[1], sw as f32 + 2.0 * HALO_PX, bg);
+                }
                 for w in c.windows(2) {
                     self.seg_raw(w[0], w[1], sw as f32, st.color);
                 }
@@ -1308,6 +1375,9 @@ impl<'a> Builder<'a> {
             if skip_zero && k == 0 {
                 continue;
             }
+            if self.ext.sparse_labels && k % 2 != 0 {
+                continue;
+            }
             let mut p = anchor;
             p[a] = v;
             // The polar grid numbers distances from the origin: positive on both sides.
@@ -1628,7 +1698,10 @@ impl<'a> Builder<'a> {
         for m in marks {
             // Larger than a plain point and, for the ring, a thicker outline: an endpoint must
             // read at a glance on a projector.
-            let size = self.point_px(st.point_size * MARKER_SCALE);
+            // Capped so the Extra weight's marker does not swallow neighbouring tick labels.
+            let size = self
+                .point_px(st.point_size * MARKER_SCALE)
+                .min(self.point_px(st.point_size) + MARKER_GROW_MAX * self.ext.scale);
             let p = self.ext.map.fwd3([m.pos[0], m.pos[1], 0.0]);
             if !p.iter().all(|v| v.is_finite()) {
                 continue;
@@ -2393,12 +2466,17 @@ impl<'a> Builder<'a> {
             }
         }
         if cs.points {
-            let bg = self.theme.background;
             for p in pts {
                 if mode != Mode::D1 || (p[0] >= self.win.min[0] && p[0] <= self.win.max[0]) {
                     if cs.outline {
-                        let ow = 2.0 * OUTLINE_W * self.ext.line_mul;
-                        self.seg_raw(p, p, self.point_px(st.point_size) + ow, bg);
+                        // A darker ring of the column's own colour round the halo, so table dots
+                        // read apart from plain point items (a background ring would vanish).
+                        let ow = 2.0 * (OUTLINE_W * self.ext.line_mul + HALO_PX);
+                        let mut dark = st.color;
+                        for c in &mut dark[..3] {
+                            *c *= 0.55;
+                        }
+                        self.seg_raw(p, p, self.point_px(st.point_size) + ow, dark);
                     }
                     self.point(p, st);
                 }
@@ -3112,6 +3190,7 @@ pub fn build_scene_mapped(
             grid: doc.view.grid,
             axes: doc.view.axes,
             axis_numbers: doc.view.axis_numbers,
+            sparse_labels: mode == Mode::D3 && doc.slice.is_some(),
             minor_grid: doc.view.minor_grid,
             arrows: doc.view.arrows,
             axis_names: [doc.view.x_label.clone(), doc.view.y_label.clone()],
@@ -3292,6 +3371,9 @@ pub fn build_scene_mapped(
         }
     }
     b.out.diagnostics = diags;
+    if mode == Mode::D2 {
+        b.drop_covered_ticks();
+    }
     b.out
 }
 
@@ -4752,7 +4834,7 @@ mod tests {
     fn dots(g: &SceneGeometry, mode: Mode, origin: [f64; 3]) -> Vec<[f64; 3]> {
         g.segments[base_len(mode)..]
             .iter()
-            .filter(|s| s.p0 == s.p1 && s.width == DOT_W)
+            .filter(|s| s.p0 == s.p1 && s.width == DOT_W && s.color != Theme::light().background)
             .map(|s| {
                 [
                     s.p0[0] as f64 + origin[0],
@@ -5324,7 +5406,7 @@ mod tests {
         d.items[0].table.as_mut().unwrap().apply_table_style(TableStyle::Line);
         let g = build(&d, Mode::D2);
         let n_line = g.segments.len() - base_len(Mode::D2);
-        assert_eq!(n_line, 3 + 2, "three dots and two joining segments");
+        assert_eq!(n_line, 3 * 2 + 2, "three dots with their halos and two joining segments");
         d.items[0].table.as_mut().unwrap().apply_table_style(TableStyle::Hidden);
         assert!(content(&build(&d, Mode::D2), Mode::D2).is_empty());
     }
@@ -5393,7 +5475,12 @@ mod tests {
 
     /// Item segments (after the grid and axes) and their total length in world units.
     fn item_segs(g: &SceneGeometry, mode: Mode) -> (Vec<SegmentInstance>, f64) {
-        let v: Vec<SegmentInstance> = g.segments[base_len(mode)..].to_vec();
+        let bg = Theme::light().background;
+        let v: Vec<SegmentInstance> = g.segments[base_len(mode)..]
+            .iter()
+            .filter(|s| s.color != bg)
+            .copied()
+            .collect();
         let len = v
             .iter()
             .map(|s| {
@@ -5465,16 +5552,16 @@ mod tests {
         let pt = |size: Option<f64>, w| {
             let d = weighted(styled("(1,2)", |s| s.point_size = size), w);
             let g = build(&d, Mode::D2);
-            let dots: Vec<f32> = g.segments.iter().filter(|s| s.p0 == s.p1 && s.width > 4.0)
+            let dots: Vec<f32> = g.segments.iter().filter(|s| s.p0 == s.p1 && s.width > 4.0 && s.color != Theme::light().background)
                 .map(|s| s.width).collect();
             assert_eq!(dots.len(), 1, "{dots:?}");
             dots[0]
         };
         assert!(near(pt(None, Weight::Normal), DOT_W));
-        assert!(near(pt(None, Weight::Bold), DOT_W * 1.3));
-        assert!(near(pt(None, Weight::Extra), DOT_W * 1.6));
-        assert!(near(pt(Some(20.0), Weight::Extra), 32.0));
-        assert!(near(pt(Some(30.0), Weight::Extra), 40.0), "clamped to 40");
+        assert!(near(pt(None, Weight::Bold), DOT_W * 1.5));
+        assert!(near(pt(None, Weight::Extra), DOT_W * 2.0));
+        assert!(near(pt(Some(20.0), Weight::Extra), 40.0));
+        assert!(near(pt(Some(30.0), Weight::Extra), 48.0), "clamped to 48");
         assert!(near(pt(Some(60.0), Weight::Extra), 60.0), "never below the request");
         assert!(near(pt(Some(60.0), Weight::Normal), 60.0));
         // A dashed curve keeps its dash-to-width proportions: fewer, thicker dashes.
@@ -5561,17 +5648,17 @@ mod tests {
         d.items[0].style.line_style = Some(LineStyle::Dashed);
         let (dashed, _) = item_segs(&build(&d, Mode::D2), Mode::D2);
         let dashes: Vec<_> = dashed.iter().filter(|s| s.p0 != s.p1).collect();
-        // 10 units = 400 px; at width 2.5 the visible dash is 8 px and the visible gap 5 px, so
-        // the period is 13 px: 31 dashes.
-        assert!((30..=32).contains(&dashes.len()), "{}", dashes.len());
+        // 10 units = 400 px; at width 3.2 the dashes are proportionally longer, so
+        // there are about 25 dashes.
+        assert!((24..=26).contains(&dashes.len()), "{}", dashes.len());
         let on = (dashes[0].p1[0] - dashes[0].p0[0]) as f64 * 40.0;
         assert!(
-            (on - 5.5).abs() < 1e-3,
-            "visible dash 8 px = 5.5 px + caps: {on}"
+            (on - 6.4).abs() < 1e-3,
+            "dash scales with the line width: {on}"
         );
-        // Geometric gap between consecutive dashes: 13 - 5.5 = 7.5 px (5 px visible).
+        // Geometric gap between consecutive dashes (scaled with the line width).
         let gap = (dashes[1].p0[0] - dashes[0].p1[0]) as f64 * 40.0;
-        assert!((gap - 7.5).abs() < 1e-3, "{gap}");
+        assert!((gap - 9.6).abs() < 1e-3, "{gap}");
     }
 
     #[test]
@@ -5791,7 +5878,7 @@ mod tests {
         let dots: Vec<[f32; 3]> = g
             .segments
             .iter()
-            .filter(|s| s.p0 == s.p1)
+            .filter(|s| s.p0 == s.p1 && s.color != Theme::light().background)
             .map(|s| s.p0)
             .collect();
         let want = map.fwd3([10.0, 100.0, 0.0]);
@@ -6012,7 +6099,7 @@ mod tests {
             }),
             Mode::D2,
         );
-        assert!(dist(px(&g)[0].p0) > 2.5 * r0);
+        assert!(dist(px(&g)[0].p0) > 2.0 * r0);
         // Cross: two diagonals through the point.
         let g = build(
             &styled("(1,2)", |s| s.point_style = Some(PointStyle::Cross)),
