@@ -712,6 +712,11 @@ pub struct App {
     inset_hidden: bool,
     /// The 3D view was moved closer when the slice came on (undone when it goes).
     slice_zoomed: bool,
+    /// The 3D box has not been touched since the document / mode was set up, so the first build
+    /// with content may shrink the default cube to the content (see [`fit_default_cube`]).
+    fit3d: bool,
+    /// The window is the auto-fitted z = -1..5 one: an edit that draws below it gets the +-5 cube.
+    low_z_fit: bool,
     /// Last `Slice` event sent, so it is only repeated when it changes.
     last_slice: Option<Event>,
     /// Explicit inset view (`None` follows the main window).
@@ -785,6 +790,52 @@ fn view_mode(m: doc::Mode) -> Mode {
 /// framing leaves it near half).
 const FIT_3D: f64 = 1.35;
 
+/// Largest distance from the origin of any item geometry (lit surfaces and item curves or dots,
+/// not the grid, axes, slice overlay or flat plane), in world coordinates. `None` when nothing
+/// is drawn.
+/// Also returns the lowest `z` drawn.
+fn content_extent(g: &SceneGeometry, origin: [f64; 3]) -> Option<(f64, f64)> {
+    let mut m: f64 = 0.0;
+    let mut zmin = f64::INFINITY;
+    let mut upd = |p: [f32; 3]| {
+        for a in 0..3 {
+            let v = p[a] as f64 + origin[a];
+            if v.is_finite() {
+                m = m.max(v.abs());
+                if a == 2 {
+                    zmin = zmin.min(v);
+                }
+            }
+        }
+    };
+    for &i in &g.indices {
+        if let Some(v) = g.vertices.get(i as usize) {
+            upd(v.pos);
+        }
+    }
+    for s in g.segments.iter().skip(g.backdrop_segments) {
+        upd(s.p0);
+        upd(s.p1);
+    }
+    (m > 0.0).then_some((m, zmin))
+}
+
+/// The default +-10 cube shrunk to +-5 for content that fits well inside it; any other window
+/// (the document set its own) is left alone. A surface that stays on or above the `xy` plane
+/// (a paraboloid) gets `z` in -1..8, so its bowl (z = x^2+y^2 reaches 8 at r = 2.8) and the plane fit under the box top.
+fn fit_default_cube(w: Window3, (extent, zmin): (f64, f64)) -> Option<Window3> {
+    let default = w.min.iter().all(|v| *v == -10.0) && w.max.iter().all(|v| *v == 10.0);
+    if !(default && (extent < 5.0 || extent >= 9.9)) {
+        return None;
+    }
+    let mut c = Window3::new([-5.0; 3], [5.0; 3]);
+    if zmin >= -1e-6 {
+        c.min[2] = -1.0;
+        c.max[2] = 8.0;
+    }
+    Some(c)
+}
+
 /// Extra dolly while a 3D slice is active.
 const SLICE_ZOOM_3D: f64 = 1.25;
 
@@ -834,6 +885,8 @@ impl App {
             panel: None,
             inset_hidden: false,
             slice_zoomed: false,
+            fit3d: true,
+            low_z_fit: false,
             last_slice: None,
             slice_view: None,
             inset_drag: None,
@@ -1538,6 +1591,7 @@ impl App {
         self.doc = d;
         self.log_entry = None;
         self.frame_world_window(w);
+        self.fit3d = true;
         self.prev = None;
         self.swap = None;
         self.ticker_running = false;
@@ -2105,6 +2159,9 @@ impl App {
             return;
         }
         self.slice_view = None;
+        if mode == Mode::D3 {
+            self.fit3d = true;
+        }
         // Logarithmic axes are 2D only: the shared window changes coordinates with the mode.
         if !self.map.is_linear() {
             let w = self.world_window();
@@ -2182,6 +2239,7 @@ impl App {
                 }
             }
             "down" => {
+                self.fit3d = false;
                 self.inset_drag = None;
                 self.last_hover = None;
                 let point = if button == 0 && !shift {
@@ -2539,6 +2597,25 @@ impl App {
         });
         self.dirty = false;
         self.redraw = true;
+        if mode == Mode::D3 && self.fit3d && self.map.is_linear() {
+            if let Some(b) = self.current.as_ref().and_then(|b| content_extent(&b.geometry, b.origin)) {
+                self.fit3d = false;
+                if let Some(w) = fit_default_cube(self.rig.window(), b) {
+                    self.low_z_fit = w.min[2] == -1.0;
+                    self.rig.set_window(w);
+                    self.rebuild_with(preview);
+                }
+            }
+        } else if mode == Mode::D3 && self.low_z_fit {
+            let w = self.rig.window();
+            let low = (w.min, w.max) == ([-5.0, -5.0, -1.0], [5.0, 5.0, 8.0]);
+            self.low_z_fit = low;
+            if low && self.current.as_ref().and_then(|b| content_extent(&b.geometry, b.origin)).is_some_and(|(_, z)| z < -1.0 + 1e-3) {
+                self.low_z_fit = false;
+                self.rig.set_window(Window3::new([-5.0; 3], [5.0; 3]));
+                self.rebuild_with(preview);
+            }
+        }
     }
 
     /// Rebuilds the slice inset and reports the slice state when it changed.
@@ -3179,6 +3256,21 @@ mod tests {
     }
 
     #[test]
+    fn default_cube_shrinks_only_for_small_content() {
+        let d = Window3::new([-10.0; 3], [10.0; 3]);
+        assert_eq!(fit_default_cube(d, (3.0, -3.0)), Some(Window3::new([-5.0; 3], [5.0; 3])));
+        assert_eq!(fit_default_cube(d, (7.0, -7.0)), None);
+        assert!(fit_default_cube(d, (10.0, -10.0)).is_some(), "content clipped by the box");
+        assert_eq!(fit_default_cube(Window3::new([-4.0; 3], [4.0; 3]), (1.0, -1.0)), None);
+        let bowl = fit_default_cube(d, (10.0, 0.0)).unwrap();
+        assert_eq!((bowl.min, bowl.max), ([-5.0, -5.0, -1.0], [5.0, 5.0, 8.0]), "non-negative surface");
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"x^2+y^2+z^2=4"}"#);
+        cmd(&mut a, r#"{"t":"setMode","mode":"3d"}"#);
+        assert_eq!(a.rig.window().max, [5.0; 3]);
+    }
+
+    #[test]
     fn a_resize_during_the_switch_does_not_block_on_the_full_build() {
         let mut a = app();
         cmd(&mut a, r#"{"t":"setExpr","id":"a","latex":"x^2+y^2+z^2=9"}"#);
@@ -3188,7 +3280,9 @@ mod tests {
         // The stage is laid out differently in 3D: the canvas is resized right after the switch.
         cmd(&mut a, r#"{"t":"resize","width":700,"height":520}"#);
         assert!(a.refine, "resize rebuilt at full quality in the command");
-        assert!(a.current.as_ref().unwrap().geometry.indices.len() < 2000, "first look expected");
+        let n = a.current.as_ref().unwrap().geometry.indices.len();
+        let full_n = crate::scene::build_scene(&a.doc, Mode::D3, a.scene_window(), a.rig.render_origin(), a.size, &a.theme).indices.len();
+        assert!(n < full_n / 2, "first look expected, got {n} of {full_n}");
         run_until_refined(&mut a, 16.0);
         assert!(!a.refine);
         let full = crate::scene::build_scene(&a.doc, Mode::D3, a.scene_window(), a.rig.render_origin(), a.size, &a.theme);

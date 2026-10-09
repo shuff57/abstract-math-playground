@@ -798,6 +798,9 @@ impl<'a> Builder<'a> {
             (PointStyle::Circle, _) => {
                 let rw = (size * 0.28).max(2.5);
                 let bg = self.theme.background;
+                // Opaque interior: an open point stands for a missing value, so the curve, axes
+                // and grid under it must not show through.
+                self.seg_raw(p, p, size as f32, bg);
                 self.ring(p, size + 2.0 * HALO_PX as f64, rw + 2.0 * HALO_PX as f64, bg);
                 self.ring(p, size, rw, st.color);
             }
@@ -816,6 +819,12 @@ impl<'a> Builder<'a> {
                 let h = ((size - sw) * 0.5).max(0.5);
                 let c = [off(-h, -h), off(h, -h), off(h, h), off(-h, h), off(-h, -h)];
                 let bg = self.theme.background;
+                // Opaque interior (see the circle): rows of the square, ends hidden by the outline.
+                let rows = (2.0 * h).ceil().max(1.0) as usize;
+                for i in 0..=rows {
+                    let dy = -h + 2.0 * h * i as f64 / rows as f64;
+                    self.seg_raw(off(-h, dy), off(h, dy), 1.6, bg);
+                }
                 for w in c.windows(2) {
                     self.seg_raw(w[0], w[1], sw as f32 + 2.0 * HALO_PX, bg);
                 }
@@ -6158,6 +6167,20 @@ mod tests {
             Mode::D2,
         );
         assert!(dist(px(&g)[0].p0) > 2.0 * r0);
+        // Open circle and square hide what is under them (a missing value): a background-coloured
+        // fill covers the centre.
+        for style in [PointStyle::Circle, PointStyle::Square] {
+            let g = build(&styled("(1,2)", |s| s.point_style = Some(style)), Mode::D2);
+            let bg = Theme::light().background;
+            let filled = g.segments.iter().any(|s| {
+                s.color == bg
+                    && (s.p0[1] - s.p1[1]).abs() < 1e-6
+                    && s.p0[0].min(s.p1[0]) <= 1.0 + 1e-6
+                    && s.p0[0].max(s.p1[0]) >= 1.0 - 1e-6
+                    && (s.p0[1] - 2.0).abs() < 4.0 / 30.0
+            });
+            assert!(filled, "{style:?} has an opaque interior");
+        }
         // Cross: two diagonals through the point.
         let g = build(
             &styled("(1,2)", |s| s.point_style = Some(PointStyle::Cross)),

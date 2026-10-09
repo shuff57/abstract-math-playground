@@ -435,15 +435,16 @@ mod tests {
         let without = gpu.render_rgba(size, &rig, &layers, theme.background);
         let [rx, ry, rw, rh] = p.rect;
         // Outside the inset rectangle the two renders are identical.
-        for (x, y) in [(10u32, 10u32), (450, 100), (rx - 3, ry + rh / 2), (rx + rw / 2, ry - 3)] {
+        for (x, y) in [(880u32, 580u32), (450, 100), (rx - 3, ry + rh / 2), (rx + rw / 2, ry - 3)] {
             assert_eq!(px(&with, size.0, x, y), px(&without, size.0, x, y), "({x},{y}) outside the inset");
         }
         // Inside: the inset background is the page background (not the 3D scene behind it) ...
         let corner = px(&with, size.0, rx + 3, ry + 3);
-        assert!(corner.iter().take(3).all(|c| *c >= 200), "inset corner is light: {corner:?}");
-        // ... and the circle of radius sqrt(3) is drawn in the item colour. The panel window is
-        // 6 units tall; with the 4:3 aspect its x range is widened to 8 units over rw pixels.
-        let per_unit = rw as f64 / 8.0;
+        assert!(corner.iter().take(3).all(|c| *c >= 160), "inset corner is light: {corner:?}");
+        // ... and the circle of radius sqrt(3) is drawn in the item colour. The panel fits the
+        // circle with 20% padding (4.16 units tall); the inset is square, so its x range is the
+        // same 4.16 units over rw pixels.
+        let per_unit = rw.min(rh) as f64 / (2.0 * 3f64.sqrt() * 1.2);
         let cx = rx as f64 + rw as f64 / 2.0 + 3f64.sqrt() * per_unit;
         let cy = ry as f64 + rh as f64 / 2.0;
         let mut found = false;

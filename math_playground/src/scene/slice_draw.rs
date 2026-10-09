@@ -13,13 +13,21 @@ use math_core::Interval;
 
 /// Plane quad, cut line and outline colour.
 pub const SLICE_COLOR: [f32; 4] = [0.95, 0.58, 0.08, 1.0];
-const PLANE_ALPHA: f32 = 0.07;
+const PLANE_ALPHA: f32 = 0.18;
+/// Extra room around the slice curve when the inset auto-fits it.
+const INSET_FIT_PAD: f64 = 0.2;
+/// Weight of the cut (plane / surface intersection) in the main scene, before its halo.
+const CUT_MIN_W: f32 = 5.0;
+/// Extra width of the cut's plane-tinted halo (under the light halo and the dark ring).
+const CUT_TINT_HALO: f32 = 12.0;
 const SLICE_CURVE_W: f32 = 4.5;
 const SLICE_DOT_W: f32 = 13.0;
 const INSET_CURVE_W: f32 = 2.5;
 /// Samples used to estimate the value range of a 1D graph.
 /// NDC depth the slice curves are pulled towards the camera.
 const DEPTH_BIAS: f32 = 1.0e-3;
+/// Stronger pull for the cut so it is not broken up where it grazes the surface.
+const CUT_BIAS: f32 = 6.0e-3;
 const RANGE_SAMPLES: usize = 600;
 /// Highlight of the intervals of a line slice where an inequality holds.
 const INTERVAL_W: f32 = 9.0;
@@ -615,7 +623,7 @@ impl<'a> Builder<'a> {
         let win = self.win;
         let (lo, hi) = (win.min, win.max);
         let mut halo = self.theme.background;
-        halo[3] = 0.9;
+        halo[3] = 1.0;
         // A sloped plane is drawn as its section of the window (a fan of triangles).
         let section = rs.plane.map(|pl| pl.section(lo, hi));
         let in_window = match &section {
@@ -650,7 +658,7 @@ impl<'a> Builder<'a> {
                 }
                 // Thin (never above 1.6x) and in front of the box edges it runs along, so the
                 // plane's rim stays one clean line at the heavy print weights.
-                let rim = 1.0 * self.ext.line_mul.min(1.6) / self.ext.line_mul;
+                let rim = 2.0 * self.ext.line_mul.min(1.6) / self.ext.line_mul;
                 for i in 0..corners.len() {
                     self.seg_front(corners[i], corners[(i + 1) % corners.len()], rim, SLICE_COLOR, 4.0e-4);
                 }
@@ -660,17 +668,24 @@ impl<'a> Builder<'a> {
                 // surface of its own colour.
                 let mut ring = self.theme.axis;
                 ring[3] = 1.0;
+                let w = it.line_w.max(CUT_MIN_W);
+                let mut tint = SLICE_COLOR;
+                tint[3] = 0.55;
                 for s in segs {
                     let (a, b) = (rs.lift(&s[0]), rs.lift(&s[1]));
-                    self.biased_seg(a, b, it.line_w + 3.0, halo, DEPTH_BIAS);
+                    self.biased_seg(a, b, w + CUT_TINT_HALO, tint, CUT_BIAS);
                 }
                 for s in segs {
                     let (a, b) = (rs.lift(&s[0]), rs.lift(&s[1]));
-                    self.biased_seg(a, b, it.line_w + 1.5, ring, DEPTH_BIAS);
+                    self.biased_seg(a, b, w + 9.0, halo, CUT_BIAS);
                 }
                 for s in segs {
                     let (a, b) = (rs.lift(&s[0]), rs.lift(&s[1]));
-                    self.biased_seg(a, b, it.line_w, it.color, DEPTH_BIAS);
+                    self.biased_seg(a, b, w + 3.0, ring, CUT_BIAS);
+                }
+                for s in segs {
+                    let (a, b) = (rs.lift(&s[0]), rs.lift(&s[1]));
+                    self.biased_seg(a, b, w, it.color, CUT_BIAS);
                 }
             }
         } else if free.len() == 1 && in_window {
@@ -740,19 +755,19 @@ pub struct PanelCtx<'a> {
 /// Inset rectangle `[x, y, w, h]` (top-left origin) for a canvas of `size`, top-left corner (the
 /// right edge belongs to the floating controls, the bottom-left to the phone sheet's button, and
 /// the plane's lower-left corner would sit under a bottom inset). At most 24% of the canvas width
-/// and 140 x 105 px; on a narrow canvas (480 px or less) at most 96 x 72 px.
+/// and 180 x 180 px (square, so a round curve fills it); on a narrow canvas (480 px or less) 120 x 90 px (less only on a canvas too small for it).
 pub fn inset_rect(size: (u32, u32)) -> [u32; 4] {
     let (cw, ch) = (size.0.max(1) as f64, size.1.max(1) as f64);
     let m = (0.015 * cw.min(ch)).clamp(6.0, 18.0);
     let narrow = cw <= 480.0;
-    let mut w = (if narrow { 0.26 } else { 0.18 } * cw)
-        .min(140.0)
+    let mut w = (if narrow { 0.26 } else { 0.24 } * cw)
+        .min(180.0)
         .max(if narrow { 0.0 } else { 108.0_f64.min(0.3 * cw) })
         .min((cw - 2.0 * m).max(40.0));
-    let mut h = w * 0.75;
+    let mut h = w;
     if narrow {
-        w = w.min(96.0);
-        h = (w * 0.75).min(72.0);
+        w = (0.4 * cw).clamp(120.0, 160.0).min((cw - 2.0 * m).max(40.0));
+        h = w * 0.8;
     }
     if h > ch * 0.45 {
         h = (ch * 0.45).max(30.0);
@@ -823,19 +838,39 @@ pub fn build_panel(
         .unwrap_or((win.min[u], win.max[u]));
     let (vc, k, v_lo_s, v_hi_s);
     let view;
+    let fit = if two_d && req.is_none() {
+        let g = compute(rs, items, &win, (pw, ph), angle);
+        curve_fit(&g, free[0], free[1], &win)
+    } else {
+        None
+    };
     if two_d {
         let v = free[1];
         match req {
             Some(r) => vc = 0.5 * (r[2] + r[3]),
             None => {
                 let (v0, v1) = (win.min[v], win.max[v]);
-                let need_u = (v1 - v0) * aspect;
-                if need_u > u1 - u0 {
-                    let c = 0.5 * (u0 + u1);
-                    u0 = c - need_u / 2.0;
-                    u1 = c + need_u / 2.0;
+                if let Some(f) = fit {
+                    // Auto-fit: centre on the curve, ~20% padding, never wider than the window.
+                    u0 = f[0];
+                    u1 = f[1];
+                    vc = 0.5 * (f[2] + f[3]);
+                    let (fv0, fv1) = (f[2], f[3]);
+                    let need_u = (fv1 - fv0) * aspect;
+                    if need_u > u1 - u0 {
+                        let c = 0.5 * (u0 + u1);
+                        u0 = c - need_u / 2.0;
+                        u1 = c + need_u / 2.0;
+                    }
+                } else {
+                    let need_u = (v1 - v0) * aspect;
+                    if need_u > u1 - u0 {
+                        let c = 0.5 * (u0 + u1);
+                        u0 = c - need_u / 2.0;
+                        u1 = c + need_u / 2.0;
+                    }
+                    vc = 0.5 * (v0 + v1);
                 }
-                vc = 0.5 * (v0 + v1);
             }
         }
         k = 1.0;
@@ -1097,6 +1132,37 @@ impl Builder<'_> {
 
 /// Window handed to `compute` for the panel: free-axis ranges in WORLD (unscaled) values (for a
 /// 1D slice only the horizontal range matters).
+/// `[u0, u1, v0, v1]` hugging every slice curve with [`INSET_FIT_PAD`] around it, clamped to the
+/// window. `None` when nothing is drawn or the curve already spans the window.
+fn curve_fit(geo: &SliceGeo, u: usize, v: usize, win: &Window3) -> Option<[f64; 4]> {
+    let mut e = [f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY];
+    for s in geo.curves.iter().flatten() {
+        for p in s {
+            if p[0].is_finite() && p[1].is_finite() {
+                e[0] = e[0].min(p[0]);
+                e[1] = e[1].max(p[0]);
+                e[2] = e[2].min(p[1]);
+                e[3] = e[3].max(p[1]);
+            }
+        }
+    }
+    if !(e[0] <= e[1] && e[2] <= e[3]) {
+        return None;
+    }
+    let span = (e[1] - e[0]).max(e[3] - e[2]);
+    if !(span > 1e-9) {
+        return None;
+    }
+    let (cu, cv) = (0.5 * (e[0] + e[1]), 0.5 * (e[2] + e[3]));
+    let hu = ((e[1] - e[0]) * 0.5 * (1.0 + INSET_FIT_PAD)).max(span * 0.1);
+    let hv = ((e[3] - e[2]) * 0.5 * (1.0 + INSET_FIT_PAD)).max(span * 0.1);
+    let (wu, wv) = (win.max[u] - win.min[u], win.max[v] - win.min[v]);
+    if hu * 2.0 >= wu && hv * 2.0 >= wv {
+        return None;
+    }
+    Some([cu - hu, cu + hu, cv - hv, cv + hv])
+}
+
 fn win_for_panel(
     win: &Window3,
     free: &[usize],
@@ -1625,11 +1691,22 @@ mod tests {
     #[test]
     fn inset_rect_is_capped_and_top_left_anchored() {
         let r = inset_rect((1600, 900));
-        assert!(r[2] <= 140 && r[3] <= 105 && r[0] < 100 && r[1] < 40, "{r:?}");
+        assert!(r[2] <= 180 && r[3] <= 180 && r[3] >= 160 && r[0] < 100 && r[1] < 40, "{r:?}");
         let r = inset_rect((375, 700));
-        assert!(r[2] <= 96 && r[3] <= 72 && r[0] < 40);
+        assert!(r[2] >= 140 && r[2] <= 160 && r[3] <= 128 && r[0] < 40, "{r:?}");
         // clear of the sheet and its button along the bottom
         assert!(r[1] < 40 && r[1] + r[3] + 200 <= 700, "{r:?}");
+    }
+
+    #[test]
+    fn paraboloid_ellipse_fills_the_inset() {
+        let d = doc_with(&["z=x^2+y^2"], "z=7.84", Mode::D3);
+        let w = Window3::new([-5.0, -5.0, -1.0], [5.0, 5.0, 8.0]);
+        let p = panel_of(&d, Mode::D3, w, None);
+        let (du, dv) = (p.view[1] - p.view[0], p.view[3] - p.view[2]);
+        let aspect = p.rect[2] as f64 / p.rect[3] as f64;
+        assert!((du / dv - aspect).abs() < 1e-6, "equal scale on both axes");
+        assert!(5.6 / du > 0.6, "the r = 2.8 curve fills over 60% of the width: {du}");
     }
 
     #[test]
