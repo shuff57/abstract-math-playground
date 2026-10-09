@@ -420,15 +420,131 @@ struct TableData<'a> {
 /// line grows and shrinks with the line's width.
 struct Host {
     prog: Program,
-    /// `y = f(x)` (one input) or `F(x, y) = 0` (two inputs).
-    explicit: bool,
+    kind: HostKind,
     line_w: f32,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum HostKind {
+    /// `y = f(x)`.
+    ExplicitY,
+    /// `x = g(y)`.
+    ExplicitX,
+    /// `F(x, y) = 0`.
+    Implicit,
+    /// `r = f(theta)`.
+    Polar,
 }
 
 /// Dot diameter that goes with a line `line_w` px thick (the default 2.5 px line gives the default
 /// dot).
 fn dot_for_line(line_w: f32) -> f32 {
     (line_w * (DOT_W / CURVE_W)).clamp(4.0, 36.0)
+}
+
+/// The 2D curves that points can lie on, with their item ids.
+fn build_hosts(items: &[Prepared], defs: &Defs, angle: Angle) -> Vec<(String, Host)> {
+    let mut out = Vec::new();
+    for pr in items.iter().filter(|p| !p.item.hidden) {
+        let line_w = pr.item.style.line_width.map(|w| w as f32).unwrap_or(CURVE_W);
+        let (e, vars, kind): (Option<Expr>, &[&str], HostKind) = match &pr.kind {
+            Kind::ExplicitY { rhs } => (defs.resolve(rhs).ok(), &["x"], HostKind::ExplicitY),
+            Kind::ExplicitX { rhs } => (defs.resolve(rhs).ok(), &["y"], HostKind::ExplicitX),
+            Kind::Implicit { f } => (defs.resolve(f).ok(), &["x", "y"], HostKind::Implicit),
+            Kind::Polar { rhs } => (defs.resolve(rhs).ok(), &["theta"], HostKind::Polar),
+            _ => continue,
+        };
+        if let Some(Ok(prog)) = e.map(|e| compile(&e, vars, angle)) {
+            out.push((pr.item.id.clone(), Host { prog, kind, line_w }));
+        }
+    }
+    out
+}
+
+/// Which curve each point item lies on: `(point item id, curve item id)`, the first curve that
+/// any of its points touches. The UI uses it to tie a point's size to its curve's thickness.
+/// `px` is the canvas size in pixels (2D, linear axes only; anything else gives nothing).
+pub fn point_hosts(doc: &Doc, mode: Mode, win: Window3, px: (f64, f64)) -> Vec<(String, String)> {
+    if mode != Mode::D2 {
+        return Vec::new();
+    }
+    let doc = &*with_folders_applied(doc);
+    let mut diags = Vec::new();
+    let (items, defs, _, _, _) = prepare_fitted(doc, &mut diags);
+    let angle = match doc.view.angle {
+        AngleMode::Rad => Angle::Rad,
+        AngleMode::Deg => Angle::Deg,
+    };
+    let hosts = build_hosts(&items, &defs, angle);
+    let win = win.sanitized();
+    let (vw, vh) = (px.0.max(1.0), px.1.max(1.0));
+    let k = [vw / (win.max[0] - win.min[0]).max(1e-300), vh / (win.max[1] - win.min[1]).max(1e-300), 1.0];
+    let eval = |c: &[Expr]| -> Option<[f64; 3]> {
+        if c.len() != 2 {
+            return None;
+        }
+        let mut v = [0.0; 3];
+        for (i, e) in c.iter().enumerate() {
+            let r = defs.resolve(e).ok()?;
+            v[i] = compile(&r, &[], angle).ok()?.eval(&[]);
+        }
+        v.iter().all(|x| x.is_finite()).then_some(v)
+    };
+    let mut out = Vec::new();
+    for pr in items.iter().filter(|p| !p.item.hidden) {
+        let pts: Vec<[f64; 3]> = match &pr.kind {
+            Kind::Point { components } => eval(components).into_iter().collect(),
+            Kind::List { items } => items
+                .iter()
+                .filter_map(|e| if let Expr::Tuple(c) = e { eval(c) } else { None })
+                .collect(),
+            _ => continue,
+        };
+        'host: for (hid, h) in &hosts {
+            for p in &pts {
+                if host_hit(h, *p, k, angle) {
+                    out.push((pr.item.id.clone(), hid.clone()));
+                    break 'host;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// True when world point `w` lies on the host curve (within its half width plus 2 px); `k` is
+/// pixels per world unit.
+fn host_hit(h: &Host, w: [f64; 3], k: [f64; 3], angle: Angle) -> bool {
+    let tol = h.line_w as f64 * 0.5 + 2.0;
+    match h.kind {
+                HostKind::ExplicitY => {
+                    let y = h.prog.eval(&[w[0]]);
+                    y.is_finite() && (y - w[1]).abs() * k[1] <= tol
+                }
+                HostKind::ExplicitX => {
+                    let x = h.prog.eval(&[w[1]]);
+                    x.is_finite() && (x - w[0]).abs() * k[0] <= tol
+                }
+                HostKind::Implicit => {
+                    let f = h.prog.eval(&[w[0], w[1]]);
+                    let e = 1e-5 * (1.0 + w[0].abs().max(w[1].abs()));
+                    let gx = (h.prog.eval(&[w[0] + e, w[1]]) - h.prog.eval(&[w[0] - e, w[1]])) / (2.0 * e);
+                    let gy = (h.prog.eval(&[w[0], w[1] + e]) - h.prog.eval(&[w[0], w[1] - e])) / (2.0 * e);
+                    // Distance in pixels: F / |grad F| with each axis scaled to pixels.
+                    let g = (gx / k[0]).hypot(gy / k[1]);
+                    f.is_finite() && g.is_finite() && g > 1e-12 && f.abs() / g <= tol
+                }
+                HostKind::Polar => {
+                    // r may be negative, and theta repeats: try theta and theta + pi.
+                    let (r, th) = (w[0].hypot(w[1]), w[1].atan2(w[0]));
+                    let unit = if angle == Angle::Deg { 180.0 / PI } else { 1.0 };
+                    let kk = k[0].min(k[1]);
+                    [(th, r), (th + PI, -r)].iter().any(|(t, rr)| {
+                        let f = h.prog.eval(&[t * unit]);
+                        f.is_finite() && (f - rr).abs() * kk <= tol
+                    })
+                }
+            }
 }
 
 struct Builder<'a> {
@@ -808,19 +924,7 @@ impl<'a> Builder<'a> {
         let k = self.px_per_unit();
         let mut best: Option<f32> = None;
         for h in &self.hosts {
-            let tol = h.line_w as f64 * 0.5 + 2.0;
-            let on = if h.explicit {
-                let y = h.prog.eval(&[w[0]]);
-                y.is_finite() && (y - w[1]).abs() * k[1] <= tol
-            } else {
-                let f = h.prog.eval(&[w[0], w[1]]);
-                let e = 1e-5 * (1.0 + w[0].abs().max(w[1].abs()));
-                let gx = (h.prog.eval(&[w[0] + e, w[1]]) - h.prog.eval(&[w[0] - e, w[1]])) / (2.0 * e);
-                let gy = (h.prog.eval(&[w[0], w[1] + e]) - h.prog.eval(&[w[0], w[1] - e])) / (2.0 * e);
-                // Distance in pixels: F / |grad F| with each axis scaled to pixels.
-                let g = (gx / k[0]).hypot(gy / k[1]);
-                f.is_finite() && g.is_finite() && g > 1e-12 && f.abs() / g <= tol
-            };
+            let on = host_hit(h, w, k, self.angle);
             if on && best.is_none_or(|b| h.line_w > b) {
                 best = Some(h.line_w);
             }
@@ -2592,7 +2696,11 @@ impl<'a> Builder<'a> {
                         for c in &mut dark[..3] {
                             *c *= 0.55;
                         }
-                        self.seg_raw(p, p, self.point_px(st.point_size) + ow, dark);
+                        let sz = match (st.auto_size, self.host_line_w(p)) {
+                            (true, Some(w)) => dot_for_line(w),
+                            _ => st.point_size,
+                        };
+                        self.seg_raw(p, p, self.point_px(sz) + ow, dark);
                     }
                     self.point(p, st);
                 }
@@ -3329,17 +3437,7 @@ pub fn build_scene_mapped(
     b.out.infos = calc_draw::collect_infos(&items, &fits, &defs, &pdefs, b.angle);
     b.pdefs = pdefs;
     if mode == Mode::D2 && map.is_linear() {
-        for pr in items.iter().filter(|p| !p.item.hidden) {
-            let line_w = pr.item.style.line_width.map(|w| w as f32).unwrap_or(CURVE_W);
-            let (e, vars, explicit): (Option<Expr>, &[&str], bool) = match &pr.kind {
-                Kind::ExplicitY { rhs } => (defs.resolve(rhs).ok(), &["x"], true),
-                Kind::Implicit { f } => (defs.resolve(f).ok(), &["x", "y"], false),
-                _ => continue,
-            };
-            if let Some(Ok(prog)) = e.map(|e| compile(&e, vars, b.angle)) {
-                b.hosts.push(Host { prog, explicit, line_w });
-            }
-        }
+        b.hosts = build_hosts(&items, &defs, b.angle).into_iter().map(|(_, h)| h).collect();
     }
     let mut visible_idx = 0usize;
     for pr in items.iter().filter(|p| !p.item.hidden) {
@@ -6470,6 +6568,43 @@ mod tests {
         // Off the curve, or with its own size, nothing follows.
         assert_eq!(width_of_point(Some(6.0), "(1,3)", None), DOT_W);
         assert_eq!(width_of_point(Some(6.0), "(1,1)", Some(20.0)), 20.0);
+    }
+
+    #[test]
+    fn points_follow_every_kind_of_curve_and_list_and_table_dots() {
+        let size = |curves: &[(&str, Option<f64>)], pts: &str, kind: ItemKind| -> f32 {
+            let mut d = Doc::new_default();
+            for (i, (l, w)) in curves.iter().enumerate() {
+                let mut it = Item::new(&format!("c{i}"), ItemKind::Equation, l);
+                it.style.line_width = *w;
+                d.items.push(it);
+            }
+            d.items.push(Item::new("p", kind, pts));
+            let g = build(&d, Mode::D2);
+            g.segments.iter().filter(|s| s.p0 == s.p1).map(|s| s.width).fold(0.0, f32::max) - 2.0 * HALO_PX
+        };
+        let base = DOT_W;
+        for (curve, pt) in [("y=x^2", "(1,1)"), ("x=y^2", "(1,1)"), ("x^2+y^2=2", "(1,1)"), ("r=2", "(2,0)")] {
+            let thick = size(&[(curve, Some(8.0))], pt, ItemKind::Points);
+            assert!(thick > base * 2.0, "{curve}: {thick}");
+            let thin = size(&[(curve, Some(1.0))], pt, ItemKind::Points);
+            assert!(thin < base * 0.6, "{curve}: {thin}");
+        }
+        // A list: only the member on the curve follows (the biggest dot is the one on it).
+        let both = size(&[("y=x^2", Some(8.0))], "[(1,1),(1,3)]", ItemKind::Points);
+        assert!(both > base * 2.0);
+    }
+
+    #[test]
+    fn point_hosts_names_the_curve_each_point_lies_on() {
+        let mut d = Doc::new_default();
+        d.items.push(Item::new("c", ItemKind::Equation, "y=x^2"));
+        d.items.push(Item::new("on", ItemKind::Points, "(1,1)"));
+        d.items.push(Item::new("off", ItemKind::Points, "(1,3)"));
+        let w = Window3::new([-10.0, -10.0, -1.0], [10.0, 10.0, 1.0]);
+        let h = point_hosts(&d, Mode::D2, w, (800.0, 800.0));
+        assert_eq!(h, vec![("on".to_string(), "c".to_string())]);
+        assert!(point_hosts(&d, Mode::D3, w, (800.0, 800.0)).is_empty());
     }
 
 }
