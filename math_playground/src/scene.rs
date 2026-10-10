@@ -156,6 +156,18 @@ pub const POLAR_LABEL_AXIS: u8 = 5;
 const MAX_CIRCLES: usize = 200;
 /// Message of an item that cannot be drawn on logarithmic axes.
 pub const LOG_UNSUPPORTED: &str = "not available on a logarithmic axis";
+/// Message of an item that cannot be drawn when the x and y scales differ (`freeAspect`).
+pub const STRETCH_UNSUPPORTED: &str =
+    "not available while the axes have different scales (turn off Independent axis scales)";
+
+/// The "not available ..." tail for `map`: logarithmic axes, or axes stretched by `freeAspect`.
+pub fn axes_unsupported(map: &AxisMap) -> &'static str {
+    if map.log[0] || map.log[1] {
+        LOG_UNSUPPORTED
+    } else {
+        STRETCH_UNSUPPORTED
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Nice spacing and number formatting
@@ -3680,7 +3692,7 @@ pub fn build_scene_mapped(
         let seg0 = b.out.segments.len();
         if !map.is_linear() {
             if let Some(why) = log_unsupported(pr) {
-                diags.push((pr.item.id.clone(), format!("{why} {LOG_UNSUPPORTED}")));
+                diags.push((pr.item.id.clone(), format!("{why} {}", axes_unsupported(&map))));
                 b.end_item_labels(&pr.item.style, seg0);
                 continue;
             }
@@ -3688,7 +3700,12 @@ pub fn build_scene_mapped(
         if !pr.domain.is_empty() && restrictable(pr) && mode != Mode::D2 {
             diags.push((pr.item.id.clone(), "a {range} on x or y restricts curves in 2D only".into()));
         } else if !pr.domain.is_empty() && restrictable(pr) && !map.is_linear() {
-            diags.push((pr.item.id.clone(), "a {range} on x or y needs linear axes".into()));
+            let why = if map.log[0] || map.log[1] {
+                "a {range} on x or y needs linear axes"
+            } else {
+                "a {range} on x or y needs equal x and y scales (turn off Independent axis scales)"
+            };
+            diags.push((pr.item.id.clone(), why.into()));
         } else if !pr.domain.is_empty()
             && !restrictable(pr)
             && !matches!(pr.kind, Kind::Parametric { .. } | Kind::Polar { .. })
@@ -4136,6 +4153,8 @@ pub enum CoordSrc {
     Slider(String),
     /// A plain numeric definition item (`a=3`): rewrite that item.
     Def { item: String, name: String },
+    /// A cell of a table (row `row` of column `col`): rewrite that cell.
+    Cell { item: String, col: usize, row: usize },
     /// Anything else (a formula): stays where it is.
     Fixed,
 }
@@ -4453,7 +4472,7 @@ pub fn shape_lines(c: &ShapeCurve, win: Window3, vp: (f64, f64)) -> Vec<Vec<[f64
 pub fn point_handles(doc: &Doc) -> Vec<PointHandle> {
     let doc = &*with_folders_applied(doc);
     let mut diags = Vec::new();
-    let (items, defs, _, _) = prepare(doc, &mut diags);
+    let (items, defs, _, tables) = prepare(doc, &mut diags);
     let angle = match doc.view.angle {
         AngleMode::Rad => Angle::Rad,
         AngleMode::Deg => Angle::Deg,
@@ -4469,6 +4488,40 @@ pub fn point_handles(doc: &Doc) -> Vec<PointHandle> {
         }
     }
     let mut out = Vec::new();
+    // Table points of columns with `drag` on: rows whose x and y cells are plain numbers.
+    for t in tables.iter().filter(|t| !t.item.hidden) {
+        let Some(tb) = &t.item.table else { continue };
+        if tb.columns.first().is_none_or(|c| c.formula.is_some()) {
+            continue;
+        }
+        for (ci, col) in tb.columns.iter().enumerate().skip(1) {
+            let st = &col.style;
+            if !st.drag || st.hidden || !st.points || col.formula.is_some() {
+                continue;
+            }
+            for row in 0..t.cols[0].cells.len().min(t.cols[ci].cells.len()) {
+                let (Some(x), Some(y)) = (&t.cols[0].cells[row], &t.cols[ci].cells[row]) else {
+                    continue;
+                };
+                let (Some(xv), Some(yv)) = (literal_number(x), literal_number(y)) else {
+                    continue;
+                };
+                let item = t.item.id.clone();
+                out.push(PointHandle {
+                    id: item.clone(),
+                    pos: [xv, yv],
+                    src: [
+                        CoordSrc::Cell { item: item.clone(), col: 0, row },
+                        CoordSrc::Cell { item, col: ci, row },
+                    ],
+                    text: [
+                        math_core::print::to_text(x),
+                        math_core::print::to_text(y),
+                    ],
+                });
+            }
+        }
+    }
     for p in items
         .iter()
         .filter(|p| !p.item.hidden && p.complex.is_none())
@@ -5424,6 +5477,31 @@ mod tests {
             Mode::D1,
         );
         assert_eq!(dots(&g, Mode::D1, [0.0; 3]).len(), 6);
+    }
+
+    #[test]
+    fn a_stretched_view_explains_what_it_cannot_draw_in_its_own_words() {
+        let mut d = doc_with(&[("r", "y=x^2 {x>0}"), ("v", "(-y, x)")]);
+        d.view.free_aspect = true;
+        d.view.window.min = [-10.0, -1000.0, -1.0];
+        d.view.window.max = [10.0, 1000.0, 1.0];
+        let vp = (800, 600);
+        let map = doc_map(&d, Mode::D2, vp);
+        let g = build_scene(&d, Mode::D2, map.to_display(&d.view.window), [0.0; 3], vp, &Theme::light());
+        let msg = |id: &str| g.diagnostics.iter().find(|(i, _)| i == id).map(|(_, m)| m.clone());
+        let r = msg("r").expect("range diagnostic");
+        assert!(r.contains("equal x and y scales") && !r.contains("linear axes"), "{r}");
+        let v = msg("v").expect("vector field diagnostic");
+        assert!(v.contains("different scales") && !v.contains("logarithmic"), "{v}");
+        // logarithmic axes keep their own wording
+        let mut l = doc_with(&[("r", "y=x^2 {x>0}")]);
+        l.view.x_scale = math_core::doc::AxisScale::Log;
+        l.view.window.min = [0.1, -5.0, -1.0];
+        l.view.window.max = [100.0, 5.0, 1.0];
+        let m = doc_map(&l, Mode::D2, vp);
+        let g = build_scene(&l, Mode::D2, m.to_display(&l.view.window), [0.0; 3], vp, &Theme::light());
+        let r = g.diagnostics.iter().find(|(i, _)| i == "r").map(|(_, m)| m.as_str()).unwrap_or("");
+        assert!(r.contains("linear axes"), "{r}");
     }
 
     #[test]

@@ -92,9 +92,12 @@ pub struct ColumnStyle {
     /// A thin background-coloured ring around each point.
     #[serde(default, skip_serializing_if = "is_false")]
     pub outline: bool,
-    // TODO(drag): Desmos also has a per-column "Drag" toggle (move table points on the canvas,
-    // writing the new values back into the cells). Not implemented yet; it needs a drag handle
-    // per table point in `math_playground::app` and a `setCell` write-back.
+    /// The column's points can be dragged on the canvas; the new values are written back into
+    /// the cells (only rows whose x and y cells are plain numbers move). Left out of the JSON
+    /// schema: the workspace writes it.
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub drag: bool,
 }
 
 impl Default for ColumnStyle {
@@ -108,13 +111,14 @@ impl Default for ColumnStyle {
             point_size: None,
             opacity: None,
             outline: false,
+            drag: false,
         }
     }
 }
 
 /// Keys accepted by [`ColumnStyle::merge`] (camelCase, as serialised).
-pub const COLUMN_STYLE_KEYS: [&str; 8] =
-    ["color", "hidden", "points", "lines", "pointStyle", "pointSize", "opacity", "outline"];
+pub const COLUMN_STYLE_KEYS: [&str; 9] =
+    ["color", "hidden", "points", "lines", "pointStyle", "pointSize", "opacity", "outline", "drag"];
 
 impl ColumnStyle {
     pub fn is_default(&self) -> bool {

@@ -483,6 +483,10 @@ pub enum Event {
         columns: Vec<Column>,
         rows: usize,
         style: String,
+        /// True when a drag of a table point on the canvas caused it (the shell records the
+        /// undo step, which it does itself for its own table commands).
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        drag: bool,
     },
     /// The pointer is over a curve `y = f(x)` (2D only): `item` is its id and `(x, y)` the point of
     /// the curve nearest the pointer in world coordinates; `px`/`py` is that point on the canvas in
@@ -1914,6 +1918,15 @@ impl App {
     }
 
     fn emit_table(&mut self, id: &str) {
+        self.emit_table_inner(id, false);
+    }
+
+    /// [`App::emit_table`] for a change made by dragging one of its points.
+    fn emit_table_drag(&mut self, id: &str) {
+        self.emit_table_inner(id, true);
+    }
+
+    fn emit_table_inner(&mut self, id: &str, drag: bool) {
         if let Some(t) = self
             .doc
             .items
@@ -1958,6 +1971,7 @@ impl App {
                 columns,
                 rows,
                 style,
+                drag,
             });
         }
     }
@@ -1988,6 +2002,7 @@ impl App {
         let m = self.active_map();
         let mut pieces = [h.text[0].clone(), h.text[1].clone()];
         let mut literal = false;
+        let mut touched_tables: Vec<String> = Vec::new();
         for k in 0..2 {
             // World units per pixel at the point (on a log axis they grow with the value).
             let upp = if m.log[k] {
@@ -2029,8 +2044,28 @@ impl App {
                         }
                     }
                 }
+                CoordSrc::Cell { item, col, row } => {
+                    let text = fmt_coord(v, decimals);
+                    if let Some(tb) = self
+                        .doc
+                        .items
+                        .iter_mut()
+                        .find(|i| i.id == *item)
+                        .and_then(|i| i.table.as_mut())
+                    {
+                        if tb.columns.get(*col).and_then(|c| c.cells.get(*row)) != Some(&text) {
+                            let _ = tb.set_cell(*row, *col, &text);
+                            if !touched_tables.contains(item) {
+                                touched_tables.push(item.clone());
+                            }
+                        }
+                    }
+                }
                 CoordSrc::Fixed => {}
             }
+        }
+        for id in touched_tables {
+            self.emit_table_drag(&id);
         }
         if literal {
             let latex = format!("({}, {})", pieces[0], pieces[1]);
@@ -2782,7 +2817,10 @@ impl App {
         self.panel_dirty = false;
         let window = self.scene_window();
         let res = if self.doc.slice.is_some() && !self.active_map().is_linear() {
-            Some(Err(format!("a slice is {}", crate::scene::LOG_UNSUPPORTED)))
+            Some(Err(format!(
+                "a slice is {}",
+                crate::scene::axes_unsupported(&self.active_map())
+            )))
         } else {
             build_slice_panel_view(
                 &self.doc,
@@ -4871,6 +4909,50 @@ mod tests {
         // a bad formula is an error and changes nothing
         let ev = cmd(&mut a, r#"{"t":"setColumnFormula","id":"t","col":1,"formula":"x_1+"}"#);
         assert!(ev.iter().any(|e| e["t"] == "error"), "{ev:?}");
+    }
+
+    #[test]
+    fn table_points_of_a_drag_column_move_and_write_back_into_their_cells() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"addTable","id":"t"}"#);
+        for (r, (x, y)) in [("1", "2"), ("3", "4"), ("", "")].iter().enumerate() {
+            cmd(&mut a, &format!(r#"{{"t":"setCell","id":"t","row":{r},"col":0,"value":"{x}"}}"#));
+            cmd(&mut a, &format!(r#"{{"t":"setCell","id":"t","row":{r},"col":1,"value":"{y}"}}"#));
+        }
+        let vp = (800.0, 600.0);
+        let at = |a: &App, x: f64, y: f64| a.rig.world_to_pixel(a.map.fwd3([x, y, 0.0]), vp);
+        let drag = |a: &mut App, from: (f64, f64), to: (f64, f64)| {
+            let (px, py) = at(a, from.0, from.1);
+            let (tx, ty) = at(a, to.0, to.1);
+            cmd(a, &format!(r#"{{"t":"pointer","phase":"down","x":{px},"y":{py}}}"#));
+            let ev = cmd(a, &format!(r#"{{"t":"pointer","phase":"move","x":{tx},"y":{ty}}}"#));
+            cmd(a, &format!(r#"{{"t":"pointer","phase":"up","x":{tx},"y":{ty}}}"#));
+            ev
+        };
+        let cell = |a: &App, r: usize, c: usize| {
+            a.doc.items.iter().find(|i| i.id == "t").unwrap().table.as_ref().unwrap().columns[c].cells[r].clone()
+        };
+        // not draggable until the column's Drag is on: the press pans instead
+        let w0 = a.rig.window();
+        drag(&mut a, (1.0, 2.0), (2.0, 5.0));
+        assert_eq!((cell(&a, 0, 0).as_str(), cell(&a, 0, 1).as_str()), ("1", "2"));
+        assert!(a.rig.window() != w0, "a press with no handle pans");
+        cmd(&mut a, r#"{"t":"setView","window":{"min":[-10,-7.5,-1],"max":[10,7.5,1]}}"#);
+        let ev = cmd(&mut a, r#"{"t":"setTableColumnStyle","id":"t","col":1,"style":{"drag":true}}"#);
+        assert!(!ev.iter().any(|e| e["t"] == "error"), "{ev:?}");
+        // now the point (1, 2) follows the pointer and rewrites its two cells
+        let ev = drag(&mut a, (1.0, 2.0), (2.0, 5.0));
+        let t = ev.iter().find(|e| e["t"] == "table").expect("table event");
+        assert_eq!(t["drag"], true, "{t}");
+        let (x, y): (f64, f64) = (cell(&a, 0, 0).parse().unwrap(), cell(&a, 0, 1).parse().unwrap());
+        assert!((x - 2.0).abs() < 0.1 && (y - 5.0).abs() < 0.1, "{x} {y}");
+        // the other row is untouched, the blank row has no handle
+        assert_eq!((cell(&a, 1, 0).as_str(), cell(&a, 1, 1).as_str()), ("3", "4"));
+        // a formula column cannot be dragged
+        cmd(&mut a, r#"{"t":"setColumnFormula","id":"t","col":1,"formula":"x_1+1"}"#);
+        let before = (cell(&a, 0, 0), cell(&a, 1, 0));
+        drag(&mut a, (x, x + 1.0), (6.0, 6.0));
+        assert_eq!((cell(&a, 0, 0), cell(&a, 1, 0)), before);
     }
 
     #[test]
