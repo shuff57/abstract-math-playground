@@ -411,6 +411,30 @@ pub fn choose(n: f64, k: f64) -> f64 {
 }
 
 /// Permutations `nPr(n, k) = n!/(n-k)!` for integer `n >= 0` and `k`; 0 outside `0 <= k <= n`.
+/// Greatest common divisor of two integers (`gcd(0, 0)` is 0). NaN when either is not an integer.
+pub fn gcd(a: f64, b: f64) -> f64 {
+    if !(a.is_finite() && b.is_finite()) || a != a.trunc() || b != b.trunc() {
+        return f64::NAN;
+    }
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0.0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// Least common multiple of two integers (0 when either is 0). NaN when either is not an integer.
+pub fn lcm(a: f64, b: f64) -> f64 {
+    let g = gcd(a, b);
+    if g.is_nan() {
+        return f64::NAN;
+    }
+    if g == 0.0 {
+        return 0.0;
+    }
+    (a / g * b).abs()
+}
+
 pub fn permute(n: f64, k: f64) -> f64 {
     if n.is_nan() || k.is_nan() || n != n.floor() || k != k.floor() || n < 0.0 {
         return f64::NAN;

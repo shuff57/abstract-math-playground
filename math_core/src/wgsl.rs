@@ -173,6 +173,43 @@ fn am_perm(n: f32, k: f32) -> f32 {
     return r;
 }
 
+// Abramowitz and Stegun 7.1.26: absolute error below 1.5e-7, enough for f32 drawing.
+fn am_erf(x: f32) -> f32 {
+    let s = select(1.0, -1.0, x < 0.0);
+    let a = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * a);
+    let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    return s * (1.0 - poly * exp(-a * a));
+}
+
+fn am_gcd(a: f32, b: f32) -> f32 {
+    if (a != a || b != b || a != floor(a) || b != floor(b)) {
+        return am_nan();
+    }
+    var p: f32 = abs(a);
+    var q: f32 = abs(b);
+    for (var i: i32 = 0; i < 64; i += 1) {
+        if (q == 0.0) {
+            break;
+        }
+        let r = p - q * floor(p / q);
+        p = q;
+        q = r;
+    }
+    return p;
+}
+
+fn am_lcm(a: f32, b: f32) -> f32 {
+    let g = am_gcd(a, b);
+    if (g != g) {
+        return am_nan();
+    }
+    if (g == 0.0) {
+        return 0.0;
+    }
+    return abs(a / g * b);
+}
+
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,6 +308,10 @@ fn f1_expr(f: F1, a: &str, angle: Angle) -> Result<String, WgslError> {
         F1::Sinh => format!("sinh({a})"),
         F1::Cosh => format!("cosh({a})"),
         F1::Tanh => format!("tanh({a})"),
+        F1::Asinh => format!("asinh({a})"),
+        F1::Acosh => format!("acosh({a})"),
+        F1::Atanh => format!("atanh({a})"),
+        F1::Erf => format!("am_erf({a})"),
         F1::Exp => format!("exp({a})"),
         F1::Ln => format!("log({a})"),
         F1::Log10 => format!("am_log10({a})"),
@@ -293,6 +334,8 @@ fn f2_expr(f: F2, a: &str, b: &str) -> String {
         F2::Mod => format!("am_mod_floor({a}, {b})"),
         F2::Choose => format!("am_choose({a}, {b})"),
         F2::Perm => format!("am_perm({a}, {b})"),
+        F2::Gcd => format!("am_gcd({a}, {b})"),
+        F2::Lcm => format!("am_lcm({a}, {b})"),
     }
 }
 
@@ -451,9 +494,9 @@ mod tests {
     fn body_ok(body: &str, fname: &str) {
         const OK: &[&str] = &[
             "fn", "let", "return", "f32", "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
-            "sinh", "cosh", "tanh", "exp", "log", "sqrt", "abs", "floor", "ceil", "min", "max",
-            "am_pow", "am_cbrt", "am_sign0", "am_round_away", "am_mod_floor", "am_log10", "am_fact",
-            "am_choose", "am_perm",
+            "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "exp", "log", "sqrt", "abs", "floor",
+            "ceil", "min", "max", "am_pow", "am_cbrt", "am_sign0", "am_round_away", "am_mod_floor",
+            "am_log10", "am_fact", "am_choose", "am_perm", "am_erf", "am_gcd", "am_lcm",
         ];
         let b: Vec<char> = body.chars().collect();
         let mut i = 0;

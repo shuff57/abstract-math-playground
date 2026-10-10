@@ -846,8 +846,45 @@ fn canonical_alias(name: &str) -> &str {
         "arcsin" => "asin",
         "arccos" => "acos",
         "arctan" => "atan",
-        "sgn" => "sign",
+        "sgn" | "signum" => "sign",
+        "arcsinh" => "asinh",
+        "arccosh" => "acosh",
+        "arctanh" => "atanh",
+        "gcf" | "mcd" => "gcd",
+        "mcm" => "lcm",
+        "stdDev" | "stddev" => "stdev",
+        "stdDevP" | "stddevp" => "stdevp",
         other => other,
+    }
+}
+
+/// Builds the call `name(args)`, rewriting the reciprocal and inverse-reciprocal functions that
+/// have no node of their own onto the ones that do (`sech x` is `1/cosh x`, `arcsec x` is
+/// `acos(1/x)`, `arccot x` is `acos(x/sqrt(1+x^2))`, range `(0, pi)`). Only a one-argument call
+/// is rewritten, so a wrong argument count still reports the function's own name.
+fn make_call(name: String, mut args: Vec<Expr>) -> Expr {
+    if args.len() != 1 {
+        return Expr::Call(name, args);
+    }
+    let x = args.pop().unwrap();
+    let one = || Expr::Num(1.0);
+    let recip = |e: Expr| Expr::bin(BinOp::Div, Expr::Num(1.0), e);
+    match name.as_str() {
+        "sech" => recip(Expr::call("cosh", vec![x])),
+        "csch" => recip(Expr::call("sinh", vec![x])),
+        "arcsec" => Expr::call("acos", vec![recip(x)]),
+        "arccsc" => Expr::call("asin", vec![recip(x)]),
+        "arccoth" => Expr::call("atanh", vec![recip(x)]),
+        "arcsech" => Expr::call("acosh", vec![recip(x)]),
+        "arccsch" => Expr::call("asinh", vec![recip(x)]),
+        "arccot" => {
+            let r = Expr::call(
+                "sqrt",
+                vec![Expr::bin(BinOp::Add, one(), Expr::bin(BinOp::Pow, x.clone(), Expr::Num(2.0)))],
+            );
+            Expr::call("acos", vec![Expr::bin(BinOp::Div, x, r)])
+        }
+        _ => Expr::Call(name, vec![x]),
     }
 }
 
@@ -1427,18 +1464,18 @@ impl<'a> Parser<'a> {
                 _ => name.clone(),
             };
             let arg = self.func_arg()?;
-            let call = Expr::call(&fname, arg);
+            let call = make_call(fname.clone(), arg);
             return Ok(if inverse && fname != name { call } else { Expr::bin(BinOp::Pow, call, exp) });
         }
         if self.peek().tok == Tok::LParen {
             let args = self.call_args()?;
-            return Ok(Expr::Call(name, args));
+            return Ok(make_call(name, args));
         }
         if user {
             return Ok(Expr::Var(name));
         }
         let arg = self.func_arg()?;
-        Ok(Expr::Call(name, arg))
+        Ok(make_call(name, arg))
     }
 
     fn func_arg(&mut self) -> Result<Vec<Expr>, ParseError> {

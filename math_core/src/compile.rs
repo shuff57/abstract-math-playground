@@ -36,6 +36,11 @@ pub enum F1 {
     Sinh,
     Cosh,
     Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+    /// The error function.
+    Erf,
     Exp,
     Ln,
     Log10,
@@ -60,6 +65,10 @@ pub enum F2 {
     Choose,
     /// `nPr(n, k)`.
     Perm,
+    /// `gcd(a, b)`: undefined unless both are integers.
+    Gcd,
+    /// `lcm(a, b)`: undefined unless both are integers.
+    Lcm,
 }
 
 /// Scalar-argument distribution functions (fixed arity, arguments on the stack in order).
@@ -253,6 +262,10 @@ fn f1_of(name: &str) -> Option<F1> {
         "sinh" => F1::Sinh,
         "cosh" => F1::Cosh,
         "tanh" => F1::Tanh,
+        "asinh" | "arcsinh" => F1::Asinh,
+        "acosh" | "arccosh" => F1::Acosh,
+        "atanh" | "arctanh" => F1::Atanh,
+        "erf" => F1::Erf,
         "exp" => F1::Exp,
         "ln" => F1::Ln,
         "log" => F1::Log10,
@@ -276,6 +289,8 @@ fn f2_of(name: &str) -> Option<F2> {
         "mod" => F2::Mod,
         "nCr" => F2::Choose,
         "nPr" => F2::Perm,
+        "gcd" | "gcf" | "mcd" => F2::Gcd,
+        "lcm" | "mcm" => F2::Lcm,
         _ => return None,
     })
 }
@@ -533,6 +548,10 @@ fn apply1(f: F1, x: f64, angle: Angle) -> f64 {
         F1::Sinh => x.sinh(),
         F1::Cosh => x.cosh(),
         F1::Tanh => x.tanh(),
+        F1::Asinh => x.asinh(),
+        F1::Acosh => x.acosh(),
+        F1::Atanh => x.atanh(),
+        F1::Erf => crate::stats::erf(x),
         F1::Exp => x.exp(),
         F1::Ln => x.ln(),
         F1::Log10 => x.log10(),
@@ -555,6 +574,8 @@ fn apply2(f: F2, a: f64, b: f64) -> f64 {
         F2::Mod => mod_f64(a, b),
         F2::Choose => crate::stats::choose(a, b),
         F2::Perm => crate::stats::permute(a, b),
+        F2::Gcd => crate::stats::gcd(a, b),
+        F2::Lcm => crate::stats::lcm(a, b),
     }
 }
 
@@ -572,6 +593,10 @@ fn apply1_i(f: F1, x: Interval, angle: Angle) -> Interval {
         F1::Sinh => x.sinh(),
         F1::Cosh => x.cosh(),
         F1::Tanh => x.tanh(),
+        F1::Asinh => x.asinh(),
+        F1::Acosh => x.acosh(),
+        F1::Atanh => x.atanh(),
+        F1::Erf => x.erf(),
         F1::Exp => x.exp(),
         F1::Ln => x.ln(),
         F1::Log10 => x.log10(),
@@ -593,6 +618,7 @@ fn apply2_i(f: F2, a: Interval, b: Interval) -> Interval {
         F2::Max => a.max(b),
         F2::Mod => a.modulo(b),
         F2::Choose | F2::Perm => a.comb_enclosure(b, f == F2::Perm),
+        F2::Gcd | F2::Lcm => a.number_theory(b, f == F2::Lcm),
     }
 }
 
@@ -849,6 +875,60 @@ mod tests {
     }
 
     #[test]
+    fn inverse_hyperbolic_reciprocal_erf_gcd_lcm_evaluate() {
+        let f = |src: &str, x: f64| prog(src, &["x"], Angle::Rad).eval(&[x]);
+        assert!(close(f("asinh(x)", 2.0), 1.4436354751788103));
+        assert!(close(f("arcsinh(x)", -2.0), -1.4436354751788103));
+        assert!(close(f("acosh(x)", 2.0), 1.3169578969248166));
+        assert!(f("arccosh(x)", 0.5).is_nan());
+        assert!(close(f("atanh(x)", 0.5), 0.5493061443340549));
+        assert!(close(f("arctanh(x)", 0.5), 0.5493061443340549));
+        assert!(close(f("sech(x)", 1.0), 1.0 / 1f64.cosh()));
+        assert!(close(f("csch(x)", 1.0), 1.0 / 1f64.sinh()));
+        assert!(close(f("sech^2 x", 1.0), 1.0 / 1f64.cosh().powi(2)));
+        assert!(close(f("arcsech(x)", 0.5), 1.3169578969248166));
+        assert!(close(f("arccsch(x)", 2.0), 0.48121182505960347));
+        assert!(close(f("arccoth(x)", 2.0), 0.5493061443340549));
+        assert!(close(f("arcsec(x)", 2.0), std::f64::consts::FRAC_PI_3));
+        assert!(close(f("arccsc(x)", 2.0), std::f64::consts::FRAC_PI_6));
+        // arccot has range (0, pi): continuous through 0 and above pi/2 for negative x
+        assert!(close(f("arccot(x)", 0.0), std::f64::consts::FRAC_PI_2));
+        assert!(close(f("arccot(x)", 1.0), std::f64::consts::FRAC_PI_4));
+        assert!(close(f("arccot(x)", -1.0), 3.0 * std::f64::consts::FRAC_PI_4));
+        let d = prog("arccot(x)", &["x"], Angle::Deg);
+        assert!(close(d.eval(&[1.0]), 45.0) && close(d.eval(&[-1.0]), 135.0));
+        assert!(close(f("erf(x)", 0.5), 0.5204998778130465));
+        assert!(close(f("erf(x)", -0.5), -0.5204998778130465));
+        assert_eq!(f("gcd(x,18)", 12.0), 6.0);
+        assert_eq!(f("gcd(x,18)", -12.0), 6.0);
+        assert_eq!(f("gcf(x,18)", 12.0), 6.0);
+        assert_eq!(f("mcd(x,18)", 12.0), 6.0);
+        assert_eq!(f("gcd(x,0)", 7.0), 7.0);
+        assert_eq!(f("gcd(0,0)+0*x", 0.0), 0.0);
+        assert_eq!(f("lcm(x,18)", 12.0), 36.0);
+        assert_eq!(f("mcm(x,18)", 12.0), 36.0);
+        assert_eq!(f("lcm(x,0)", 7.0), 0.0);
+        assert!(f("gcd(x,18)", 2.5).is_nan() && f("lcm(x,18)", 2.5).is_nan());
+        assert_eq!(f("signum(x)", -4.0), -1.0);
+        // wrong argument counts keep the function's own name in the error
+        let e = parse("gcd(1)").unwrap();
+        assert!(matches!(compile(&e, &[], Angle::Rad), Err(CompileError::Arity { expected: 2, got: 1, .. })));
+        // enclosures: monotone functions, domain clipping, exact on points only
+        let p = prog("acosh(x)", &["x"], Angle::Rad);
+        assert!(p.eval_interval(&[Interval::new(0.0, 0.5)]).is_empty());
+        let e = p.eval_interval(&[Interval::new(0.0, 2.0)]);
+        assert!(e.lo <= 0.0 && e.hi >= 1.3169578969248166, "{e:?}");
+        let p = prog("atanh(x)", &["x"], Angle::Rad);
+        let e = p.eval_interval(&[Interval::new(-2.0, 0.5)]);
+        assert!(e.lo == f64::NEG_INFINITY && e.hi >= 0.5493, "{e:?}");
+        let p = prog("gcd(x,18)", &["x"], Angle::Rad);
+        let e = p.eval_interval(&[Interval::point(12.0)]);
+        assert!(e.lo <= 6.0 && e.hi >= 6.0 && e.hi < 6.001, "{e:?}");
+        let e = p.eval_interval(&[Interval::new(1.0, 20.0)]);
+        assert!(e.lo == f64::NEG_INFINITY && e.hi == f64::INFINITY, "{e:?}");
+    }
+
+    #[test]
     fn factorial_and_combinatorics_evaluate() {
         let f = |src: &str, x: f64| prog(src, &["x"], Angle::Rad).eval(&[x]);
         assert_eq!(f("x!", 0.0), 1.0);
@@ -982,6 +1062,11 @@ mod tests {
         "nCr(x,y)",
         "nPr(x+6,y+6)",
         "nCr(5,2)+x",
+        "arcsinh(x)+arccosh(abs(x)+1)",
+        "atanh(x/10)+erf(y)",
+        "sech(x)+csch(x+0.5)",
+        "arcsec(abs(x)+1)+arccsc(abs(y)+1)+arccot(x)",
+        "gcd(x+6,y+9)+lcm(x+6,y+9)",
     ];
 
     #[test]

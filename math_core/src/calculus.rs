@@ -402,6 +402,13 @@ impl D<'_> {
             "sinh" => f(call("cosh", vec![u.clone()])),
             "cosh" => f(call("sinh", vec![u.clone()])),
             "tanh" => f(div(n(1.0), sq(&call("cosh", vec![u.clone()])))),
+            "asinh" | "arcsinh" => div(du, call("sqrt", vec![add(sq(u), n(1.0))])),
+            "acosh" | "arccosh" => div(du, call("sqrt", vec![sub(sq(u), n(1.0))])),
+            "atanh" | "arctanh" => div(du, sub(n(1.0), sq(u))),
+            "erf" => f(mul(
+                n(2.0 / std::f64::consts::PI.sqrt()),
+                call("exp", vec![neg(sq(u))]),
+            )),
             "exp" => f(me),
             "ln" => div(du, u.clone()),
             "log" => div(du, mul(u.clone(), n(std::f64::consts::LN_10))),

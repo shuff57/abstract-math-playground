@@ -214,6 +214,49 @@ impl Interval {
         self.inc(f64::sinh)
     }
 
+    pub fn asinh(self) -> Self {
+        self.inc(f64::asinh)
+    }
+
+    /// Defined for `x >= 1`.
+    pub fn acosh(self) -> Self {
+        if self.is_empty() || self.hi < 1.0 {
+            return Self::EMPTY;
+        }
+        Interval::new(self.lo.max(1.0).acosh(), self.hi.acosh()).widen()
+    }
+
+    /// Defined for `-1 < x < 1`; unbounded at the ends.
+    pub fn atanh(self) -> Self {
+        if self.is_empty() || self.hi < -1.0 || self.lo > 1.0 {
+            return Self::EMPTY;
+        }
+        let lo = if self.lo <= -1.0 { f64::NEG_INFINITY } else { self.lo.atanh() };
+        let hi = if self.hi >= 1.0 { f64::INFINITY } else { self.hi.atanh() };
+        Interval::new(lo, hi).widen()
+    }
+
+    pub fn erf(self) -> Self {
+        self.inc(crate::stats::erf)
+    }
+
+    /// `gcd` (or `lcm` when `lcm`): exact for two point intervals, otherwise unbounded, since
+    /// the result is not monotone in either argument.
+    pub fn number_theory(self, b: Self, lcm: bool) -> Self {
+        if self.is_empty() || b.is_empty() {
+            return Self::EMPTY;
+        }
+        if self.lo == self.hi && b.lo == b.hi {
+            let r = if lcm {
+                crate::stats::lcm(self.lo, b.lo)
+            } else {
+                crate::stats::gcd(self.lo, b.lo)
+            };
+            return Interval::point(r);
+        }
+        Self::ENTIRE
+    }
+
     pub fn tanh(self) -> Self {
         self.inc(f64::tanh)
     }

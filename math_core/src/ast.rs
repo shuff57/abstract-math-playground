@@ -40,6 +40,14 @@ pub const BUILTIN_FUNCS: &[&str] = &[
     "sin", "cos", "tan", "sec", "csc", "cot", "asin", "acos", "atan", "arcsin", "arccos",
     "arctan", "sinh", "cosh", "tanh", "exp", "ln", "log", "sqrt", "cbrt", "abs", "floor",
     "ceil", "round", "sign", "sgn", "min", "max", "mod", "atan2",
+    // inverse hyperbolic (`arc*` spellings are aliases), reciprocal hyperbolic and the inverse
+    // reciprocal trig functions (the last group is desugared by the parser; see `parse`)
+    "asinh", "acosh", "atanh", "arcsinh", "arccosh", "arctanh", "sech", "csch", "arcsec",
+    "arccsc", "arccot", "arccoth", "arcsech", "arccsch",
+    // `erf(x)`, `gcd(a, b)` and `lcm(a, b)` (`gcf`/`mcd` and `mcm` are aliases), `signum` = `sign`
+    "erf", "gcd", "lcm", "gcf", "mcd", "mcm", "signum",
+    // Desmos spellings of `stdev` and `stdevp`
+    "stdDev", "stddev", "stdDevP", "stddevp",
     // lists and statistics
     "length", "count", "total", "mean", "median", "var", "varp", "stdev", "stdevp", "mad",
     "quartile", "quantile", "sort", "reverse", "join", "unique", "corr", "cov",

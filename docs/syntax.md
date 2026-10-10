@@ -32,6 +32,10 @@ Numbers: `3`, `.5`, `1.5`, `1e3`. The exponent form needs digits right after the
 The full list is `BUILTIN_FUNCS` in `math_core/src/ast.rs`:
 
 - Trig: `sin cos tan sec csc cot asin acos atan arcsin arccos arctan sinh cosh tanh atan2`. `arcsin`/`arccos`/`arctan` are aliases of `asin`/`acos`/`atan`. `sin^2 x` means `(sin x)^2`; `sin^-1(x)` means `asin(x)`.
+- Inverse hyperbolic: `asinh acosh atanh` (aliases `arcsinh arccosh arctanh`).
+- Reciprocal and inverse reciprocal: `sech csch arcsec arccsc arccot arccoth arcsech arccsch`. They have no node of their own: the parser rewrites them (`sech x` to `1/cosh x`, `arcsec x` to `acos(1/x)`, `arccot x` to `acos(x/sqrt(1+x^2))`, so `arccot` has range `(0, pi)` and is continuous through 0, as in Desmos).
+- `erf(x)` (error function), `gcd(a, b)` and `lcm(a, b)` of two integers (NaN for a non-integer; aliases `gcf`/`mcd` and `mcm`). The GPU form of `erf` is accurate to about 1.5e-7. `gcd` and `lcm` take scalars only, not lists.
+- Desmos spellings accepted as aliases: `signum` (`sign`), `stdDev`/`stddev` (`stdev`), `stdDevP`/`stddevp` (`stdevp`).
 - Exponential and roots: `exp ln log sqrt cbrt`. `log` is base 10 (`F1::Log10` in `compile.rs`). `√` is accepted as `sqrt`.
 - Rounding and sign: `abs floor ceil round sign sgn min max mod`. `sgn` is an alias of `sign`. `min`/`max` take two numbers, or one list.
 - Lists and statistics: `length count total mean median var varp stdev stdevp mad quartile quantile sort reverse join unique corr cov`.
@@ -171,6 +175,8 @@ histogram(x_1)
 ## Regression `~`
 
 `y_1 ~ a x_1 + b` fits the model on the right to the list on the left. Names in the model that are not lists, sliders or definitions are the parameters. A model linear in its parameters is solved by least squares (QR); otherwise Levenberg-Marquardt is used. The item shows the fitted parameters, R squared and RMSE. While the item is visible, the fitted parameters are defined as numbers other items can use. Residual ticks can be turned on with `setRegressionResiduals`.
+
+The regression panel's type menu writes one of nine templates (`Family` in `math_core/src/reg_family.rs`): linear `mx+b`, quadratic, cubic, quartic, exponential `ab^x`, logarithmic `a+b ln x`, power `ax^b`, logistic `c/(1+ae^(-bx))` and sinusoidal `a sin(b(x-h))+k`. The nonlinear ones are seeded from closed-form fits; the sinusoidal one scans frequencies with a linear sine/cosine fit (so it needs at least 4 points and some spread in x) and then refines with Levenberg-Marquardt. The fitted `b` and `a` may come out negative (the same curve); `h` is only defined modulo a period.
 
 ```
 y_1 ~ a x_1 + b
