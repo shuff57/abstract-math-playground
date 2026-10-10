@@ -8,7 +8,7 @@ use crate::render::{layer_lift, mode_fades, Inset, Layer, ModeFades};
 use crate::axis_map::AxisMap;
 use crate::scene::{
     build_scene_capped_mapped, build_scene_mapped, build_scene_progressive_mapped,
-    build_slice_panel_view, clear_surface_tiles, full_surface_depth, label_box_inside,
+    build_slice_panel_view, clear_surface_tiles, full_surface_depth, label_box_inside_s,
     FIRST_PREVIEW_DEPTH,
     point_handles, CoordSrc, PointHandle, SlicePanel, ViewReq,
 };
@@ -141,6 +141,11 @@ pub enum Command {
         /// Any other value is rejected with an `error` and nothing changes.
         #[serde(default)]
         weight: Option<doc::Weight>,
+        /// Text size multiplier of everything drawn as text on the graph (tick numbers, axis
+        /// names, item labels, tooltips, inset labels): 1 is the normal size, a number from 0.5
+        /// to 3. Any other value is rejected with an `error` and nothing changes.
+        #[serde(default, rename = "textScale", alias = "text_scale")]
+        text_scale: Option<f64>,
     },
     /// Transient pixel scale of the drawn widths for an export rendered at a larger canvas size
     /// (`scale` 2 draws lines twice as wide in pixels, so they keep their look). Not saved in
@@ -438,6 +443,8 @@ pub enum Event {
         #[serde(rename = "yScale")]
         y_scale: doc::AxisScale,
         weight: doc::Weight,
+        #[serde(rename = "textScale")]
+        text_scale: f64,
     },
     /// Tick labels for the current scene in world coordinates, for a text overlay to project.
     Labels {
@@ -1108,6 +1115,7 @@ impl App {
                 x_scale,
                 y_scale,
                 weight,
+                text_scale,
             } => {
                 if let Some(w) = &window {
                     if let Err(m) = w.validate() {
@@ -1140,7 +1148,20 @@ impl App {
                         }
                     }
                 }
+                if let Some(t) = text_scale {
+                    if !doc::valid_text_scale(t) {
+                        self.outbox.push(Event::Error {
+                            message: format!(
+                                "setView: textScale must be a number from {} to {}",
+                                doc::TEXT_SCALE_MIN,
+                                doc::TEXT_SCALE_MAX
+                            ),
+                        });
+                        return;
+                    }
+                }
                 let v = &mut self.doc.view;
+                v.text_scale = text_scale.unwrap_or(v.text_scale);
                 v.grid = grid.unwrap_or(v.grid);
                 v.axes = axes.unwrap_or(v.axes);
                 v.axis_numbers = axis_numbers.unwrap_or(v.axis_numbers);
@@ -2591,6 +2612,7 @@ impl App {
             x_scale: self.doc.view.x_scale,
             y_scale: self.doc.view.y_scale,
             weight: self.doc.view.weight,
+            text_scale: self.doc.view.text_scale,
         });
         self.refresh_analysis();
         self.outbox.push(Event::Labels {
@@ -2970,6 +2992,7 @@ impl App {
         let r = p.rect;
         let aspect = r[2] as f64 / r[3].max(1) as f64;
         let (pw, ph) = (r[2] as f64, r[3] as f64);
+        let ts = self.doc.view.text_scale;
         p.geometry
             .labels
             .iter()
@@ -2980,7 +3003,7 @@ impl App {
                 let (lx, ly) = ((ndc[0] * 0.5 + 0.5) * pw, (1.0 - (ndc[1] * 0.5 + 0.5)) * ph);
                 let visible = ndc[0].abs() <= 1.0
                     && ndc[1].abs() <= 1.0
-                    && label_box_inside(l.axis, &l.text, lx, ly, pw, ph);
+                    && label_box_inside_s(l.axis, &l.text, lx, ly, pw, ph, ts);
                 ScreenLabel {
                     text: l.text.clone(),
                     axis: l.axis,
@@ -3621,6 +3644,39 @@ mod tests {
         let ev = cmd(&mut a, r#"{"t":"setView","xStep":-1,"arrows":false}"#);
         assert!(error_msg(&ev).is_some());
         assert!(a.doc.view.arrows, "a rejected command changes nothing");
+    }
+
+    #[test]
+    fn set_view_text_scale_is_saved_reported_and_validated() {
+        let mut a = app();
+        assert!(!doc::to_json(&a.doc).contains("textScale"));
+        let ev = cmd(&mut a, r#"{"t":"setView","textScale":1.6}"#);
+        let view = ev.iter().rfind(|e| e["t"] == "view").expect("a view event");
+        assert_eq!(view["textScale"], 1.6);
+        assert_eq!(a.doc.view.text_scale, 1.6);
+        let json = doc::to_json(&a.doc);
+        assert!(json.contains(r#""textScale":1.6"#), "{json}");
+        // Round trips through a reload (share links carry the document).
+        let mut b = app();
+        let ev = cmd(&mut b, &format!(r#"{{"t":"loadDoc","json":{}}}"#, serde_json::to_string(&json).unwrap()));
+        assert!(!has(&ev, "error"), "{ev:?}");
+        assert_eq!(b.doc.view.text_scale, 1.6);
+        // Out of range, zero and non-numbers are errors and change nothing.
+        for bad in ["0.4", "3.1", "0", "-1", "\"big\"", "null"] {
+            let ev = cmd(&mut a, &format!(r#"{{"t":"setView","textScale":{bad}}}"#));
+            if bad == "null" {
+                continue; // null is "absent" for an optional number
+            }
+            assert!(has(&ev, "error"), "{bad}: {ev:?}");
+            assert_eq!(a.doc.view.text_scale, 1.6, "{bad}");
+        }
+        for ok in ["0.5", "3"] {
+            let ev = cmd(&mut a, &format!(r#"{{"t":"setView","textScale":{ok}}}"#));
+            assert!(!has(&ev, "error"), "{ok}: {ev:?}");
+        }
+        let ev = cmd(&mut a, r#"{"t":"setView","textScale":1}"#);
+        assert_eq!(ev.iter().rfind(|e| e["t"] == "view").unwrap()["textScale"], 1.0);
+        assert!(!doc::to_json(&a.doc).contains("textScale"));
     }
 
     #[test]
@@ -5732,6 +5788,39 @@ mod tests {
         // A new slice through other axes goes back to following.
         let ev = cmd(&mut a, r#"{"t":"setSlice","fixed":"y=1"}"#);
         assert_eq!(slice_ev(&ev).unwrap()["follow"], true);
+    }
+
+    #[test]
+    fn inset_labels_stay_inside_and_apart_at_a_larger_text_scale() {
+        use crate::scene::{label_box_inside_s, label_box_s};
+        for ts in [1.0, 1.3, 1.6] {
+            let mut a = app();
+            cmd(&mut a, r#"{"t":"setExpr","id":"p","latex":"y=x^2"}"#);
+            cmd(&mut a, r#"{"t":"setSlice","fixed":"y=1"}"#);
+            cmd(&mut a, &format!(r#"{{"t":"setView","textScale":{ts}}}"#));
+            let r = a.inset().expect("an inset").rect;
+            let labs: Vec<_> = a.inset_screen_labels().into_iter().filter(|l| l.visible).collect();
+            assert!(!labs.is_empty(), "scale {ts}: no inset labels");
+            let boxes: Vec<[f64; 4]> = labs
+                .iter()
+                .map(|l| {
+                    let (x, y) = (l.x - r[0] as f64, l.y - r[1] as f64);
+                    assert!(
+                        label_box_inside_s(l.axis, &l.text, x, y, r[2] as f64, r[3] as f64, ts),
+                        "scale {ts}: {:?} leaves the inset",
+                        l.text
+                    );
+                    label_box_s(l.axis, &l.text, x, y, ts)
+                })
+                .collect();
+            for i in 0..boxes.len() {
+                for j in i + 1..boxes.len() {
+                    let (p, q) = (boxes[i], boxes[j]);
+                    let apart = p[2] <= q[0] || q[2] <= p[0] || p[3] <= q[1] || q[3] <= p[1];
+                    assert!(apart, "scale {ts}: {:?} overlaps {:?}", labs[i].text, labs[j].text);
+                }
+            }
+        }
     }
 
     #[test]

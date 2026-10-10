@@ -945,7 +945,8 @@ pub fn build_panel(
             }
         }
     }
-    let tick_boxes = panel_axes(&mut b, two_d, (u0, u1), (v_lo_s, v_hi_s), vc, k, pw, ph);
+    let ts = doc.view.text_scale.clamp(0.5, 3.0);
+    let tick_boxes = panel_axes(&mut b, two_d, (u0, u1), (v_lo_s, v_hi_s), vc, k, pw, ph, ts);
 
     let geo = compute(
         rs,
@@ -1029,23 +1030,25 @@ pub fn build_panel(
     let xn = place_name(
         0,
         labels[0],
-        (pw - NAME_INSET_X, ph - NAME_INSET_Y),
+        (pw - NAME_INSET_X, ph - NAME_INSET_Y * ts),
         (-1.0, 0.0),
         &tick_boxes,
         &[],
         pw,
         ph,
+        ts,
     );
-    let xbox = label_box(0, labels[0], xn.0, xn.1);
+    let xbox = label_box_s(0, labels[0], xn.0, xn.1, ts);
     let yn = place_name(
         1,
         &vname,
-        (NAME_INSET_X, 0.5 * LABEL_H + 3.0),
+        (NAME_INSET_X, 0.5 * LABEL_H * ts + 3.0),
         (0.0, 1.0),
         &tick_boxes,
         &[xbox],
         pw,
         ph,
+        ts,
     );
     b.label(
         [u0 + xn.0 * wu, v_hi_s - xn.1 * wv, 0.0],
@@ -1184,6 +1187,7 @@ fn panel_axes(
     k: f64,
     pw: f64,
     ph: f64,
+    ts: f64,
 ) -> Vec<[f64; 4]> {
     let mut boxes: Vec<[f64; 4]> = Vec::new();
     let (minor_c, major_c, axis_c) = (b.theme.grid_minor, b.theme.grid_major, b.theme.axis);
@@ -1194,8 +1198,8 @@ fn panel_axes(
         (vc + y0 / k, vc + y1 / k)
     };
     let sy = |v: f64| if two_d { v } else { (v - vc) * k };
-    let su = nice_step(u1 - u0, pw, 60.0);
-    let sv = nice_step(v1 - v0, ph, 40.0);
+    let su = nice_step(u1 - u0, pw, 60.0 * ts);
+    let sv = nice_step(v1 - v0, ph, 40.0 * ts);
     for (axis, step, lo, hi) in [(0usize, su, u0, u1), (1usize, sv, v0, v1)] {
         let div = minor_divisions(step);
         let minor = step / div as f64;
@@ -1227,9 +1231,9 @@ fn panel_axes(
     }
     // Where the tick rows sit: on the zero axes while those are far enough from the edges.
     let (wu, wv) = ((u1 - u0) / pw, (v1 - v0) / ph);
-    let row_lo = v0 + (LABEL_GAP_X + LABEL_H + 3.0) * wv;
+    let row_lo = v0 + (LABEL_GAP_X * ts + LABEL_H * ts + 3.0) * wv;
     let row_hi = v1 - 3.0 * wv;
-    let col_lo = u0 + (LABEL_CHAR_W * 4.0 + LABEL_GAP_Y + 3.0) * wu;
+    let col_lo = u0 + ((LABEL_CHAR_W * 4.0 + LABEL_GAP_Y) * ts + 3.0) * wu;
     let col_hi = u1 - 3.0 * wu;
     let zy = if row_lo <= row_hi {
         0f64.max(row_lo).min(row_hi)
@@ -1244,12 +1248,12 @@ fn panel_axes(
     // Pixel position of a label anchor inside the panel (from the top-left), for the box test.
     let fits = |axis: u8, text: &str, u: f64, v: f64| -> bool {
         let (ax, ay) = ((u - u0) / wu, (v1 - v) / wv);
-        label_box_inside(axis, text, ax, ay, pw, ph)
+        label_box_inside_s(axis, text, ax, ay, pw, ph, ts)
     };
     for (_, val) in multiples(u0, u1, su) {
         let text = format_tick(val, su);
         if fits(0, &text, val, zy) {
-            boxes.push(label_box(0, &text, (val - u0) / wu, (v1 - zy) / wv));
+            boxes.push(label_box_s(0, &text, (val - u0) / wu, (v1 - zy) / wv, ts));
             b.label([val, sy(zy), 0.0], text, 0);
         }
     }
@@ -1259,7 +1263,7 @@ fn panel_axes(
         }
         let text = format_tick(val, sv);
         if fits(1, &text, zx, val) {
-            boxes.push(label_box(1, &text, (zx - u0) / wu, (v1 - val) / wv));
+            boxes.push(label_box_s(1, &text, (zx - u0) / wu, (v1 - val) / wv, ts));
             b.label([zx, sy(val), 0.0], text, 1);
         }
     }
@@ -1268,13 +1272,20 @@ fn panel_axes(
 
 /// Text box `[x0, y0, x1, y1]` (pixels from the panel's top-left) of a label anchored at `(x, y)`.
 pub fn label_box(axis: u8, text: &str, x: f64, y: f64) -> [f64; 4] {
-    let w = text.chars().count() as f64 * LABEL_CHAR_W;
+    label_box_s(axis, text, x, y, 1.0)
+}
+
+/// [`label_box`] for text drawn `ts` times larger (the view's `textScale`): the character width,
+/// height and anchor gaps all scale.
+pub fn label_box_s(axis: u8, text: &str, x: f64, y: f64, ts: f64) -> [f64; 4] {
+    let (cw, h, gx, gy) = (LABEL_CHAR_W * ts, LABEL_H * ts, LABEL_GAP_X * ts, LABEL_GAP_Y * ts);
+    let w = text.chars().count() as f64 * cw;
     let (x0, y0) = match axis {
-        0 => (x - w / 2.0, y + LABEL_GAP_X),
-        1 => (x - w - LABEL_GAP_Y, y - LABEL_H / 2.0),
-        _ => (x - w / 2.0, y - LABEL_H / 2.0),
+        0 => (x - w / 2.0, y + gx),
+        1 => (x - w - gy, y - h / 2.0),
+        _ => (x - w / 2.0, y - h / 2.0),
     };
-    [x0, y0, x0 + w, y0 + LABEL_H]
+    [x0, y0, x0 + w, y0 + h]
 }
 
 fn boxes_overlap(a: &[f64; 4], b: &[f64; 4], pad: f64) -> bool {
@@ -1294,15 +1305,16 @@ fn place_name(
     taken: &[[f64; 4]],
     pw: f64,
     ph: f64,
+    ts: f64,
 ) -> (f64, f64) {
     for i in 0..=60 {
         let t = i as f64 * 6.0;
         for sign in [1.0, -1.0] {
             let (x, y) = (pref.0 + sign * t * sweep.0, pref.1 + sign * t * sweep.1);
-            if !label_box_inside(axis, text, x, y, pw, ph) {
+            if !label_box_inside_s(axis, text, x, y, pw, ph, ts) {
                 continue;
             }
-            let bx = label_box(axis, text, x, y);
+            let bx = label_box_s(axis, text, x, y, ts);
             if ticks
                 .iter()
                 .chain(taken)
@@ -1319,7 +1331,12 @@ fn place_name(
 /// lies inside a `pw` x `ph` panel (`axis` 0 hangs below the anchor, 1 sits left of it, others
 /// are centred).
 pub fn label_box_inside(axis: u8, text: &str, x: f64, y: f64, pw: f64, ph: f64) -> bool {
-    let b = label_box(axis, text, x, y);
+    label_box_inside_s(axis, text, x, y, pw, ph, 1.0)
+}
+
+/// [`label_box_inside`] for text drawn `ts` times larger.
+pub fn label_box_inside_s(axis: u8, text: &str, x: f64, y: f64, pw: f64, ph: f64, ts: f64) -> bool {
+    let b = label_box_s(axis, text, x, y, ts);
     b[0] >= 0.0 && b[1] >= 0.0 && b[2] <= pw && b[3] <= ph
 }
 

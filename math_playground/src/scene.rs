@@ -49,7 +49,7 @@ use math_core::wgsl_complex::{emit_complex_function, emit_domain_module, COMPLEX
 
 mod slice_draw;
 pub use slice_draw::{
-    inset_rect, label_box, label_box_inside, SlicePanel, ViewReq, LABEL_CHAR_W, LABEL_GAP_X,
+    inset_rect, label_box, label_box_inside, label_box_inside_s, label_box_s, SlicePanel, ViewReq, LABEL_CHAR_W, LABEL_GAP_X,
     LABEL_GAP_Y, LABEL_H, SLICE_COLOR,
 };
 
@@ -380,6 +380,8 @@ struct BuildExt {
     point_mul: f32,
     /// Transient render scale (export at a larger pixel size), already part of both multipliers.
     scale: f32,
+    /// The view's `textScale`: tick spacing and label boxes grow with the text.
+    text_scale: f64,
 }
 
 impl Default for BuildExt {
@@ -403,6 +405,7 @@ impl Default for BuildExt {
             grid_mul: 1.0,
             point_mul: 1.0,
             scale: 1.0,
+            text_scale: 1.0,
         }
     }
 }
@@ -841,13 +844,14 @@ impl<'a> Builder<'a> {
             if l.axis > 1 || l.text == "0" {
                 return true;
             }
-            let (w, h) = (l.text.chars().count() as f64 * 7.5, 13.0);
+            let ts = self.ext.text_scale;
+            let (w, h) = (l.text.chars().count() as f64 * 7.5 * ts, 13.0 * ts);
             let (px, py) = (l.pos[0] * k[0], l.pos[1] * k[1]);
             // The label box in pixels (y up), as the overlay anchors it.
             let (x0, x1, y0, y1) = if l.axis == 0 {
-                (px - w / 2.0, px + w / 2.0, py - 5.0 - h, py - 5.0)
+                (px - w / 2.0, px + w / 2.0, py - 5.0 * ts - h, py - 5.0 * ts)
             } else {
-                (px - 6.0 - w, px - 6.0, py - h / 2.0, py + h / 2.0)
+                (px - 6.0 * ts - w, px - 6.0 * ts, py - h / 2.0, py + h / 2.0)
             };
             !dots.iter().any(|(c, r)| {
                 let dx = c[0].clamp(x0, x1) - c[0];
@@ -1167,27 +1171,33 @@ impl<'a> Builder<'a> {
         (step > 0.0 && span / step <= px / 6.0).then_some(step)
     }
 
+    /// Target pixel gap between major lines: the tick numbers grow with the text size, so does this.
+    fn target_px(&self) -> f64 {
+        TARGET_MAJOR_PX * self.ext.text_scale
+    }
+
     fn steps(&self, mode: Mode) -> [f64; 3] {
+        let tp = self.target_px();
         let (vw, vh) = self.px();
         let span = |a: usize| self.win.max[a] - self.win.min[a];
         match mode {
             Mode::D1 => {
-                let s = nice_step(span(0), vw, TARGET_MAJOR_PX);
+                let s = nice_step(span(0), vw, tp);
                 [s, s, s]
             }
             Mode::D2 => [
                 self.fixed_step(0)
-                    .unwrap_or_else(|| nice_step(span(0), vw, TARGET_MAJOR_PX)),
+                    .unwrap_or_else(|| nice_step(span(0), vw, tp)),
                 self.fixed_step(1)
-                    .unwrap_or_else(|| nice_step(span(1), vh, TARGET_MAJOR_PX)),
+                    .unwrap_or_else(|| nice_step(span(1), vh, tp)),
                 1.0,
             ],
             Mode::D3 => {
                 let px = 0.7 * vw.min(vh);
                 [
-                    nice_step(span(0), px, TARGET_MAJOR_PX),
-                    nice_step(span(1), px, TARGET_MAJOR_PX),
-                    nice_step(span(2), px, TARGET_MAJOR_PX),
+                    nice_step(span(0), px, tp),
+                    nice_step(span(1), px, tp),
+                    nice_step(span(2), px, tp),
                 ]
             }
         }
@@ -1208,7 +1218,7 @@ impl<'a> Builder<'a> {
             Mode::D2 if self.ext.polar => {
                 // One spacing for circles and ticks (the per-axis steps do not apply).
                 let (vw, _) = self.px();
-                let s = nice_step(self.win.max[0] - self.win.min[0], vw, TARGET_MAJOR_PX);
+                let s = nice_step(self.win.max[0] - self.win.min[0], vw, self.target_px());
                 if grid {
                     self.polar_grid(s);
                 }
@@ -1477,7 +1487,7 @@ impl<'a> Builder<'a> {
                     z
                 }
                 None if map.log[other] || lo[other] > 0.0 => {
-                    lo[other] + if axis == 0 { 22.0 } else { 46.0 } * upp[other]
+                    lo[other] + if axis == 0 { 22.0 } else { 46.0 } * self.ext.text_scale * upp[other]
                 }
                 None => self.clamp0(other),
             };
@@ -1495,7 +1505,7 @@ impl<'a> Builder<'a> {
             }
             if let Some(n) = self.ext.axis_names[axis].clone() {
                 let mut p = [0.0; 3];
-                p[axis] = hi[axis] - 0.02 * (hi[axis] - lo[axis]);
+                p[axis] = hi[axis] - 0.02 * self.ext.text_scale * (hi[axis] - lo[axis]);
                 p[other] = at;
                 self.label(p, n, axis as u8);
             }
@@ -1506,6 +1516,7 @@ impl<'a> Builder<'a> {
     /// grid: decades (every n-th when they are crowded) and their 2..9 multiples on a
     /// logarithmic axis, plain multiples of `step` on a linear one.
     fn log_ticks(&self, axis: usize, step: f64, px: f64) -> Vec<Tick> {
+        let text_scale = self.ext.text_scale;
         let (lo, hi) = (self.win.min[axis], self.win.max[axis]);
         let map = self.ext.map;
         let mut out = Vec::new();
@@ -1531,7 +1542,7 @@ impl<'a> Builder<'a> {
         if ppd > 2500.0 {
             // Less than a decade across: plain steps in world units, mapped.
             let (w0, w1) = (map.inv(axis, lo), map.inv(axis, hi));
-            let s = nice_step(w1 - w0, px, TARGET_MAJOR_PX);
+            let s = nice_step(w1 - w0, px, TARGET_MAJOR_PX * text_scale);
             let div = minor_divisions(s);
             for (j, v) in multiples(w0, w1, s / div as f64) {
                 let major = j % div == 0;
@@ -1549,7 +1560,7 @@ impl<'a> Builder<'a> {
         // Label every n-th decade so numbers stay at least ~45 px apart.
         let n = [1i64, 2, 3, 5, 10, 20, 50, 100]
             .into_iter()
-            .find(|n| *n as f64 * ppd >= 45.0)
+            .find(|n| *n as f64 * ppd >= 45.0 * text_scale)
             .unwrap_or(100);
         let labelled_mantissas: &[i32] = if ppd >= 700.0 {
             &[2, 3, 4, 5, 6, 7, 8, 9]
@@ -1627,10 +1638,10 @@ impl<'a> Builder<'a> {
         }
         // Axis names sit just inside the positive end of their axis.
         if let Some(n) = self.ext.axis_names[0].clone() {
-            self.label([hi[0] - 0.02 * (hi[0] - lo[0]), cy, 0.0], n, 0);
+            self.label([hi[0] - 0.02 * self.ext.text_scale * (hi[0] - lo[0]), cy, 0.0], n, 0);
         }
         if let Some(n) = self.ext.axis_names[1].clone() {
-            self.label([cx, hi[1] - 0.02 * (hi[1] - lo[1]), 0.0], n, 1);
+            self.label([cx, hi[1] - 0.02 * self.ext.text_scale * (hi[1] - lo[1]), 0.0], n, 1);
         }
     }
 
@@ -3508,6 +3519,7 @@ pub fn build_scene_mapped(
             grid_mul: gm * scale,
             point_mul: pm * scale,
             scale,
+            text_scale: doc.view.text_scale.clamp(0.5, 3.0),
         },
     };
     b.grid_and_axes(mode);
@@ -5820,6 +5832,46 @@ mod tests {
 
     fn near(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4
+    }
+
+    /// X tick-label boxes `[x0, x1]` in pixels (estimated as the label painters do, 7.5 px per
+    /// character at text scale 1) for a `vw` x `vh` build of window `[lo, lo + span]`.
+    fn x_tick_boxes(lo: f64, span: f64, vw: u32, ts: f64) -> Vec<(f64, f64, String)> {
+        let mut d = Doc::new_default();
+        d.view.text_scale = ts;
+        let win = Window3 { min: [lo, -3.0, -1.0], max: [lo + span, 3.0, 1.0] };
+        let g = build_scene(&d, Mode::D2, win, [0.0; 3], (vw, 400), &Theme::light());
+        g.labels
+            .iter()
+            .filter(|l| l.axis == 0 && l.item.is_none())
+            .map(|l| {
+                let cx = (l.pos[0] - lo) / span * vw as f64;
+                let w = l.text.chars().count() as f64 * 7.5 * ts;
+                (cx - w / 2.0, cx + w / 2.0, l.text.clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn text_scale_thins_tick_labels_so_no_two_boxes_overlap() {
+        for (lo, span) in [(-10.0, 20.0), (0.0, 1.0), (-0.003, 0.006), (1000.0, 350.0), (-7.3, 14.6), (0.0, 400.0), (-2.0e5, 1.0e6)] {
+            for ts in [1.0, 1.3, 1.6, 3.0] {
+                let mut b = x_tick_boxes(lo, span, 600, ts);
+                assert!(!b.is_empty(), "no tick labels for {lo}+{span} at {ts}");
+                b.sort_by(|a, c| a.0.total_cmp(&c.0));
+                for w in b.windows(2) {
+                    assert!(
+                        w[0].1 <= w[1].0,
+                        "labels {:?} and {:?} overlap at scale {ts} for window {lo}+{span}",
+                        w[0].2, w[1].2
+                    );
+                }
+            }
+        }
+        // Larger text means no more tick labels than smaller text.
+        let n = |ts| x_tick_boxes(-7.3, 14.6, 600, ts).len();
+        assert!(n(1.6) <= n(1.0) && n(3.0) <= n(1.6), "{} {} {}", n(1.0), n(1.6), n(3.0));
+        assert!(n(1.6) < n(1.0), "the larger text must actually thin the ticks out");
     }
 
     #[test]

@@ -112,6 +112,39 @@ pub struct ViewState {
     /// untouched.
     #[serde(default, skip_serializing_if = "Weight::is_normal")]
     pub weight: Weight,
+    /// Text size multiplier of every label drawn on the graph (tick numbers, axis names, item
+    /// labels, tooltips, inset labels), 0.5 to 3 (additive field; saved only when not 1). The
+    /// engine also widens tick spacing and label boxes by it so larger text does not collide.
+    #[serde(
+        default = "default_text_scale",
+        deserialize_with = "de_text_scale",
+        skip_serializing_if = "is_unit_scale"
+    )]
+    pub text_scale: f64,
+}
+
+/// Smallest and largest `textScale`.
+pub const TEXT_SCALE_MIN: f64 = 0.5;
+pub const TEXT_SCALE_MAX: f64 = 3.0;
+
+/// True for a finite `textScale` inside `TEXT_SCALE_MIN..=TEXT_SCALE_MAX`.
+pub fn valid_text_scale(t: f64) -> bool {
+    t.is_finite() && (TEXT_SCALE_MIN..=TEXT_SCALE_MAX).contains(&t)
+}
+
+fn default_text_scale() -> f64 {
+    1.0
+}
+
+fn is_unit_scale(t: &f64) -> bool {
+    *t == 1.0
+}
+
+/// A saved `textScale` outside the range is clamped (non-finite counts as 1) rather than failing
+/// the whole document.
+fn de_text_scale<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let t = f64::deserialize(d)?;
+    Ok(if t.is_finite() { t.clamp(TEXT_SCALE_MIN, TEXT_SCALE_MAX) } else { 1.0 })
 }
 
 /// How heavy the graph is drawn (lines, points; the shell also enlarges the numbers).
@@ -614,6 +647,7 @@ impl Doc {
                 x_scale: AxisScale::Linear,
                 y_scale: AxisScale::Linear,
                 weight: Weight::Normal,
+                text_scale: 1.0,
             },
             items: Vec::new(),
             sliders: BTreeMap::new(),
@@ -902,6 +936,22 @@ mod tests {
         // Bad values are rejected.
         let bad = j.replace("125.0", "-1.0");
         assert!(matches!(from_json(&bad), Err(DocError::Invalid(_))));
+    }
+
+    #[test]
+    fn text_scale_is_omitted_at_one_round_trips_and_clamps_on_load() {
+        let mut d = Doc::new_default();
+        let j = to_json(&d);
+        assert!(!j.contains("textScale"), "{j}");
+        assert_eq!(from_json(&j).unwrap().view.text_scale, 1.0);
+        d.view.text_scale = 1.3;
+        let j = to_json(&d);
+        assert!(j.contains(r#""textScale":1.3"#), "{j}");
+        assert_eq!(from_json(&j).unwrap().view.text_scale, 1.3);
+        assert_eq!(from_json(&j.replace("1.3", "9")).unwrap().view.text_scale, TEXT_SCALE_MAX);
+        assert_eq!(from_json(&j.replace("1.3", "0.01")).unwrap().view.text_scale, TEXT_SCALE_MIN);
+        assert!(valid_text_scale(0.5) && valid_text_scale(3.0));
+        assert!(!valid_text_scale(0.49) && !valid_text_scale(3.01) && !valid_text_scale(f64::NAN));
     }
 
     #[test]
