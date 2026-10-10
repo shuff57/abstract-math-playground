@@ -38,10 +38,12 @@ pub enum Family {
     Power,
     /// `y = c / (1 + a e^(-b x))`
     Logistic,
+    /// `y = a sin(b (x - h)) + k`
+    Sinusoidal,
 }
 
 impl Family {
-    pub const ALL: [Family; 8] = [
+    pub const ALL: [Family; 9] = [
         Family::Linear,
         Family::Quadratic,
         Family::Cubic,
@@ -50,6 +52,7 @@ impl Family {
         Family::Logarithmic,
         Family::Power,
         Family::Logistic,
+        Family::Sinusoidal,
     ];
 
     /// Stable machine name (`"linear"`, ...).
@@ -63,6 +66,7 @@ impl Family {
             Family::Logarithmic => "logarithmic",
             Family::Power => "power",
             Family::Logistic => "logistic",
+            Family::Sinusoidal => "sinusoidal",
         }
     }
 
@@ -81,6 +85,7 @@ impl Family {
             Family::Logarithmic => "Logarithmic",
             Family::Power => "Power",
             Family::Logistic => "Logistic",
+            Family::Sinusoidal => "Sinusoidal",
         }
     }
 
@@ -93,6 +98,7 @@ impl Family {
             Family::Quartic => &["a", "b", "c", "d", "f"],
             Family::Exponential | Family::Logarithmic | Family::Power => &["a", "b"],
             Family::Logistic => &["a", "b", "c"],
+            Family::Sinusoidal => &["a", "b", "h", "k"],
         }
     }
 
@@ -107,6 +113,7 @@ impl Family {
             Family::Logarithmic => format!("a+b\\ln({x})"),
             Family::Power => format!("a{x}^{{b}}"),
             Family::Logistic => format!("\\frac{{c}}{{1+ae^{{-b{x}}}}}"),
+            Family::Sinusoidal => format!("a\\sin(b({x}-h))+k"),
         }
     }
 
@@ -165,9 +172,108 @@ impl Family {
                 m.insert("c".into(), c);
                 Some(m)
             }
+            Family::Sinusoidal => sinusoid_start(x, y),
             _ => None,
         }
     }
+}
+
+/// Starting values `a, b, h, k` for `a sin(b (x - h)) + k`. The frequency is the one whose
+/// linear fit `A sin(w x) + B cos(w x) + K` leaves the least residual over a grid fine enough to
+/// resolve the phase across the whole x span (a plain Gauss-Newton start far from the true
+/// frequency lands in a local minimum). `None` for fewer than 4 points, no spread in x, or
+/// non-finite data.
+fn sinusoid_start(x: &[f64], y: &[f64]) -> Option<BTreeMap<String, f64>> {
+    let n = x.len();
+    if n != y.len() || n < 4 || !x.iter().chain(y).all(|v| v.is_finite()) {
+        return None;
+    }
+    let (xmin, xmax) = x.iter().fold((f64::MAX, f64::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
+    let span = xmax - xmin;
+    if span <= 0.0 {
+        return None;
+    }
+    let mut xs: Vec<f64> = x.to_vec();
+    xs.sort_by(|a, b| a.total_cmp(b));
+    let mut gaps: Vec<f64> = xs.windows(2).map(|w| w[1] - w[0]).filter(|g| *g > 0.0).collect();
+    if gaps.is_empty() {
+        return None;
+    }
+    gaps.sort_by(|a, b| a.total_cmp(b));
+    // Up to the Nyquist frequency of the typical spacing; at least one period over the span.
+    let w_lo = std::f64::consts::PI / span;
+    let w_hi = (std::f64::consts::PI / gaps[gaps.len() / 2]).max(2.0 * w_lo);
+    let steps = (((w_hi - w_lo) * span / (std::f64::consts::PI / 8.0)).ceil() as usize).clamp(16, 4000);
+    let x0 = xmin;
+    let mut best: Option<(f64, f64, [f64; 3])> = None; // (rss, w, [A, B, K])
+    for i in 0..=steps {
+        let w = w_lo + (w_hi - w_lo) * i as f64 / steps as f64;
+        let Some((coef, rss)) = sin_cos_fit(x, y, w, x0) else { continue };
+        if best.as_ref().is_none_or(|b| rss < b.0) {
+            best = Some((rss, w, coef));
+        }
+    }
+    let (_, w, [aa, bb, kk]) = best?;
+    let amp = aa.hypot(bb);
+    if !amp.is_finite() || amp == 0.0 {
+        return None;
+    }
+    // A sin(w t) + B cos(w t) = amp sin(w t + phi), t = x - x0; the model wants sin(w (x - h)).
+    let phi = bb.atan2(aa);
+    let h = x0 - phi / w;
+    Some(BTreeMap::from([
+        ("a".to_string(), amp),
+        ("b".to_string(), w),
+        ("h".to_string(), h),
+        ("k".to_string(), kk),
+    ]))
+}
+
+/// Least squares of `y ~ A sin(w t) + B cos(w t) + K` (`t = x - x0`): `([A, B, K], rss)`, `None`
+/// when the 3x3 normal equations are singular.
+fn sin_cos_fit(x: &[f64], y: &[f64], w: f64, x0: f64) -> Option<([f64; 3], f64)> {
+    let mut m = [[0.0f64; 4]; 3];
+    for (xi, yi) in x.iter().zip(y) {
+        let t = w * (xi - x0);
+        let b = [t.sin(), t.cos(), 1.0];
+        for r in 0..3 {
+            for c in 0..3 {
+                m[r][c] += b[r] * b[c];
+            }
+            m[r][3] += b[r] * yi;
+        }
+    }
+    // Gaussian elimination with partial pivoting.
+    for col in 0..3 {
+        let piv = (col..3).max_by(|a, b| m[*a][col].abs().total_cmp(&m[*b][col].abs()))?;
+        if m[piv][col].abs() < 1e-12 {
+            return None;
+        }
+        m.swap(col, piv);
+        for r in col + 1..3 {
+            let f = m[r][col] / m[col][col];
+            for c in col..4 {
+                m[r][c] -= f * m[col][c];
+            }
+        }
+    }
+    let mut s = [0.0; 3];
+    for r in (0..3).rev() {
+        let mut v = m[r][3];
+        for c in r + 1..3 {
+            v -= m[r][c] * s[c];
+        }
+        s[r] = v / m[r][r];
+    }
+    let rss: f64 = x
+        .iter()
+        .zip(y)
+        .map(|(xi, yi)| {
+            let t = w * (xi - x0);
+            (yi - (s[0] * t.sin() + s[1] * t.cos() + s[2])).powi(2)
+        })
+        .sum();
+    rss.is_finite().then_some((s, rss))
 }
 
 /// A list name (`x_1`, `y_{12}`, `L`) starting at byte `i` of `s`: one ASCII letter, then
@@ -302,6 +408,46 @@ mod tests {
             Family::detect("y_1 ~ mx_1+b").map(|d| d.0),
             Some(Family::Linear)
         );
+    }
+
+    #[test]
+    fn sinusoidal_fits_recover_amplitude_frequency_phase_and_offset() {
+        // 3 sin(2 (x - 0.5)) + 1 over about 1.6 periods, then a fast one the default starts miss.
+        let x: Vec<f64> = (0..40).map(|i| i as f64 * 0.25).collect();
+        for (a, b, h, k) in [(3.0, 2.0, 0.5, 1.0), (0.5, 5.0, 0.2, -4.0), (10.0, 0.7, 2.0, 0.0)] {
+            let y: Vec<f64> = x.iter().map(|t| a * (b * (t - h)).sin() + k).collect();
+            let r = fit_family(Family::Sinusoidal, &x, &y);
+            assert!(close(r.r2, 1.0, 1e-9), "r2 {} for {a} {b} {h} {k}", r.r2);
+            // a, b, h are determined up to the sin symmetries; compare the curve instead
+            let (fa, fb, fh, fk) = (
+                r.param("a").unwrap(),
+                r.param("b").unwrap(),
+                r.param("h").unwrap(),
+                r.param("k").unwrap(),
+            );
+            assert!(close(fk, k, 1e-6), "k {fk} vs {k}");
+            assert!(close(fa.abs(), a, 1e-6), "a {fa} vs {a}");
+            assert!(close(fb.abs(), b, 1e-6), "b {fb} vs {b}");
+            for t in [0.3, 1.7, 6.1] {
+                let want = a * (b * (t - h)).sin() + k;
+                let got = fa * (fb * (t - fh)).sin() + fk;
+                assert!((want - got).abs() < 1e-6, "curve differs at {t}");
+            }
+        }
+        // Noise and irregular spacing still land on the right frequency.
+        let x: Vec<f64> = (0..60).map(|i| i as f64 * 0.17 + ((i * 7) % 5) as f64 * 0.01).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, t)| 4.0 * (1.3 * (t - 0.4)).sin() + 2.0 + 0.2 * ((i * 37 % 11) as f64 / 11.0 - 0.5))
+            .collect();
+        let r = fit_family(Family::Sinusoidal, &x, &y);
+        assert!(close(r.param("b").unwrap().abs(), 1.3, 0.02), "{:?}", r.param("b"));
+        assert!(close(r.param("k").unwrap(), 2.0, 0.05));
+        assert!(r.r2 > 0.99);
+        // Too little data is not seeded (the plain fit may still run).
+        assert!(Family::Sinusoidal.starts(&[1.0, 2.0, 3.0], &[1.0, 0.0, 1.0]).is_none());
+        assert!(Family::Sinusoidal.starts(&[1.0; 6], &[1.0, 0.0, 1.0, 2.0, 1.0, 3.0]).is_none());
     }
 
     #[test]
