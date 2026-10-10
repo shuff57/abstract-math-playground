@@ -411,6 +411,44 @@ pub fn choose(n: f64, k: f64) -> f64 {
 }
 
 /// Permutations `nPr(n, k) = n!/(n-k)!` for integer `n >= 0` and `k`; 0 outside `0 <= k <= n`.
+/// `v` as the fraction `(numerator, denominator)` (denominator at least 2, at most 10 000) when
+/// one reproduces it to about 1e-9 relative, by continued fractions; `None` for an integer, a
+/// non-finite number or a value with no such fraction (`pi`, `sqrt(2)`).
+pub fn as_fraction(v: f64) -> Option<(i64, u64)> {
+    if !v.is_finite() || v == v.round() || v.abs() > 1e9 {
+        return None;
+    }
+    let target = v.abs();
+    let tol = 1e-9 * target.max(1.0);
+    // convergents h/k of the continued fraction of `target`
+    let (mut h0, mut k0, mut h1, mut k1) = (0i64, 1i64, 1i64, 0i64);
+    let mut x = target;
+    for _ in 0..40 {
+        let a = x.floor();
+        if a > 1e12 {
+            return None;
+        }
+        let a = a as i64;
+        let (h2, k2) = (a.checked_mul(h1)?.checked_add(h0)?, a.checked_mul(k1)?.checked_add(k0)?);
+        if k2 > 10_000 {
+            return None;
+        }
+        (h0, k0, h1, k1) = (h1, k1, h2, k2);
+        if (h1 as f64 / k1 as f64 - target).abs() <= tol {
+            if k1 < 2 {
+                return None;
+            }
+            return Some((if v < 0.0 { -h1 } else { h1 }, k1 as u64));
+        }
+        let frac = x - a as f64;
+        if frac < 1e-15 {
+            return None;
+        }
+        x = 1.0 / frac;
+    }
+    None
+}
+
 /// Greatest common divisor of two integers (`gcd(0, 0)` is 0). NaN when either is not an integer.
 pub fn gcd(a: f64, b: f64) -> f64 {
     if !(a.is_finite() && b.is_finite()) || a != a.trunc() || b != b.trunc() {
@@ -993,6 +1031,24 @@ mod tests {
         assert!(corr(&x, &m).unwrap() < 1.0);
         near(spearman(&x, &m).unwrap(), 1.0, 1e-15);
         near(spearman(&[1.0, 2.0, 2.0, 3.0], &[1.0, 2.0, 2.0, 3.0]).unwrap(), 1.0, 1e-15);
+    }
+
+    #[test]
+    fn fractions_from_decimals() {
+        assert_eq!(as_fraction(0.5), Some((1, 2)));
+        assert_eq!(as_fraction(-0.75), Some((-3, 4)));
+        assert_eq!(as_fraction(1.0 / 3.0), Some((1, 3)));
+        assert_eq!(as_fraction(7.0 / 3.0), Some((7, 3)));
+        assert_eq!(as_fraction(-22.0 / 7.0), Some((-22, 7)));
+        assert_eq!(as_fraction(0.1 + 0.2), Some((3, 10)), "float dust is fine");
+        assert_eq!(as_fraction(355.0 / 113.0), Some((355, 113)));
+        // not fractions: integers, irrationals, huge denominators, non-finite
+        assert_eq!(as_fraction(3.0), None);
+        assert_eq!(as_fraction(std::f64::consts::PI), None);
+        assert_eq!(as_fraction(2f64.sqrt()), None);
+        assert_eq!(as_fraction(f64::NAN), None);
+        assert_eq!(as_fraction(f64::INFINITY), None);
+        assert_eq!(as_fraction(1.0 / 1_000_003.0), None);
     }
 
     #[test]

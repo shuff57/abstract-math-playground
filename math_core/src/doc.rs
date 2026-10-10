@@ -307,6 +307,9 @@ pub struct ItemStyle {
     // = the default place. (A plain comment: the schema's prompt copy has a size budget.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label_offset: Option<[f64; 2]>,
+    // Number items: show the value as a fraction (`7/3`) when it is one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub as_fraction: bool,
     // Point items: which coordinates the pointer may change; absent = both. Only coordinates
     // that are a number, slider or definition move at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -976,6 +979,7 @@ mod tests {
                     residual_plot: i % 4 == 0,
                     label_offset: Some([12.0, -30.5]),
                     drag_mode: Some(DragMode::X),
+                    as_fraction: i % 4 == 0,
                 };
             }
             d.add_item(it).unwrap();
@@ -1406,6 +1410,7 @@ mod tests {
             "showLabel",
             "labelOffset",
             "dragMode",
+            "asFraction",
         ] {
             assert!(!j.contains(k), "{k} in {j}");
         }

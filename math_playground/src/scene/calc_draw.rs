@@ -401,11 +401,18 @@ pub(super) fn collect_infos(
                 continue;
             }
             if let Ok(Value::Num(v)) = eval_value(&r, &Bindings::new().with_angle(angle)) {
-                let shown = format_value(v);
+                let mut shown = format_value(v);
+                let mut shown_latex = shown.clone();
+                if pr.item.style.as_fraction {
+                    if let Some((p, q)) = math_core::stats::as_fraction(v) {
+                        shown = format!("{p}/{q}");
+                        shown_latex = format!("{}\\frac{{{}}}{{{q}}}", if p < 0 { "-" } else { "" }, p.abs());
+                    }
+                }
                 out.push(ItemInfo {
                     id: id.clone(),
                     kind: "value".into(),
-                    latex: Some(format!("{} = {}", to_latex(&pr.expr), if shown.is_empty() { "\\text{undefined}".into() } else { shown.clone() })),
+                    latex: Some(format!("{} = {}", to_latex(&pr.expr), if shown.is_empty() { "\\text{undefined}".into() } else { shown_latex })),
                     text: Some(if shown.is_empty() { "undefined".into() } else { shown }),
                     value: finite(v),
                     ..Default::default()
@@ -552,6 +559,31 @@ mod tests {
         assert!(g.diagnostics.is_empty());
         // d/dx sin(x deg) = (pi/180) cos(x): tiny, so the curve hugs the x axis.
         assert!(g.segments.iter().filter(|s| s.width == crate::scene::CURVE_W).all(|s| s.p0[1].abs() < 0.05));
+    }
+
+    #[test]
+    fn a_number_item_can_show_its_value_as_a_fraction() {
+        let mut d = doc_with(&[("f", "1/3+1/6"), ("p", "pi"), ("n", "4")]);
+        let plain = build(&d, Mode::D2);
+        assert_eq!(info(&plain, "f").text.as_deref(), Some("0.5"));
+        for id in ["f", "p", "n"] {
+            d.items.iter_mut().find(|i| i.id == id).unwrap().style.as_fraction = true;
+        }
+        let g = build(&d, Mode::D2);
+        let f = info(&g, "f");
+        assert_eq!(f.text.as_deref(), Some("1/2"));
+        assert!(f.latex.as_deref().unwrap().ends_with("= \\frac{1}{2}"), "{:?}", f.latex);
+        assert!((f.value.unwrap() - 0.5).abs() < 1e-12, "the number itself is unchanged");
+        // not a fraction: pi and an integer stay decimal
+        assert_eq!(info(&g, "p").text.as_deref(), Some("3.1415926536"));
+        assert_eq!(info(&g, "n").text.as_deref(), Some("4"));
+        // negative
+        let mut d = doc_with(&[("m", "-7/4")]);
+        d.items[0].style.as_fraction = true;
+        let gm = build(&d, Mode::D2);
+        let m = info(&gm, "m");
+        assert_eq!(m.text.as_deref(), Some("-7/4"));
+        assert!(m.latex.as_deref().unwrap().ends_with("= -\\frac{7}{4}"));
     }
 
     #[test]
