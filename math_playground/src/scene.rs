@@ -656,7 +656,7 @@ fn is_listish(e: &Expr) -> bool {
         Expr::Num(_) | Expr::Var(_) => false,
         Expr::List(_) => true,
         Expr::Call(n, args) => {
-            matches!(n.as_str(), "range" | "for" | "index")
+            matches!(n.as_str(), "range" | "for" | "index" | "distance" | "midpoint" | "random")
                 || STAT_PLOTS.contains(&n.as_str())
                 || args.iter().any(is_listish)
         }
@@ -5397,6 +5397,31 @@ mod tests {
             Mode::D1,
         );
         assert_eq!(dots(&g, Mode::D1, [0.0; 3]).len(), 6);
+    }
+
+    #[test]
+    fn distance_midpoint_and_random_draw_like_other_list_values() {
+        // distance is a number: a dot on the 1D line at 5; random(n, seed) is a list of dots.
+        let g = build(&doc_with(&[("d", "distance((0,0),(3,4))")]), Mode::D1);
+        assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
+        let xs: Vec<f64> = dots(&g, Mode::D1, [0.0; 3]).iter().map(|p| p[0]).collect();
+        assert_eq!(xs, vec![5.0]);
+        let g = build(&doc_with(&[("r", "random(6, 4)")]), Mode::D1);
+        assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
+        let xs: Vec<f64> = dots(&g, Mode::D1, [0.0; 3]).iter().map(|p| p[0]).collect();
+        assert_eq!(xs.len(), 6);
+        assert!(xs.iter().all(|v| (0.0..1.0).contains(v)));
+        // the same document draws the same numbers again (a redraw must not reshuffle)
+        let g2 = build(&doc_with(&[("r", "random(6, 4)")]), Mode::D1);
+        let xs2: Vec<f64> = dots(&g2, Mode::D1, [0.0; 3]).iter().map(|p| p[0]).collect();
+        assert_eq!(xs, xs2);
+        // a midpoint is a point in 2D
+        let g = build(&doc_with(&[("m", "midpoint((0,0),(4,6))")]), Mode::D2);
+        assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
+        let near = dots(&g, Mode::D2, [0.0; 3])
+            .iter()
+            .any(|p| (p[0] - 2.0).abs() < 1e-9 && (p[1] - 3.0).abs() < 1e-9);
+        assert!(near, "a dot at (2, 3)");
     }
 
     #[test]

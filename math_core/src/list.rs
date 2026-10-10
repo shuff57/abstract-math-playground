@@ -137,8 +137,29 @@ impl From<StatsError> for ListError {
 type R<T> = Result<T, ListError>;
 
 pub fn eval_value(expr: &Expr, b: &Bindings) -> Result<Value, ListError> {
-    let mut ev = Evaluator { base: b, locals: Vec::new(), steps: 0, cache: HashMap::new() };
+    let mut ev = Evaluator {
+        base: b,
+        locals: Vec::new(),
+        steps: 0,
+        cache: HashMap::new(),
+        rng: RANDOM_SEED,
+    };
     ev.ev(expr, 0)
+}
+
+/// Where `random()` starts in every evaluation: the numbers are the same each time the same
+/// expression is evaluated (a redraw must not reshuffle a graph), and `random(n, seed)` gives a
+/// different stream per seed, e.g. a slider.
+const RANDOM_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// One step of splitmix64: returns a uniform number in `[0, 1)` and advances `state`.
+fn next_unit(state: &mut u64) -> f64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
 }
 
 struct Evaluator<'a> {
@@ -146,6 +167,8 @@ struct Evaluator<'a> {
     locals: Vec<(String, Value)>,
     steps: u64,
     cache: HashMap<(String, usize), Program>,
+    /// State of the `random()` stream of this evaluation.
+    rng: u64,
 }
 
 fn apply_bin(op: BinOp, a: f64, b: f64) -> f64 {
@@ -803,6 +826,73 @@ impl<'a> Evaluator<'a> {
                 self.tick(out.len())?;
                 Ok(Value::List(out))
             }
+            "gcd" | "lcm" if n == 1 => {
+                // Over a list: the gcd / lcm of all its elements (NaN for an empty list).
+                let l = slice_of(&a[0])?;
+                let f: fn(f64, f64) -> f64 = if name == "gcd" { stats::gcd } else { stats::lcm };
+                Ok(Value::Num(match l.split_first() {
+                    Some((first, rest)) => rest.iter().fold(f(*first, *first), |acc, v| f(acc, *v)),
+                    None => f64::NAN,
+                }))
+            }
+            "distance" | "midpoint" => {
+                check_arity(name, "2", n == 2, n)?;
+                let pairs = point_pairs(name, &a[0], &a[1])?;
+                self.tick(pairs.0.len())?;
+                let is_list = pairs.1;
+                if name == "distance" {
+                    let d: Vec<f64> = pairs
+                        .0
+                        .iter()
+                        .map(|(p, q)| p.iter().zip(q).map(|(x, y)| (x - y) * (x - y)).sum::<f64>().sqrt())
+                        .collect();
+                    Ok(if is_list { Value::List(d) } else { Value::Num(d[0]) })
+                } else {
+                    let mut m: Vec<Vec<f64>> = pairs
+                        .0
+                        .iter()
+                        .map(|(p, q)| p.iter().zip(q).map(|(x, y)| (x + y) / 2.0).collect())
+                        .collect();
+                    Ok(if is_list { Value::PointList(m) } else { Value::Point(m.remove(0)) })
+                }
+            }
+            "random" => {
+                check_arity(name, "0 to 2", n <= 2, n)?;
+                if n == 0 {
+                    return Ok(Value::Num(next_unit(&mut self.rng)));
+                }
+                let count = match &a[0] {
+                    Value::Num(k) if k.is_finite() && *k >= 0.0 && *k <= MAX_LIST_LEN as f64 => *k as usize,
+                    Value::Num(k) => {
+                        return Err(ListError::TooLong { limit: if *k < 0.0 { 0 } else { MAX_LIST_LEN } })
+                    }
+                    other => {
+                        return Err(ListError::Type(format!(
+                            "random needs a count, got {}",
+                            kind(other)
+                        )))
+                    }
+                };
+                let mut own;
+                let state = if n == 2 {
+                    let seed = match &a[1] {
+                        Value::Num(s) if s.is_finite() => *s,
+                        other => {
+                            return Err(ListError::Type(format!(
+                                "random needs a number seed, got {}",
+                                kind(other)
+                            )))
+                        }
+                    };
+                    own = RANDOM_SEED ^ seed.to_bits().wrapping_mul(0xD6E8_FEB8_6659_FD93);
+                    &mut own
+                } else {
+                    &mut self.rng
+                };
+                let out: Vec<f64> = (0..count).map(|_| next_unit(state)).collect();
+                self.tick(count)?;
+                Ok(Value::List(out))
+            }
             "corr" | "cov" => {
                 check_arity(name, "2", n == 2, n)?;
                 let (x, y) = (slice_of(&a[0])?, slice_of(&a[1])?);
@@ -811,6 +901,37 @@ impl<'a> Evaluator<'a> {
             _ => self.scalar(name, &a),
         }
     }
+}
+
+/// The `(p, q)` pairs of a two-point function over a point or a list of points on each side
+/// (a single point repeats against a list), and whether the result is a list.
+#[allow(clippy::type_complexity)]
+fn point_pairs(name: &str, a: &Value, b: &Value) -> R<(Vec<(Vec<f64>, Vec<f64>)>, bool)> {
+    let pts = |v: &Value| -> R<(Vec<Vec<f64>>, bool)> {
+        match v {
+            Value::Point(p) => Ok((vec![p.clone()], false)),
+            Value::PointList(l) => Ok((l.clone(), true)),
+            other => Err(ListError::Type(format!("{name} needs points, got {}", kind(other)))),
+        }
+    };
+    let ((pa, la), (pb, lb)) = (pts(a)?, pts(b)?);
+    let len = match (la, lb) {
+        (false, false) => 1,
+        (true, false) => pa.len(),
+        (false, true) => pb.len(),
+        (true, true) if pa.len() == pb.len() => pa.len(),
+        (true, true) => return Err(ListError::LengthMismatch { a: pa.len(), b: pb.len() }),
+    };
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let p = &pa[if la { i } else { 0 }];
+        let q = &pb[if lb { i } else { 0 }];
+        if p.len() != q.len() {
+            return Err(ListError::Type(format!("{name} needs points of the same dimension")));
+        }
+        out.push((p.clone(), q.clone()));
+    }
+    Ok((out, la || lb))
 }
 
 /// Numbers make a list; points of equal dimension make a list of points.
@@ -881,6 +1002,66 @@ mod tests {
         assert!(matches!(err("[1...1e300]"), ListError::TooLong { .. }));
         assert!(matches!(err("[1...L]"), ListError::BadRange(_)));
         assert_eq!(ev("[1...10000]").as_list().unwrap().len(), 10_000);
+    }
+
+    #[test]
+    fn gcd_and_lcm_over_a_list() {
+        assert_eq!(num("gcd([12, 18, 30])"), 6.0);
+        assert_eq!(num("lcm([4, 6, 10])"), 60.0);
+        assert_eq!(num("gcd([7])"), 7.0);
+        assert_eq!(num("gcd(12, 18)"), 6.0);
+        assert!(num("gcd([])").is_nan());
+        assert!(num("gcd([4, 2.5])").is_nan());
+        // two arguments still broadcast
+        assert_eq!(ev("gcd([12, 20], 8)"), list(&[4.0, 4.0]));
+        assert_eq!(ev("lcm([2, 3], [4, 6])"), list(&[4.0, 6.0]));
+    }
+
+    #[test]
+    fn distance_and_midpoint() {
+        assert_eq!(num("distance((0,0),(3,4))"), 5.0);
+        assert_eq!(num("distance((1,2,3),(1,2,3))"), 0.0);
+        assert!((num("distance((0,0,0),(1,2,2))") - 3.0).abs() < 1e-12);
+        assert_eq!(ev("midpoint((0,0),(4,6))"), Value::Point(vec![2.0, 3.0]));
+        // a point against a list repeats; two lists go pairwise
+        assert_eq!(ev("distance((0,0),[(3,4),(6,8)])"), list(&[5.0, 10.0]));
+        assert_eq!(
+            ev("midpoint([(0,0),(2,2)],(2,0))"),
+            Value::PointList(vec![vec![1.0, 0.0], vec![2.0, 1.0]])
+        );
+        assert_eq!(ev("distance([(0,0),(1,1)],[(0,3),(1,5)])"), list(&[3.0, 4.0]));
+        assert!(matches!(err("distance([(0,0),(1,1)],[(0,3)])"), ListError::LengthMismatch { a: 2, b: 1 }));
+        assert!(matches!(err("distance((0,0),(1,2,3))"), ListError::Type(_)));
+        assert!(matches!(err("midpoint(1,(1,2))"), ListError::Type(_)));
+        assert!(matches!(err("distance((0,0))"), ListError::Arity { .. }));
+    }
+
+    #[test]
+    fn random_is_stable_per_evaluation_and_seedable() {
+        let r = num("random()");
+        assert!((0.0..1.0).contains(&r));
+        assert_eq!(num("random()"), r, "the same expression gives the same number");
+        // two calls in one expression draw successive numbers
+        let two = ev("[random(), random()]");
+        let l = two.as_list().unwrap();
+        assert!(l[0] != l[1] && l[0] == r);
+        let a = ev("random(5)");
+        assert_eq!(a.as_list().unwrap().len(), 5);
+        assert!(a.as_list().unwrap().iter().all(|v| (0.0..1.0).contains(v)));
+        assert_eq!(ev("random(5, 1)"), ev("random(5, 1)"));
+        assert!(ev("random(5, 1)") != ev("random(5, 2)"));
+        assert_eq!(ev("random(0)"), list(&[]));
+        // roughly uniform
+        let big = ev("random(2000, 7)");
+        let m: f64 = big.as_list().unwrap().iter().sum::<f64>() / 2000.0;
+        assert!((m - 0.5).abs() < 0.05, "{m}");
+        assert!(matches!(err("random(-1)"), ListError::TooLong { .. }));
+        assert!(matches!(err("random(100000)"), ListError::TooLong { .. }));
+        assert!(matches!(err("random(1,2,3)"), ListError::Arity { .. }));
+        assert!(matches!(err("random(L)"), ListError::Type(_)));
+        // usable in comprehension: a list of rolls 1..6
+        let rolls = ev("[floor(6*random(1, k)[1])+1 for k=[1...50]]");
+        assert!(rolls.as_list().unwrap().iter().all(|v| (1.0..=6.0).contains(v)));
     }
 
     #[test]

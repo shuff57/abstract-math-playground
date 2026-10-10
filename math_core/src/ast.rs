@@ -46,6 +46,9 @@ pub const BUILTIN_FUNCS: &[&str] = &[
     "arccsc", "arccot", "arccoth", "arcsech", "arccsch",
     // `erf(x)`, `gcd(a, b)` and `lcm(a, b)` (`gcf`/`mcd` and `mcm` are aliases), `signum` = `sign`
     "erf", "gcd", "lcm", "gcf", "mcd", "mcm", "signum",
+    // points and sampling, evaluated by the list evaluator: `distance(p, q)`, `midpoint(p, q)`,
+    // `random()`, `random(n)`, `random(n, seed)` (see `list`)
+    "distance", "midpoint", "random",
     // Desmos spellings of `stdev` and `stdevp`
     "stdDev", "stddev", "stdDevP", "stddevp",
     // lists and statistics
