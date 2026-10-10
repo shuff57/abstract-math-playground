@@ -1587,7 +1587,7 @@ impl App {
         id: &str,
         patch: serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), String> {
-        const KEYS: [&str; 15] = [
+        const KEYS: [&str; 16] = [
             "lineWidth",
             "lineStyle",
             "pointStyle",
@@ -1603,6 +1603,7 @@ impl App {
             "asFraction",
             "labelSize",
             "pointOutline",
+            "logMode",
         ];
         let Some(item) = self.doc.items.iter_mut().find(|i| i.id == id) else {
             return Err(format!("no item with id '{id}'"));

@@ -339,6 +339,10 @@ pub struct ItemStyle {
     #[cfg_attr(feature = "schemars", schemars(skip))]
     #[serde(default, skip_serializing_if = "is_false")]
     pub point_outline: bool,
+    // Exponential and power regressions: fit ln y instead of y ("log mode").
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub log_mode: bool,
     // Number items: show the value as a fraction (`7/3`) when it is one.
     #[cfg_attr(feature = "schemars", schemars(skip))]
     #[serde(default, skip_serializing_if = "is_false")]
@@ -1017,6 +1021,7 @@ mod tests {
                     as_fraction: i % 4 == 0,
                     label_size: Some(LabelSize::Large),
                     point_outline: i % 4 == 0,
+                    log_mode: i % 4 == 0,
                 };
             }
             d.add_item(it).unwrap();
@@ -1450,6 +1455,7 @@ mod tests {
             "asFraction",
             "labelSize",
             "pointOutline",
+            "logMode",
         ] {
             assert!(!j.contains(k), "{k} in {j}");
         }

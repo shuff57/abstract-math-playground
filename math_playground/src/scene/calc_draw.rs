@@ -241,7 +241,13 @@ pub(super) fn fit_regressions(
             .into_iter()
             .filter(|n| !matches!(n.as_str(), "x" | "y" | "z"))
             .collect();
-        match reg_family::fit_detected(&pr.expr, &pr.item.latex, &base, Some(&params)) {
+        match reg_family::fit_detected_mode(
+            &pr.expr,
+            &pr.item.latex,
+            &base,
+            Some(&params),
+            pr.item.style.log_mode,
+        ) {
             Ok(f) => {
                 if f.params.iter().any(|(_, v)| !v.is_finite()) {
                     diags.push((pr.item.id.clone(), "regression: the fit did not produce finite parameters".into()));
@@ -646,6 +652,34 @@ mod tests {
         assert_eq!(i.params.len(), 1, "only b is fitted: {:?}", i.params);
         assert_eq!(i.params[0].name, "b");
         assert!((i.params[0].value - 4.0).abs() < 1e-9, "with a = 1, b is the mean of y - x");
+    }
+
+    #[test]
+    fn log_mode_changes_an_exponential_fit_and_reports_a_domain_error_on_bad_data() {
+        let mut d = Doc::new_default();
+        add_table(&mut d, &[
+            ("x_1", &["1", "2", "3", "4", "5", "6"]),
+            ("y_1", &["6", "18", "54", "162", "486", "2187"]),
+        ]);
+        d.items.push(Item::new("r", ItemKind::Equation, "y_1 \\sim ab^{x_1}"));
+        let g = build(&d, Mode::D2);
+        let b_plain = info(&g, "r").params.iter().find(|p| p.name == "b").unwrap().value;
+        d.items.iter_mut().find(|i| i.id == "r").unwrap().style.log_mode = true;
+        let g = build(&d, Mode::D2);
+        assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
+        let b_log = info(&g, "r").params.iter().find(|p| p.name == "b").unwrap().value;
+        assert!((b_log - b_plain).abs() > 1e-6, "{b_log} vs {b_plain}");
+        // the log-space slope of this data: exp of the line through (x, ln y)
+        let lx = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let ly: Vec<f64> = [6.0f64, 18.0, 54.0, 162.0, 486.0, 2187.0].iter().map(|v| v.ln()).collect();
+        let (mx, my) = (3.5, ly.iter().sum::<f64>() / 6.0);
+        let slope = lx.iter().zip(&ly).map(|(x, y)| (x - mx) * (y - my)).sum::<f64>()
+            / lx.iter().map(|x| (x - mx) * (x - mx)).sum::<f64>();
+        assert!((b_log - slope.exp()).abs() < 1e-6, "{b_log} vs {}", slope.exp());
+        // a non-positive y makes log mode a diagnostic, not a panic
+        d.items[0].table.as_mut().unwrap().set_cell(2, 1, "-5").unwrap();
+        let g = build(&d, Mode::D2);
+        assert!(g.diagnostics.iter().any(|(id, m)| id == "r" && m.contains("log mode")), "{:?}", g.diagnostics);
     }
 
     #[test]

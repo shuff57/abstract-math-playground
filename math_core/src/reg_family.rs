@@ -318,6 +318,40 @@ pub fn fit_detected(
     defs: &Defs,
     params: Option<&[String]>,
 ) -> Result<FitResult, RegressError> {
+    fit_detected_mode(reg, latex, defs, params, false)
+}
+
+/// [`fit_detected`] with Desmos' "log mode": for the exponential and power families the
+/// parameters are those of the straight-line fit of `ln y` (against `x` or `ln x`), instead of
+/// the minimum of the squared error in `y`. It needs positive data (an error otherwise) and
+/// weighs small and large `y` alike, which suits data over several orders of magnitude. The
+/// reported `r2` and `rmse` are still measured in `y`. Other families ignore `log_mode`.
+pub fn fit_detected_mode(
+    reg: &Expr,
+    latex: &str,
+    defs: &Defs,
+    params: Option<&[String]>,
+    log_mode: bool,
+) -> Result<FitResult, RegressError> {
+    if log_mode {
+        if let Some((f, y, x)) = Family::detect(latex) {
+            if matches!(f, Family::Exponential | Family::Power) {
+                let (xs, ys) = (list_of(defs, &x), list_of(defs, &y));
+                let init = match (xs, ys) {
+                    (Some(xs), Some(ys)) => f.starts(&xs, &ys),
+                    _ => None,
+                };
+                let Some(init) = init else {
+                    return Err(RegressError::Domain(
+                        "log mode needs positive data (x for power, y for both)".into(),
+                    ));
+                };
+                // No iterations: the log-space solution itself, with its fit statistics.
+                let opts = FitOptions { init, max_iter: 0 };
+                return regress::fit_regression_with(reg, defs, params, &opts);
+            }
+        }
+    }
     let seeded = Family::detect(latex).and_then(|(f, y, x)| {
         let (xs, ys) = (list_of(defs, &x)?, list_of(defs, &y)?);
         f.starts(&xs, &ys)
@@ -448,6 +482,43 @@ mod tests {
         // Too little data is not seeded (the plain fit may still run).
         assert!(Family::Sinusoidal.starts(&[1.0, 2.0, 3.0], &[1.0, 0.0, 1.0]).is_none());
         assert!(Family::Sinusoidal.starts(&[1.0; 6], &[1.0, 0.0, 1.0, 2.0, 1.0, 3.0]).is_none());
+    }
+
+    #[test]
+    fn log_mode_fits_ln_y_instead_of_y() {
+        // Data over several orders of magnitude with one outlier at the large end: the fit in y
+        // is dragged to the outlier, the log-space fit follows the whole curve.
+        let x: Vec<f64> = (1..=8).map(|i| i as f64).collect();
+        let mut y: Vec<f64> = x.iter().map(|t| 2.0 * 3.0f64.powf(*t)).collect();
+        y[7] *= 1.5;
+        let latex = Family::Exponential.latex("y_1", "x_1");
+        let reg = parse(&latex).unwrap();
+        let params: Vec<String> = Family::Exponential.params().iter().map(|s| s.to_string()).collect();
+        let normal = fit_detected_mode(&reg, &latex, &defs(&x, &y), Some(&params), false).unwrap();
+        let logm = fit_detected_mode(&reg, &latex, &defs(&x, &y), Some(&params), true).unwrap();
+        // the log-space line through ln y: slope ln b, the closed-form answer
+        let ly: Vec<f64> = y.iter().map(|v| v.ln()).collect();
+        let line = regress::polyfit(&x, &ly, 1).unwrap();
+        assert!(close(logm.param("b").unwrap(), line.param("a_1").unwrap().exp(), 1e-9));
+        assert!(close(logm.param("a").unwrap(), line.param("a_0").unwrap().exp(), 1e-9));
+        // and it differs from the squared-error-in-y fit
+        assert!((logm.param("b").unwrap() - normal.param("b").unwrap()).abs() > 1e-4);
+        assert!(logm.r2.is_finite() && logm.r2 > 0.9, "r2 stays measured in y: {}", logm.r2);
+        // the power family too
+        let y: Vec<f64> = x.iter().map(|t| 5.0 * t.powf(1.5)).collect();
+        let latex = Family::Power.latex("y_1", "x_1");
+        let reg = parse(&latex).unwrap();
+        let pw = fit_detected_mode(&reg, &latex, &defs(&x, &y), Some(&["a".into(), "b".into()]), true).unwrap();
+        assert!(close(pw.param("a").unwrap(), 5.0, 1e-9) && close(pw.param("b").unwrap(), 1.5, 1e-9));
+        // non-positive data is an error, other families ignore the flag
+        let bad = vec![1.0, -2.0, 3.0, 4.0];
+        let err = fit_detected_mode(&reg, &latex, &defs(&[1.0, 2.0, 3.0, 4.0], &bad), None, true);
+        assert!(matches!(err, Err(RegressError::Domain(_))), "{err:?}");
+        let lin = Family::Linear.latex("y_1", "x_1");
+        let lreg = parse(&lin).unwrap();
+        let a = fit_detected_mode(&lreg, &lin, &defs(&[1.0, 2.0, 3.0], &[1.0, 2.0, 4.0]), None, true).unwrap();
+        let b = fit_detected_mode(&lreg, &lin, &defs(&[1.0, 2.0, 3.0], &[1.0, 2.0, 4.0]), None, false).unwrap();
+        assert_eq!(a.params, b.params);
     }
 
     #[test]
