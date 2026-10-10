@@ -121,6 +121,12 @@ pub struct ViewState {
         skip_serializing_if = "is_unit_scale"
     )]
     pub text_scale: f64,
+    // Linear axes keep the typed y range even when that makes the x and y scales differ
+    // (`false`: equal scales, the y range follows the canvas shape). Left out of the JSON
+    // schema: the workspace writes it.
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub free_aspect: bool,
 }
 
 /// Smallest and largest `textScale`.
@@ -752,6 +758,7 @@ impl Doc {
                 y_scale: AxisScale::Linear,
                 weight: Weight::Normal,
                 text_scale: 1.0,
+                free_aspect: false,
             },
             items: Vec::new(),
             sliders: BTreeMap::new(),

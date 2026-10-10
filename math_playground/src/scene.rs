@@ -1270,8 +1270,16 @@ impl<'a> Builder<'a> {
         let step = self.ext.fixed_steps[a]?;
         let (vw, vh) = self.px();
         let px = if a == 0 { vw } else { vh };
-        let span = self.win.max[a] - self.win.min[a];
+        let span = self.world_span(a);
         (step > 0.0 && span / step <= px / 6.0).then_some(step)
+    }
+
+    /// The window's extent on axis `a` in the units its numbers are written in: world units on a
+    /// linear axis, also when `freeAspect` stretches it (display units on a logarithmic axis,
+    /// where ticks follow decades).
+    fn world_span(&self, a: usize) -> f64 {
+        let s = if a < 2 && !self.ext.map.log[a] { self.ext.map.scale[a] } else { 1.0 };
+        (self.win.max[a] - self.win.min[a]) / s
     }
 
     /// Target pixel gap between major lines: the tick numbers grow with the text size, so does this.
@@ -1290,9 +1298,9 @@ impl<'a> Builder<'a> {
             }
             Mode::D2 => [
                 self.fixed_step(0)
-                    .unwrap_or_else(|| nice_step(span(0), vw, tp)),
+                    .unwrap_or_else(|| nice_step(self.world_span(0), vw, tp)),
                 self.fixed_step(1)
-                    .unwrap_or_else(|| nice_step(span(1), vh, tp)),
+                    .unwrap_or_else(|| nice_step(self.world_span(1), vh, tp)),
                 1.0,
             ],
             Mode::D3 => {
@@ -1624,11 +1632,14 @@ impl<'a> Builder<'a> {
         let map = self.ext.map;
         let mut out = Vec::new();
         if !map.log[axis] {
+            // Multiples of the step in world units, placed at their display positions (the
+            // two differ by `scale` when the view keeps its typed y range).
+            let s = map.scale[axis];
             let div = minor_divisions(step);
-            for (k, v) in multiples(lo, hi, step / div as f64) {
+            for (k, v) in multiples(lo / s, hi / s, step / div as f64) {
                 let major = k % div == 0;
                 out.push(Tick {
-                    pos: v,
+                    pos: v * s,
                     major,
                     text: major.then(|| format_tick(v, step)),
                 });
@@ -5413,6 +5424,41 @@ mod tests {
             Mode::D1,
         );
         assert_eq!(dots(&g, Mode::D1, [0.0; 3]).len(), 6);
+    }
+
+    #[test]
+    fn a_stretched_view_numbers_the_axes_in_world_units_and_draws_curves_in_place() {
+        let mut d = doc_with(&[("a", "y=100x")]);
+        d.view.free_aspect = true;
+        d.view.window.min = [-10.0, -1000.0, -1.0];
+        d.view.window.max = [10.0, 1000.0, 1.0];
+        let vp = (800, 600);
+        let map = doc_map(&d, Mode::D2, vp);
+        assert!(!map.is_linear() && map.scale[1] != 1.0, "{map:?}");
+        let g = build_scene(&d, Mode::D2, map.to_display(&d.view.window), [0.0; 3], vp, &Theme::light());
+        assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
+        // axis numbers are world numbers (x 5, y 500), placed at their display positions
+        let label = |axis: u8, text: &str| g.labels.iter().find(|l| l.axis == axis && l.text == text);
+        let texts = |axis: u8| -> Vec<String> {
+            g.labels.iter().filter(|l| l.axis == axis).map(|l| l.text.clone()).collect()
+        };
+        let lx = label(0, "4").unwrap_or_else(|| panic!("x labels {:?}", texts(0)));
+        assert!((lx.pos[0] - 4.0).abs() < 1e-9, "x is unscaled: {:?}", lx.pos);
+        let ly = label(1, "500").unwrap_or_else(|| panic!("y labels {:?}", texts(1)));
+        assert!((ly.pos[1] - map.fwd(1, 500.0)).abs() < 1e-6, "{:?}", ly.pos);
+        // the curve y = 100x passes through the display position of (5, 500)
+        let want = map.fwd3([5.0, 500.0, 0.0]);
+        let hit = g.segments.iter().any(|s| {
+            s.width == CURVE_W
+                && (s.p0[0] as f64 - want[0]).abs() < 0.2
+                && (s.p0[1] as f64 - want[1]).abs() < 0.5 * map.scale[1].max(0.01) * 10.0
+        });
+        assert!(hit, "curve near display {want:?}");
+        // a point's dot sits at the display position too
+        let mut p = doc_with(&[("p", "(5,500)")]);
+        p.view = d.view.clone();
+        let g = build_scene(&p, Mode::D2, map.to_display(&p.view.window), [0.0; 3], vp, &Theme::light());
+        assert!(dots(&g, Mode::D2, [0.0; 3]).iter().any(|q| (q[0] - want[0]).abs() < 1e-6 && (q[1] - want[1]).abs() < 1e-6));
     }
 
     #[test]

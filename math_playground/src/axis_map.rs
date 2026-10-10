@@ -25,6 +25,9 @@ pub struct AxisMap {
     pub log: [bool; 2],
     /// Display units per decade on a logarithmic axis (unused on a linear one).
     pub k: [f64; 2],
+    /// Display units per world unit on a LINEAR axis: 1 for equal scales, otherwise the axes
+    /// have different scales (`freeAspect` views, where the typed y range is honoured).
+    pub scale: [f64; 2],
 }
 
 impl Default for AxisMap {
@@ -37,10 +40,13 @@ impl AxisMap {
     pub const LINEAR: AxisMap = AxisMap {
         log: [false, false],
         k: [1.0, 1.0],
+        scale: [1.0, 1.0],
     };
 
+    /// True when display coordinates ARE world coordinates: no logarithmic axis and no stretch.
+    /// (Every place that treats the two as the same asks this.)
     pub fn is_linear(&self) -> bool {
-        !self.log[0] && !self.log[1]
+        !self.log[0] && !self.log[1] && self.scale == [1.0, 1.0]
     }
 
     /// The map for `view` on a canvas of aspect `aspect` (width / height): the view's world
@@ -49,14 +55,28 @@ impl AxisMap {
     /// logarithmic axis with min <= 0) gives the linear map.
     pub fn for_view(view: &ViewState, aspect: f64) -> AxisMap {
         let log = [view.x_scale.is_log(), view.y_scale.is_log()];
-        if !log[0] && !log[1] || view.check_log_window(None).is_err() {
-            return AxisMap::LINEAR;
-        }
         let aspect = if aspect.is_finite() && aspect > 0.0 {
             aspect
         } else {
             1.0
         };
+        if !log[0] && !log[1] {
+            // Linear axes: equal scales, unless the view asks for its y range to be honoured.
+            if view.free_aspect {
+                let w = &view.window;
+                let (sx, sy) = (w.max[0] - w.min[0], w.max[1] - w.min[1]);
+                if sx.is_finite() && sy.is_finite() && sx > 0.0 && sy > 0.0 {
+                    let s = sx / (aspect * sy);
+                    if s.is_finite() && s > 0.0 && (s - 1.0).abs() > 1e-9 {
+                        return AxisMap { scale: [1.0, s], ..AxisMap::LINEAR };
+                    }
+                }
+            }
+            return AxisMap::LINEAR;
+        }
+        if view.check_log_window(None).is_err() {
+            return AxisMap::LINEAR;
+        }
         let w = &view.window;
         let span = |a: usize| {
             if log[a] {
@@ -76,7 +96,7 @@ impl AxisMap {
             [1.0, sx / (aspect * sy)]
         };
         if k.iter().all(|v| v.is_finite() && *v > 0.0) {
-            AxisMap { log, k }
+            AxisMap { log, k, scale: [1.0, 1.0] }
         } else {
             AxisMap::LINEAR
         }
@@ -91,6 +111,8 @@ impl AxisMap {
             } else {
                 f64::NAN
             }
+        } else if a < 2 {
+            v * self.scale[a]
         } else {
             v
         }
@@ -100,6 +122,8 @@ impl AxisMap {
     pub fn inv(&self, a: usize, d: f64) -> f64 {
         if a < 2 && self.log[a] {
             10f64.powf(d / self.k[a])
+        } else if a < 2 {
+            d / self.scale[a]
         } else {
             d
         }
@@ -134,6 +158,8 @@ impl AxisMap {
                 "exp",
                 vec![Expr::bin(BinOp::Mul, Expr::num(LN10 / self.k[a]), v)],
             )
+        } else if self.scale[a] != 1.0 {
+            Expr::bin(BinOp::Div, v, Expr::num(self.scale[a]))
         } else {
             v
         }
@@ -147,6 +173,8 @@ impl AxisMap {
                 Expr::num(self.k[a] / LN10),
                 Expr::call("ln", vec![e]),
             )
+        } else if a < 2 && self.scale[a] != 1.0 {
+            Expr::bin(BinOp::Mul, Expr::num(self.scale[a]), e)
         } else {
             e
         }
@@ -157,7 +185,7 @@ impl AxisMap {
     pub fn display_expr(&self, e: &Expr) -> Expr {
         let mut out = e.clone();
         for (a, n) in [(0usize, "x"), (1, "y")] {
-            if self.log[a] && out.contains_var(n) {
+            if (self.log[a] || self.scale[a] != 1.0) && out.contains_var(n) {
                 out = out.subst(n, &self.world_of(a, n));
             }
         }
@@ -212,6 +240,47 @@ mod tests {
         let m2 = AxisMap::for_view(&v2, 1.0);
         assert_eq!(m2.k[0], 1.0);
         assert!((m2.k[1] - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn free_aspect_stretches_y_so_the_typed_range_fills_the_canvas() {
+        let mut v = view(AxisScale::Linear, AxisScale::Linear, [-10.0, -1000.0], [10.0, 1000.0]);
+        // off: equal scales, the identity
+        assert_eq!(AxisMap::for_view(&v, 2.0), AxisMap::LINEAR);
+        v.free_aspect = true;
+        let m = AxisMap::for_view(&v, 2.0);
+        assert!(!m.is_linear() && !m.log[0] && !m.log[1]);
+        assert_eq!(m.scale[0], 1.0);
+        let d = m.to_display(&v.window);
+        // display spans keep the canvas aspect: 20 wide, 10 tall
+        assert!(((d.max[0] - d.min[0]) / (d.max[1] - d.min[1]) - 2.0).abs() < 1e-12);
+        let back = m.to_world(d);
+        for a in 0..2 {
+            assert!((back.min[a] - v.window.min[a]).abs() < 1e-9);
+            assert!((back.max[a] - v.window.max[a]).abs() < 1e-9);
+        }
+        // a window that already has the canvas aspect is the identity (no needless stretch)
+        let eq = {
+            let mut e = view(AxisScale::Linear, AxisScale::Linear, [-10.0, -5.0], [10.0, 5.0]);
+            e.free_aspect = true;
+            e
+        };
+        assert_eq!(AxisMap::for_view(&eq, 2.0), AxisMap::LINEAR);
+        // expressions follow: y = 100 x is Y = s * 100 * (X / 1) on the stretched axis
+        let e = m.display_of(1, m.display_expr(&Expr::bin(
+            BinOp::Mul,
+            Expr::num(100.0),
+            Expr::var("x"),
+        )));
+        let p = math_core::compile::compile(&e, &["x"], math_core::compile::Angle::Rad).unwrap();
+        assert!((p.eval(&[3.0]) - m.fwd(1, 300.0)).abs() < 1e-9);
+        // log axes win over the flag
+        let l = {
+            let mut l = view(AxisScale::Log, AxisScale::Linear, [1.0, -5.0], [100.0, 5.0]);
+            l.free_aspect = true;
+            l
+        };
+        assert!(AxisMap::for_view(&l, 2.0).log[0]);
     }
 
     #[test]

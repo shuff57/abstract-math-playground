@@ -146,6 +146,9 @@ pub enum Command {
         /// to 3. Any other value is rejected with an `error` and nothing changes.
         #[serde(default, rename = "textScale", alias = "text_scale")]
         text_scale: Option<f64>,
+        /// Keep the typed y range on linear axes even when the x and y scales then differ.
+        #[serde(default, rename = "freeAspect", alias = "free_aspect")]
+        free_aspect: Option<bool>,
     },
     /// Transient pixel scale of the drawn widths for an export rendered at a larger canvas size
     /// (`scale` 2 draws lines twice as wide in pixels, so they keep their look). Not saved in
@@ -1134,6 +1137,7 @@ impl App {
                 y_scale,
                 weight,
                 text_scale,
+                free_aspect,
             } => {
                 if let Some(w) = &window {
                     if let Err(m) = w.validate() {
@@ -1178,7 +1182,9 @@ impl App {
                         return;
                     }
                 }
+                let aspect_change = free_aspect.is_some_and(|f| f != self.doc.view.free_aspect);
                 let v = &mut self.doc.view;
+                v.free_aspect = free_aspect.unwrap_or(v.free_aspect);
                 v.text_scale = text_scale.unwrap_or(v.text_scale);
                 v.grid = grid.unwrap_or(v.grid);
                 v.axes = axes.unwrap_or(v.axes);
@@ -1202,6 +1208,10 @@ impl App {
                 v.y_step = step(y_step, v.y_step);
                 v.grid_kind = grid_kind.unwrap_or(v.grid_kind);
                 v.weight = weight.unwrap_or(v.weight);
+                if aspect_change && !(scales_change || window.is_some()) {
+                    // Only the aspect rule changed: re-frame the same world window under it.
+                    self.frame_world_window(world_now.clone());
+                }
                 if scales_change || window.is_some() {
                     let was_linear =
                         self.doc.view.x_scale.is_linear() && self.doc.view.y_scale.is_linear();
@@ -4035,6 +4045,65 @@ mod tests {
         // The rig was not panned by the drag.
         let w = a.world_window();
         assert!((w.min[0] - 0.1).abs() < 1e-9 && (w.max[0] - 1000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn free_aspect_honours_the_typed_y_range_and_keeps_world_coordinates() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"p","latex":"(5,500)"}"#);
+        let view = |ev: &[serde_json::Value]| {
+            ev.iter().rev().find(|e| e["t"] == "view").cloned().expect("view event")
+        };
+        // equal scales first: the map is the identity
+        cmd(
+            &mut a,
+            r#"{"t":"setView","window":{"min":[-10,-1000,-1],"max":[10,1000,1]}}"#,
+        );
+        assert!(a.map.is_linear());
+        let px_per_unit = |a: &App| {
+            let (x0, y0) = a.rig.world_to_pixel(a.map.fwd3([0.0, 0.0, 0.0]), (800.0, 600.0));
+            let (x1, y1) = a.rig.world_to_pixel(a.map.fwd3([1.0, 1.0, 0.0]), (800.0, 600.0));
+            ((x1 - x0).abs(), (y1 - y0).abs())
+        };
+        let (sx, sy) = px_per_unit(&a);
+        assert!((sx / sy - 1.0).abs() < 1e-6, "equal pixels per unit: {sx} vs {sy}");
+        // free aspect: the typed range is the shown range exactly
+        let ev = cmd(
+            &mut a,
+            r#"{"t":"setView","freeAspect":true,"window":{"min":[-10,-1000,-1],"max":[10,1000,1]}}"#,
+        );
+        let v = view(&ev);
+        // free aspect: a world x unit is many times wider on screen than a y unit
+        let (sx, sy) = px_per_unit(&a);
+        assert!(sx / sy > 50.0, "x {sx} px/unit vs y {sy} px/unit");
+        let near = |x: &serde_json::Value, w: f64| (x.as_f64().unwrap() - w).abs() < 1e-6;
+        assert!(near(&v["min"][0], -10.0) && near(&v["max"][0], 10.0), "{v}");
+        assert!(near(&v["min"][1], -1000.0) && near(&v["max"][1], 1000.0), "{v}");
+        assert!(!a.map.is_linear() && a.map.scale[1] != 1.0);
+        // a point drag reads back in world units
+        let vp = (800.0, 600.0);
+        let at = |a: &App, x: f64, y: f64| a.rig.world_to_pixel(a.map.fwd3([x, y, 0.0]), vp);
+        let (px, py) = at(&a, 5.0, 500.0);
+        let (tx, ty) = at(&a, 8.0, 250.0);
+        cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"down","x":{px},"y":{py}}}"#));
+        let ev = cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"move","x":{tx},"y":{ty}}}"#));
+        cmd(&mut a, &format!(r#"{{"t":"pointer","phase":"up","x":{tx},"y":{ty}}}"#));
+        let edited = ev.iter().find(|e| e["t"] == "itemEdited").expect("the point moved");
+        let latex = edited["latex"].as_str().unwrap();
+        let inner = latex.trim_start_matches('(').trim_end_matches(')');
+        let (x, y) = inner.split_once(',').unwrap();
+        let (x, y): (f64, f64) = (x.trim().parse().unwrap(), y.trim().parse().unwrap());
+        assert!((x - 8.0).abs() < 0.1 && (y - 250.0).abs() < 5.0, "{latex}");
+        // the view is preserved by the drag, and the flag round-trips through the document
+        let w = a.world_window();
+        assert!((w.min[1] + 1000.0).abs() < 1e-6 && (w.max[1] - 1000.0).abs() < 1e-6);
+        assert!(doc::to_json(&a.doc).contains("freeAspect"));
+        // turning it off returns to equal scales
+        let ev = cmd(&mut a, r#"{"t":"setView","freeAspect":false}"#);
+        assert!(a.map.is_linear(), "{:?}", a.map);
+        let (sx, sy) = px_per_unit(&a);
+        assert!((sx / sy - 1.0).abs() < 1e-6, "equal again: {sx} vs {sy}");
+        let _ = view(&ev);
     }
 
     #[test]
