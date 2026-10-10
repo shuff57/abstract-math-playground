@@ -31,7 +31,8 @@ Sliders:
 | `t` | Fields | Notes |
 | --- | --- | --- |
 | `setSlider` | `name`, `value`, optional `min`, `max`, `step` | Creates the slider if needed (range defaults to -10..10). |
-| `removeSlider` | `name` | |
+| `removeSlider` | `name` | Also drops the slider's saved playback settings. |
+| `setSliderPlay` | `name`, optional `mode` (`oscillate`, `loop`, `once`), optional `speed` (multiplier in (0, 20]) | Saves how the workspace animates the slider (the engine itself does not animate); stored in the document's `sliderPlay` map, which keeps only non-default entries. An unknown slider or a bad speed gives an `error` event and changes nothing. |
 
 View and theme:
 

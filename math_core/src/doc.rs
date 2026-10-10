@@ -431,6 +431,39 @@ pub struct SliderCfg {
     pub value: f64,
 }
 
+// How a playing slider repeats (the workspace's Mode menu). Plain comments: doc comments are
+// copied into the JSON schema, which has a size budget.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SliderPlayMode {
+    // Back and forth between min and max (the default).
+    Oscillate,
+    // min to max, then jump back to min.
+    Loop,
+    // min to max once, then stop.
+    Once,
+}
+
+// A slider's saved playback settings; absent fields are the defaults (oscillate, 1x).
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SliderPlay {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SliderPlayMode>,
+    // Speed multiplier in (0, 20].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f64>,
+}
+
+impl SliderPlay {
+    /// True when nothing differs from the defaults (the entry is then not stored).
+    pub fn is_default(&self) -> bool {
+        self.mode.is_none() && self.speed.is_none()
+    }
+}
+
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -440,6 +473,11 @@ pub struct Doc {
     pub items: Vec<Item>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sliders: BTreeMap<String, SliderCfg>,
+    // Playback settings of sliders that differ from the defaults (additive field). Left out of
+    // the JSON schema: the workspace writes it, a generated document never needs to.
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slider_play: BTreeMap<String, SliderPlay>,
     /// Ticker configuration (additive field: absent in older v1 documents). Whether it is
     /// running is runtime state and is never saved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -675,6 +713,7 @@ impl Doc {
             },
             items: Vec::new(),
             sliders: BTreeMap::new(),
+            slider_play: BTreeMap::new(),
             ticker: None,
             slice: None,
         }
@@ -749,6 +788,15 @@ impl Doc {
         if let Some(sl) = &self.slice {
             if let Err(m) = sl.validate() {
                 e.push(format!("slice: {m}"));
+            }
+        }
+        for (name, p) in &self.slider_play {
+            let ctx = format!("sliderPlay {:?}", truncate(name));
+            if !self.sliders.contains_key(name) {
+                e.push(format!("{ctx}: no such slider"));
+            }
+            if p.speed.is_some_and(|s| !(s.is_finite() && s > 0.0 && s <= 20.0)) {
+                e.push(format!("{ctx}: speed must be in (0, 20]"));
             }
         }
         for (name, s) in &self.sliders {
@@ -1320,6 +1368,28 @@ mod tests {
         let mut bad = d.clone();
         bad.items[0].table.as_mut().unwrap().columns[1].style.color = Some("javascript:".into());
         assert!(from_json(&to_json(&bad)).is_err());
+    }
+
+    #[test]
+    fn slider_play_round_trips_and_is_validated() {
+        let mut d = Doc::new_default();
+        d.sliders.insert("a".into(), SliderCfg { min: 0.0, max: 1.0, step: None, value: 0.5 });
+        assert!(!to_json(&d).contains("sliderPlay"), "defaults stay absent");
+        d.slider_play.insert(
+            "a".into(),
+            SliderPlay { mode: Some(SliderPlayMode::Once), speed: Some(0.5) },
+        );
+        let back = from_json(&to_json(&d)).unwrap();
+        assert_eq!(back.slider_play, d.slider_play);
+        assert_eq!(decode_hash(&encode_hash(&d)).unwrap().slider_play, d.slider_play);
+        let mut bad = d.clone();
+        bad.slider_play.get_mut("a").unwrap().speed = Some(0.0);
+        assert!(bad.validate().is_err());
+        let mut bad = d.clone();
+        bad.slider_play.insert("ghost".into(), SliderPlay::default());
+        assert!(bad.validate().is_err());
+        // an older document without the key loads with no settings
+        assert!(from_json(GOLDEN).unwrap().slider_play.is_empty());
     }
 
     #[test]

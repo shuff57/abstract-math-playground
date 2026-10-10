@@ -163,6 +163,14 @@ pub enum Command {
     RemoveSlider {
         name: String,
     },
+    /// Saves a slider's playback settings: `mode` (`oscillate`, `loop`, `once`) and `speed`
+    /// (a multiplier in (0, 20]). A missing key is left alone; the defaults (`oscillate`, `1`)
+    /// are stored as nothing.
+    SetSliderPlay {
+        name: String,
+        mode: Option<doc::SliderPlayMode>,
+        speed: Option<f64>,
+    },
     SetMode {
         mode: String,
     },
@@ -1253,7 +1261,33 @@ impl App {
                 self.mark_doc_changed();
             }
             Command::RemoveSlider { name } => {
-                if self.doc.sliders.remove(&name).is_some() {
+                let had_play = self.doc.slider_play.remove(&name).is_some();
+                if self.doc.sliders.remove(&name).is_some() || had_play {
+                    self.mark_doc_changed();
+                }
+            }
+            Command::SetSliderPlay { name, mode, speed } => {
+                if !self.doc.sliders.contains_key(&name) {
+                    self.outbox.push(Event::Error {
+                        message: format!("setSliderPlay: no slider named '{name}'"),
+                    });
+                } else if speed.is_some_and(|s| !(s.is_finite() && s > 0.0 && s <= 20.0)) {
+                    self.outbox.push(Event::Error {
+                        message: "setSliderPlay: speed must be in (0, 20]".into(),
+                    });
+                } else {
+                    let mut p = self.doc.slider_play.get(&name).cloned().unwrap_or_default();
+                    if let Some(m) = mode {
+                        p.mode = (m != doc::SliderPlayMode::Oscillate).then_some(m);
+                    }
+                    if let Some(s) = speed {
+                        p.speed = (s != 1.0).then_some(s);
+                    }
+                    if p.is_default() {
+                        self.doc.slider_play.remove(&name);
+                    } else {
+                        self.doc.slider_play.insert(name, p);
+                    }
                     self.mark_doc_changed();
                 }
             }
@@ -4655,6 +4689,43 @@ mod tests {
         ptr(&mut a, "down", 100.0, 500.0);
         ptr(&mut a, "move", 60.0, 500.0);
         assert!(a.rig.window() != w0);
+    }
+
+    #[test]
+    fn slider_play_settings_are_saved_in_the_document() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setSlider","name":"a","value":1,"min":0,"max":5}"#);
+        assert!(a.doc.slider_play.is_empty());
+        let ev = cmd(&mut a, r#"{"t":"setSliderPlay","name":"a","mode":"loop","speed":2}"#);
+        assert!(!ev.iter().any(|e| e["t"] == "error"), "{ev:?}");
+        let p = &a.doc.slider_play["a"];
+        assert_eq!((p.mode, p.speed), (Some(doc::SliderPlayMode::Loop), Some(2.0)));
+        // it is part of the saved document and survives a reload
+        let json = doc::to_json(&a.doc);
+        assert!(json.contains("sliderPlay"), "{json}");
+        let back = doc::from_json(&json).unwrap();
+        assert_eq!(back.slider_play, a.doc.slider_play);
+        // a key left out is left alone; the defaults are stored as nothing
+        cmd(&mut a, r#"{"t":"setSliderPlay","name":"a","speed":1}"#);
+        let p = &a.doc.slider_play["a"];
+        assert_eq!((p.mode, p.speed), (Some(doc::SliderPlayMode::Loop), None));
+        cmd(&mut a, r#"{"t":"setSliderPlay","name":"a","mode":"oscillate"}"#);
+        assert!(a.doc.slider_play.is_empty());
+        assert!(!doc::to_json(&a.doc).contains("sliderPlay"));
+        // errors change nothing
+        for bad in [
+            r#"{"t":"setSliderPlay","name":"nope","mode":"loop"}"#,
+            r#"{"t":"setSliderPlay","name":"a","speed":0}"#,
+            r#"{"t":"setSliderPlay","name":"a","speed":99}"#,
+        ] {
+            let ev = cmd(&mut a, bad);
+            assert!(ev.iter().any(|e| e["t"] == "error"), "{bad}");
+        }
+        assert!(a.doc.slider_play.is_empty());
+        // removing the slider drops its settings
+        cmd(&mut a, r#"{"t":"setSliderPlay","name":"a","mode":"once"}"#);
+        cmd(&mut a, r#"{"t":"removeSlider","name":"a"}"#);
+        assert!(a.doc.slider_play.is_empty());
     }
 
     #[test]
