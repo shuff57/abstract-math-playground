@@ -307,6 +307,9 @@ struct Cx {
     out: Vec<Op>,
     subs: Vec<Program>,
     angle: Angle,
+    /// `random()` calls folded so far: the k-th one is the k-th draw of the list evaluator's
+    /// stream, so a scalar `random() + random()` matches the list value of the same text.
+    random_calls: usize,
 }
 
 fn emit(e: &Expr, vars: &[String], cx: &mut Cx) -> Result<(), CompileError> {
@@ -348,6 +351,51 @@ fn emit(e: &Expr, vars: &[String], cx: &mut Cx) -> Result<(), CompileError> {
             }
             cx.out.push(Op::Piece { pairs, default });
         }
+        // `distance(p, q)` of two points written out: the Euclidean formula, so the coordinates
+        // may use the variables (`distance((x, 0), (3, 4))`).
+        Expr::Call(name, args)
+            if name == "distance"
+                && args.len() == 2
+                && matches!((&args[0], &args[1]), (Expr::Tuple(p), Expr::Tuple(q)) if p.len() == q.len() && !p.is_empty()) =>
+        {
+            let (Expr::Tuple(p), Expr::Tuple(q)) = (&args[0], &args[1]) else { unreachable!() };
+            let mut sum: Option<Expr> = None;
+            for (a, b) in p.iter().zip(q) {
+                let d = Expr::bin(BinOp::Sub, a.clone(), b.clone());
+                let sq = Expr::bin(BinOp::Pow, d, Expr::Num(2.0));
+                sum = Some(match sum {
+                    None => sq,
+                    Some(s) => Expr::bin(BinOp::Add, s, sq),
+                });
+            }
+            emit(&Expr::call("sqrt", vec![sum.expect("non-empty")]), vars, cx)?;
+        }
+        // The list evaluator's functions with constant arguments are numbers: `y = random()`,
+        // `y = distance(P, Q)` with defined points. (`random(n)` is a list, not a scalar.)
+        Expr::Call(name, args)
+            if matches!(name.as_str(), "random" | "distance")
+                && args.iter().all(|a| a.free_vars().is_empty())
+                && !(name == "random" && !args.is_empty()) =>
+        {
+            let k = if name == "random" {
+                cx.random_calls += 1;
+                cx.random_calls
+            } else {
+                0
+            };
+            let bind = crate::list::Bindings::new().with_angle(cx.angle);
+            let src = if name == "random" {
+                // the k-th draw of the stream
+                Expr::call("index", vec![Expr::call("random", vec![Expr::Num(k as f64)]), Expr::Num(k as f64)])
+            } else {
+                e.clone()
+            };
+            match crate::list::eval_value(&src, &bind) {
+                Ok(crate::list::Value::Num(v)) => cx.out.push(Op::Const(v)),
+                Ok(_) => return Err(CompileError::NotScalar("a list or a point")),
+                Err(err) => return Err(CompileError::Calculus(err.to_string())),
+            }
+        }
         Expr::Call(name, args) => {
             let n = name.as_str();
             if n == "deriv" {
@@ -370,7 +418,7 @@ fn emit(e: &Expr, vars: &[String], cx: &mut Cx) -> Result<(), CompileError> {
                 // the same name (`Load` resolves names from the end).
                 let mut sub_vars = vars.to_vec();
                 sub_vars.push(bound.clone());
-                let mut inner = Cx { out: Vec::new(), subs: Vec::new(), angle: cx.angle };
+                let mut inner = Cx { out: Vec::new(), subs: Vec::new(), angle: cx.angle, random_calls: 0 };
                 emit(&args[0], &sub_vars, &mut inner)?;
                 cx.subs.push(Program { ops: inner.out, vars: sub_vars, angle: cx.angle, subs: inner.subs });
                 cx.out.push(Op::Reduce(kind, cx.subs.len() - 1));
@@ -445,7 +493,7 @@ fn emit_cond(e: &Expr, vars: &[String], cx: &mut Cx) -> Result<(), CompileError>
 /// Compiles `expr` with `vars` as the input slots (in order).
 pub fn compile(expr: &Expr, vars: &[&str], angle: Angle) -> Result<Program, CompileError> {
     let vars: Vec<String> = vars.iter().map(|s| s.to_string()).collect();
-    let mut cx = Cx { out: Vec::new(), subs: Vec::new(), angle };
+    let mut cx = Cx { out: Vec::new(), subs: Vec::new(), angle, random_calls: 0 };
     emit(expr, &vars, &mut cx)?;
     Ok(Program { ops: cx.out, vars, angle, subs: cx.subs })
 }
@@ -872,6 +920,43 @@ mod tests {
         assert!(close(prog("cot(pi/4)", &[], Angle::Rad).eval(&[]), 1.0));
         assert!(close(prog("mod(-1,3)", &[], Angle::Rad).eval(&[]), 2.0));
         assert!(close(prog("sign(-5)+sign(0)", &[], Angle::Rad).eval(&[]), -1.0));
+    }
+
+    #[test]
+    fn random_and_distance_are_scalars_in_compiled_expressions() {
+        use crate::list::{eval_value, Bindings, Value};
+        let r = prog("random()", &[], Angle::Rad).eval(&[]);
+        assert!((0.0..1.0).contains(&r));
+        // the same value as the list evaluator's first draw, and stable across compiles
+        let first = match eval_value(&parse("random()").unwrap(), &Bindings::new()) {
+            Ok(Value::Num(v)) => v,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(r, first);
+        assert_eq!(prog("random()", &[], Angle::Rad).eval(&[]), r);
+        // two calls are two successive draws, matching the list of the same text
+        let sum = prog("random()+random()", &[], Angle::Rad).eval(&[]);
+        let pair = match eval_value(&parse("[random(), random()]").unwrap(), &Bindings::new()) {
+            Ok(Value::List(l)) => l,
+            other => panic!("{other:?}"),
+        };
+        assert!((sum - (pair[0] + pair[1])).abs() < 1e-15 && pair[0] != pair[1]);
+        // with a variable around it
+        let p = prog("x+random()", &["x"], Angle::Rad);
+        assert!((p.eval(&[10.0]) - (10.0 + r)).abs() < 1e-12);
+        // distance of two written-out points may use variables; defined points arrive resolved
+        let d = prog("distance((x,0),(3,4))", &["x"], Angle::Rad);
+        assert_eq!(d.eval(&[0.0]), 5.0);
+        assert_eq!(d.eval(&[3.0]), 4.0);
+        assert_eq!(prog("distance((0,0,0),(1,2,2))", &[], Angle::Rad).eval(&[]), 3.0);
+        // a list-valued call is not a scalar
+        for src in ["random(3)", "random(2,1)"] {
+            let e = parse(src).unwrap();
+            assert!(compile(&e, &[], Angle::Rad).is_err(), "{src}");
+        }
+        // intervals see a constant
+        let iv = prog("random()", &[], Angle::Rad).eval_interval(&[]);
+        assert!(iv.lo <= r && iv.hi >= r && iv.hi - iv.lo < 1e-9);
     }
 
     #[test]

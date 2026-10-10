@@ -5416,6 +5416,28 @@ mod tests {
     }
 
     #[test]
+    fn random_and_distance_can_be_the_value_of_a_curve() {
+        // y = random() is a horizontal line at the first draw; y = distance(...) at 5
+        for (src, want) in [("y=distance((0,0),(3,4))", Some(5.0)), ("y=random()", None)] {
+            let g = build(&doc_with(&[("a", src)]), Mode::D2);
+            assert!(g.diagnostics.is_empty(), "{src}: {:?}", g.diagnostics);
+            let segs: Vec<_> = g.segments.iter().filter(|s| s.width == CURVE_W).collect();
+            assert!(segs.len() > 10, "{src} draws a curve");
+            let y0 = segs[0].p0[1] as f64;
+            assert!(segs.iter().all(|s| (s.p0[1] as f64 - y0).abs() < 1e-5), "{src} is horizontal");
+            if let Some(w) = want {
+                assert!((y0 - w).abs() < 1e-4, "{y0}");
+            } else {
+                assert!((0.0..1.0).contains(&y0), "{y0}");
+            }
+        }
+        // a point built from random() is a normal point
+        let g = build(&doc_with(&[("p", "(1, distance((0,0),(0,2)))")]), Mode::D2);
+        assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
+        assert!(dots(&g, Mode::D2, [0.0; 3]).iter().any(|p| (p[0] - 1.0).abs() < 1e-9 && (p[1] - 2.0).abs() < 1e-9));
+    }
+
+    #[test]
     fn a_formula_column_draws_and_defines_its_list() {
         let mut d = table_doc(&[("x_1", &["1", "2", "", "4"]), ("y_1", &["", "", "", ""])], TableStyle::Points);
         d.items[0].table.as_mut().unwrap().set_formula(1, Some("x_1^2")).unwrap();
