@@ -1,3 +1,5 @@
+> **About this fork.** This is [shuff57's fork](https://github.com/shuff57/abstract-math-playground) of [PullJosh/abstract-math-playground](https://github.com/PullJosh/abstract-math-playground) by Josh Pullen. The renderer, window/wasm shell and original plotting are his. The fork adds `math_core` (expression parser, list and scalar evaluators, meshing, the JSON document model, regression and tables) and a JSON command API used by the [viSHual](https://github.com/shuff57/viSHual) graphing app. The original README follows unchanged.
+
 # Abstract Math Playground
 
 Right now this project does not have a clear purpose or goal except to be a playground where I explore what makes me curious. It lives in the same realm as [Mr. Pullen's Graphing Calculator](https://calculator.mrpullen.com/). If you're interested in these kinds of things and want to discuss more, join us on Discord!
