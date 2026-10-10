@@ -479,6 +479,8 @@ pub enum SliderPlayMode {
     Loop,
     // min to max once, then stop.
     Once,
+    // Keeps counting up past max, which grows with it.
+    Indefinite,
 }
 
 // A slider's saved playback settings; absent fields are the defaults (oscillate, 1x).
