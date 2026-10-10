@@ -58,6 +58,8 @@ pub struct Label {
     pub item: Option<String>,
     /// The item's `labelOffset` (CSS pixels, y down, already clamped); `[0, 0]` when none.
     pub offset: [f64; 2],
+    /// The item's `labelSize` text scale (1 for medium and for tick labels).
+    pub size: f64,
 }
 
 /// How a [`FieldSpec`] is shaded by the GPU.

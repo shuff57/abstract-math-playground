@@ -382,6 +382,9 @@ pub struct ScreenLabel {
     /// to `x`/`y` (canvas pixels / dpr) so the text is moved off its point. Absent when none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offset: Option<[f64; 2]>,
+    /// The item's `labelSize` as a text scale (0.75 small, 1.45 large). Absent for medium.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<f64>,
 }
 
 /// A curve parameter and its value (see [`Event::CurveDrag`]).
@@ -1573,7 +1576,7 @@ impl App {
         id: &str,
         patch: serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), String> {
-        const KEYS: [&str; 13] = [
+        const KEYS: [&str; 15] = [
             "lineWidth",
             "lineStyle",
             "pointStyle",
@@ -1587,6 +1590,8 @@ impl App {
             "labelOffset",
             "dragMode",
             "asFraction",
+            "labelSize",
+            "pointOutline",
         ];
         let Some(item) = self.doc.items.iter_mut().find(|i| i.id == id) else {
             return Err(format!("no item with id '{id}'"));
@@ -2970,6 +2975,7 @@ impl App {
                 clip: None,
                 item: l.item.clone(),
                 offset: (l.offset != [0.0; 2]).then_some(l.offset),
+                size: (l.size != 1.0).then_some(l.size),
             })
         }));
     }
@@ -3051,6 +3057,7 @@ impl App {
                     clip: Some([r[0] as f64, r[1] as f64, pw, ph]),
                     item: None,
                     offset: None,
+                    size: None,
                 }
             })
             .collect()

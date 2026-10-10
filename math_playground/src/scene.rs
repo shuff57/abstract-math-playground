@@ -78,6 +78,8 @@ const OUTLINE_W: f32 = 2.5;
 const TICK_PX: f64 = 4.0;
 /// Background-coloured halo under every point (pixels on each side).
 const HALO_PX: f32 = 1.5;
+/// Thickness of the `pointOutline` ring around a dot.
+const OUTLINE_PX: f32 = 1.5;
 /// Largest point size (pixels) the print weight enlarges to.
 const MAX_POINT_PX: f32 = 48.0;
 /// Print weight multipliers of (curve/axis/tick line widths, grid line widths, point sizes). The
@@ -306,6 +308,8 @@ struct Style {
     auto_size: bool,
     /// Effective opacity of an inequality fill (`None`: the built-in shading).
     fill: Option<f32>,
+    /// `pointOutline`: a thin dark ring around dot markers.
+    outline: bool,
 }
 
 impl Style {
@@ -319,6 +323,7 @@ impl Style {
             point_size: DOT_W,
             auto_size: false,
             fill: None,
+            outline: false,
         }
     }
 
@@ -344,6 +349,7 @@ impl Style {
             point_size: s.point_size.map(|v| v as f32).unwrap_or(DOT_W),
             auto_size: s.point_size.is_none(),
             fill: s.fill_opacity.map(|v| v.clamp(0.0, 1.0) as f32),
+            outline: s.point_outline,
         }
     }
 }
@@ -371,7 +377,7 @@ struct BuildExt {
     /// labels it may still place.
     labels: Option<(Option<String>, usize)>,
     /// Id and clamped `labelOffset` of the item whose labels are being placed.
-    label_item: Option<(String, [f64; 2])>,
+    label_item: Option<(String, [f64; 2], f64)>,
     /// Print weight multiplier of line widths (curves, axes, ticks, arrows; dashes follow).
     line_mul: f32,
     /// Print weight multiplier of the grid lines (and the 3D box edges); gentler than `line_mul`
@@ -811,11 +817,11 @@ impl<'a> Builder<'a> {
     fn label(&mut self, pos: [f64; 3], text: String, axis: u8) {
         if !text.is_empty() && pos.iter().all(|v| v.is_finite()) {
             // Item labels carry their item and its `labelOffset`; tick labels have neither.
-            let (item, offset) = match (&self.ext.label_item, axis == ITEM_LABEL_AXIS) {
-                (Some((id, off)), true) => (Some(id.clone()), *off),
-                _ => (None, [0.0; 2]),
+            let (item, offset, size) = match (&self.ext.label_item, axis == ITEM_LABEL_AXIS) {
+                (Some((id, off, size)), true) => (Some(id.clone()), *off, *size),
+                _ => (None, [0.0; 2], 1.0),
             };
-            self.out.labels.push(Label { pos, text, axis, item, offset });
+            self.out.labels.push(Label { pos, text, axis, item, offset, size });
         }
     }
 
@@ -1078,7 +1084,13 @@ impl<'a> Builder<'a> {
         match (st.point, self.ext.mode) {
             (PointStyle::Dot, _) | (_, Mode::D3) => {
                 if self.ext.mode != Mode::D3 {
-                    self.seg_raw(p, p, size as f32 + 2.0 * HALO_PX, self.theme.background);
+                    let ring = if st.outline { OUTLINE_PX } else { 0.0 };
+                    self.seg_raw(p, p, size as f32 + 2.0 * (HALO_PX + ring), self.theme.background);
+                    if st.outline {
+                        let mut dark = self.theme.axis;
+                        dark[3] = 1.0;
+                        self.seg_raw(p, p, size as f32 + 2.0 * ring, dark);
+                    }
                 }
                 self.seg_raw(p, p, size as f32, st.color)
             }
@@ -1197,7 +1209,11 @@ impl<'a> Builder<'a> {
 
     /// Arms `showLabel` point labels for the item about to be drawn.
     fn begin_item_labels(&mut self, id: &str, s: &ItemStyle) {
-        self.ext.label_item = Some((id.to_string(), clamp_label_offset(s.label_offset)));
+        self.ext.label_item = Some((
+            id.to_string(),
+            clamp_label_offset(s.label_offset),
+            s.label_size.map_or(1.0, |z| z.scale()),
+        ));
         self.ext.labels = s.show_label.then(|| {
             let text = s.label.clone().filter(|t| !t.trim().is_empty());
             (text, MAX_POINT_LABELS)
@@ -6704,6 +6720,58 @@ mod tests {
         let d = styled("(2)", |s| s.point_style = Some(PointStyle::Circle));
         let (v, _) = item_segs(&build(&d, Mode::D1), Mode::D1);
         assert_eq!(v.len(), RING_SIDES);
+    }
+
+    #[test]
+    fn point_outline_adds_a_dark_ring_behind_dots_and_label_size_scales_the_label() {
+        let plain = build(&styled("(1,2)", |_| {}), Mode::D2);
+        let ringed = build(&styled("(1,2)", |s| s.point_outline = true), Mode::D2);
+        // one more point-sized segment (the ring), the dot itself unchanged on top
+        assert_eq!(ringed.segments.len(), plain.segments.len() + 1);
+        let dots = |g: &SceneGeometry| -> Vec<(f32, [f32; 4])> {
+            g.segments
+                .iter()
+                .filter(|s| s.p0 == s.p1 && s.p0[0] != 0.0)
+                .map(|s| (s.width, s.color))
+                .collect()
+        };
+        let (a, b) = (dots(&plain), dots(&ringed));
+        assert_eq!(b.last(), a.last(), "the dot keeps its size and colour");
+        let ring = b.iter().find(|(w, c)| c[3] == 1.0 && c[0] < 0.3 && c[1] < 0.3 && *w > DOT_W);
+        assert!(ring.is_some(), "a dark ring wider than the dot: {b:?}");
+        // other styles are untouched (they are outlines already)
+        let sq = |o: bool| {
+            build(
+                &styled("(1,2)", |s| {
+                    s.point_style = Some(PointStyle::Square);
+                    s.point_outline = o;
+                }),
+                Mode::D2,
+            )
+            .segments
+            .len()
+        };
+        assert_eq!(sq(true), sq(false));
+        // label size rides on the item's label
+        let lbl = |z: Option<math_core::doc::LabelSize>| {
+            build(
+                &styled("(1,2)", |s| {
+                    s.show_label = true;
+                    s.label_size = z;
+                }),
+                Mode::D2,
+            )
+            .labels
+            .iter()
+            .find(|l| l.item.is_some())
+            .map(|l| l.size)
+        };
+        assert_eq!(lbl(None), Some(1.0));
+        assert_eq!(lbl(Some(math_core::doc::LabelSize::Small)), Some(0.75));
+        assert_eq!(lbl(Some(math_core::doc::LabelSize::Large)), Some(1.45));
+        // tick labels are never scaled
+        let g = build(&styled("(1,2)", |s| s.label_size = Some(math_core::doc::LabelSize::Large)), Mode::D2);
+        assert!(g.labels.iter().filter(|l| l.item.is_none()).all(|l| l.size == 1.0));
     }
 
     #[test]

@@ -257,6 +257,28 @@ pub enum PointStyle {
     Star,
 }
 
+// Size of an item's label text (`labelSize`); medium is the default and is not stored. Plain
+// comments: doc comments are copied into the JSON schema, which has a size budget.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LabelSize {
+    Small,
+    Medium,
+    Large,
+}
+
+impl LabelSize {
+    /// The text scale this size stands for (medium is 1).
+    pub fn scale(self) -> f64 {
+        match self {
+            LabelSize::Small => 0.75,
+            LabelSize::Medium => 1.0,
+            LabelSize::Large => 1.45,
+        }
+    }
+}
+
 // Which coordinates of a draggable point the pointer may change (`dragMode`). Plain comments:
 // doc comments are copied into the JSON schema, which has a size budget.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -307,7 +329,18 @@ pub struct ItemStyle {
     // = the default place. (A plain comment: the schema's prompt copy has a size budget.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label_offset: Option<[f64; 2]>,
+    // Size of the item's label text; absent = medium. (`as_fraction`, `point_outline` and this
+    // one are left out of the JSON schema: the workspace writes them, a generated document
+    // never needs to, and the compact schema has a size budget.)
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_size: Option<LabelSize>,
+    // Dots get a thin dark outline.
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub point_outline: bool,
     // Number items: show the value as a fraction (`7/3`) when it is one.
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     #[serde(default, skip_serializing_if = "is_false")]
     pub as_fraction: bool,
     // Point items: which coordinates the pointer may change; absent = both. Only coordinates
@@ -980,6 +1013,8 @@ mod tests {
                     label_offset: Some([12.0, -30.5]),
                     drag_mode: Some(DragMode::X),
                     as_fraction: i % 4 == 0,
+                    label_size: Some(LabelSize::Large),
+                    point_outline: i % 4 == 0,
                 };
             }
             d.add_item(it).unwrap();
@@ -1411,6 +1446,8 @@ mod tests {
             "labelOffset",
             "dragMode",
             "asFraction",
+            "labelSize",
+            "pointOutline",
         ] {
             assert!(!j.contains(k), "{k} in {j}");
         }
