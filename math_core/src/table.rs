@@ -604,7 +604,7 @@ mod tests {
             serde_json::json!({"color": "red"}),
             serde_json::json!({"opacity": 2}),
             serde_json::json!({"pointSize": 0}),
-            serde_json::json!({"pointStyle": "star"}),
+            serde_json::json!({"pointStyle": "hexagon"}),
             serde_json::json!({"lines": "yes"}),
             serde_json::json!({"wobble": true}),
         ] {

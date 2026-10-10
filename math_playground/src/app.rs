@@ -1539,7 +1539,7 @@ impl App {
         id: &str,
         patch: serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), String> {
-        const KEYS: [&str; 11] = [
+        const KEYS: [&str; 12] = [
             "lineWidth",
             "lineStyle",
             "pointStyle",
@@ -1551,6 +1551,7 @@ impl App {
             "showLabel",
             "residualPlot",
             "labelOffset",
+            "dragMode",
         ];
         let Some(item) = self.doc.items.iter_mut().find(|i| i.id == id) else {
             return Err(format!("no item with id '{id}'"));
@@ -4654,6 +4655,55 @@ mod tests {
         ptr(&mut a, "down", 100.0, 500.0);
         ptr(&mut a, "move", 60.0, 500.0);
         assert!(a.rig.window() != w0);
+    }
+
+    #[test]
+    fn drag_mode_limits_which_coordinates_a_point_moves() {
+        // (2, 3) is at pixel (480, 180); one unit is 40 px.
+        let drag = |mode: Option<&str>| {
+            let mut a = app();
+            cmd(&mut a, r#"{"t":"setExpr","id":"p","latex":"(2,3)"}"#);
+            if let Some(m) = mode {
+                let ev = cmd(
+                    &mut a,
+                    &format!(r#"{{"t":"setStyle","id":"p","style":{{"dragMode":"{m}"}}}}"#),
+                );
+                assert!(!ev.iter().any(|e| e["t"] == "error"), "{ev:?}");
+            }
+            let w0 = a.rig.window();
+            ptr(&mut a, "down", 480.0, 180.0);
+            ptr(&mut a, "move", 520.0, 140.0);
+            ptr(&mut a, "up", 520.0, 140.0);
+            (a.doc.items[0].latex.clone(), a.rig.window() != w0)
+        };
+        assert_eq!(drag(None), ("(3, 4)".to_string(), false));
+        assert_eq!(drag(Some("xy")), ("(3, 4)".to_string(), false));
+        assert_eq!(drag(Some("x")), ("(3, 3)".to_string(), false));
+        assert_eq!(drag(Some("y")), ("(2, 4)".to_string(), false));
+        // `none` leaves the text alone and the press pans the view instead.
+        assert_eq!(drag(Some("none")), ("(2,3)".to_string(), true));
+        // The style round-trips and `null` goes back to dragging both.
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setExpr","id":"p","latex":"(2,3)"}"#);
+        cmd(&mut a, r#"{"t":"setStyle","id":"p","style":{"dragMode":"x"}}"#);
+        assert_eq!(a.doc.items[0].style.drag_mode, Some(doc::DragMode::X));
+        cmd(&mut a, r#"{"t":"setStyle","id":"p","style":{"dragMode":null}}"#);
+        assert_eq!(a.doc.items[0].style.drag_mode, None);
+        let ev = cmd(&mut a, r#"{"t":"setStyle","id":"p","style":{"dragMode":"diagonal"}}"#);
+        assert!(ev.iter().any(|e| e["t"] == "error"));
+    }
+
+    #[test]
+    fn drag_mode_x_on_a_slider_point_leaves_the_other_slider_alone() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setSlider","name":"a","value":1,"min":-5,"max":5}"#);
+        cmd(&mut a, r#"{"t":"setSlider","name":"b","value":2,"min":-5,"max":5}"#);
+        cmd(&mut a, r#"{"t":"setExpr","id":"p","latex":"(a,b)"}"#);
+        cmd(&mut a, r#"{"t":"setStyle","id":"p","style":{"dragMode":"y"}}"#);
+        ptr(&mut a, "down", 440.0, 220.0);
+        ptr(&mut a, "move", 520.0, 140.0);
+        assert_eq!(a.doc.sliders["a"].value, 1.0);
+        assert_eq!(a.doc.sliders["b"].value, 4.0);
     }
 
     #[test]

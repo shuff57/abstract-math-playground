@@ -251,6 +251,26 @@ pub enum PointStyle {
     Circle,
     Cross,
     Square,
+    Plus,
+    Triangle,
+    Diamond,
+    Star,
+}
+
+// Which coordinates of a draggable point the pointer may change (`dragMode`). Plain comments:
+// doc comments are copied into the JSON schema, which has a size budget.
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DragMode {
+    // The point cannot be dragged.
+    None,
+    // Only `x` changes.
+    X,
+    // Only `y` changes.
+    Y,
+    // Both coordinates (the default).
+    Xy,
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -287,6 +307,10 @@ pub struct ItemStyle {
     // = the default place. (A plain comment: the schema's prompt copy has a size budget.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label_offset: Option<[f64; 2]>,
+    // Point items: which coordinates the pointer may change; absent = both. Only coordinates
+    // that are a number, slider or definition move at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drag_mode: Option<DragMode>,
 }
 
 /// Largest `labelOffset` component in either direction, in CSS pixels.
@@ -903,6 +927,7 @@ mod tests {
                     show_label: true,
                     residual_plot: i % 4 == 0,
                     label_offset: Some([12.0, -30.5]),
+                    drag_mode: Some(DragMode::X),
                 };
             }
             d.add_item(it).unwrap();
@@ -1310,6 +1335,7 @@ mod tests {
             "fillOpacity",
             "showLabel",
             "labelOffset",
+            "dragMode",
         ] {
             assert!(!j.contains(k), "{k} in {j}");
         }

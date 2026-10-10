@@ -24,14 +24,15 @@
 //! * Line widths are physical pixels: grid 1.0/1.5, axes 2.0, curves 2.5, dots 9.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::f64::consts::PI;
+use std::f64::consts::{FRAC_PI_2, PI};
 
 use math_core::analyze::{analyze, Kind};
 use math_core::ast::{BinOp, Expr, Rel};
 use math_core::compile::{compile, Angle, Program};
 use math_core::complex::{compile_complex, parse_complex};
 use math_core::doc::{
-    AngleMode, Doc, Item, ItemKind, ItemStyle, LineStyle, PointStyle, Weight, LABEL_OFFSET_MAX,
+    AngleMode, DragMode, Doc, Item, ItemKind, ItemStyle, LineStyle, PointStyle, Weight,
+    LABEL_OFFSET_MAX,
 };
 use math_core::list::{eval_value, Bindings, Value};
 use math_core::mesh;
@@ -997,6 +998,49 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// A closed outline through `corners` (pixel offsets from `p`, y up) with an opaque
+    /// background interior, like the open square: horizontal background strokes fill the
+    /// polygon (even-odd, so a star's notches stay clear) and the outline is drawn over them.
+    fn polygon_marker(
+        &mut self,
+        p: [f64; 3],
+        corners: &[[f64; 2]],
+        sw: f64,
+        bg: [f32; 4],
+        color: [f32; 4],
+    ) {
+        let k = self.px_per_unit();
+        let at = |c: [f64; 2]| [p[0] + c[0] / k[0], p[1] + c[1] / k[1], p[2]];
+        let n = corners.len();
+        let (lo, hi) = corners
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(l, h), c| (l.min(c[1]), h.max(c[1])));
+        let rows = ((hi - lo) / 1.4).ceil().max(1.0) as usize;
+        for i in 0..=rows {
+            let y = lo + (hi - lo) * i as f64 / rows as f64;
+            let mut xs: Vec<f64> = (0..n)
+                .filter_map(|j| {
+                    let (a, b) = (corners[j], corners[(j + 1) % n]);
+                    let (y0, y1) = (a[1].min(b[1]), a[1].max(b[1]));
+                    (y >= y0 && y < y1 && y1 > y0)
+                        .then(|| a[0] + (y - a[1]) / (b[1] - a[1]) * (b[0] - a[0]))
+                })
+                .collect();
+            xs.sort_by(|a, b| a.total_cmp(b));
+            for pair in xs.chunks_exact(2) {
+                self.seg_raw(at([pair[0], y]), at([pair[1], y]), 1.6, bg);
+            }
+        }
+        for j in 0..n {
+            let (a, b) = (at(corners[j]), at(corners[(j + 1) % n]));
+            self.seg_raw(a, b, sw as f32 + 2.0 * HALO_PX, bg);
+        }
+        for j in 0..n {
+            let (a, b) = (at(corners[j]), at(corners[(j + 1) % n]));
+            self.seg_raw(a, b, sw as f32, color);
+        }
+    }
+
     /// Line width of the thickest host curve that the world point `w` lies on (within the line's
     /// own half width plus 2 px), if any.
     fn host_line_w(&self, w: [f64; 3]) -> Option<f32> {
@@ -1074,6 +1118,49 @@ impl<'a> Builder<'a> {
                 for w in c.windows(2) {
                     self.seg_raw(w[0], w[1], sw as f32, st.color);
                 }
+            }
+            (PointStyle::Plus, _) => {
+                let cw = (size * 0.28).max(2.5);
+                let h = ((size - cw) * 0.5).max(0.5) * 1.2;
+                let bg = self.theme.background;
+                for (a, b) in [(off(-h, 0.0), off(h, 0.0)), (off(0.0, -h), off(0.0, h))] {
+                    self.seg_raw(a, b, cw as f32 + 2.0 * HALO_PX, bg);
+                }
+                self.seg_raw(off(-h, 0.0), off(h, 0.0), cw as f32, st.color);
+                self.seg_raw(off(0.0, -h), off(0.0, h), cw as f32, st.color);
+            }
+            (shape @ (PointStyle::Triangle | PointStyle::Diamond | PointStyle::Star), _) => {
+                let sw = (size * 0.24).max(2.5);
+                let r = ((size - sw) * 0.5).max(0.5);
+                // Corners as pixel offsets from the point, y up. Each is scaled so the marker
+                // fills about the same box as the square of the same size.
+                let corners: Vec<[f64; 2]> = match shape {
+                    PointStyle::Triangle => {
+                        let r = r * 1.25;
+                        (0..3)
+                            .map(|i| {
+                                let a = FRAC_PI_2 + 2.0 * PI * i as f64 / 3.0;
+                                [r * a.cos(), r * a.sin() - r * 0.25]
+                            })
+                            .collect()
+                    }
+                    PointStyle::Diamond => {
+                        let r = r * 1.3;
+                        vec![[0.0, r], [-r * 0.8, 0.0], [0.0, -r], [r * 0.8, 0.0]]
+                    }
+                    _ => {
+                        let r = r * 1.35;
+                        (0..10)
+                            .map(|i| {
+                                let a = FRAC_PI_2 + PI * i as f64 / 5.0;
+                                let rr = if i % 2 == 0 { r } else { r * 0.42 };
+                                [rr * a.cos(), rr * a.sin()]
+                            })
+                            .collect()
+                    }
+                };
+                let bg = self.theme.background;
+                self.polygon_marker(p, &corners, sw, bg, st.color);
             }
         }
         self.point_label(p);
@@ -4365,11 +4452,23 @@ pub fn point_handles(doc: &Doc) -> Vec<PointHandle> {
         if components.len() != 2 {
             continue;
         }
+        // `dragMode` masks the coordinates the pointer may change; the position is still read
+        // from both.
+        let allowed = match p.item.style.drag_mode {
+            Some(DragMode::None) => [false, false],
+            Some(DragMode::X) => [true, false],
+            Some(DragMode::Y) => [false, true],
+            Some(DragMode::Xy) | None => [true, true],
+        };
+        if !allowed.iter().any(|a| *a) {
+            continue;
+        }
         let mut pos = [0.0; 2];
         let mut src = [CoordSrc::Fixed, CoordSrc::Fixed];
         let mut ok = true;
         for (k, c) in components.iter().enumerate() {
             src[k] = match c {
+                _ if !allowed[k] => CoordSrc::Fixed,
                 _ if literal_number(c).is_some() => CoordSrc::Literal,
                 Expr::Var(n) if doc.sliders.contains_key(n) => CoordSrc::Slider(n.clone()),
                 Expr::Var(n) => match numeric_defs.get(n.as_str()) {
@@ -6470,7 +6569,13 @@ mod tests {
         assert!(dist(px(&g)[0].p0) > 2.0 * r0);
         // Open circle and square hide what is under them (a missing value): a background-coloured
         // fill covers the centre.
-        for style in [PointStyle::Circle, PointStyle::Square] {
+        for style in [
+            PointStyle::Circle,
+            PointStyle::Square,
+            PointStyle::Triangle,
+            PointStyle::Diamond,
+            PointStyle::Star,
+        ] {
             let g = build(&styled("(1,2)", |s| s.point_style = Some(style)), Mode::D2);
             let bg = Theme::light().background;
             let filled = g.segments.iter().any(|s| {
@@ -6504,6 +6609,53 @@ mod tests {
         assert_eq!(v.len(), 4);
         assert!(v.iter().all(|s| s.p0[0] == s.p1[0] || s.p0[1] == s.p1[1]));
         assert_eq!(v[3].p1, v[0].p0);
+        // Plus: one horizontal and one vertical stroke through the point.
+        let g = build(
+            &styled("(1,2)", |s| s.point_style = Some(PointStyle::Plus)),
+            Mode::D2,
+        );
+        let v = px(&g);
+        assert_eq!(v.len(), 2);
+        assert!(v.iter().any(|s| s.p0[1] == s.p1[1] && s.p0[0] != s.p1[0]));
+        assert!(v.iter().any(|s| s.p0[0] == s.p1[0] && s.p0[1] != s.p1[1]));
+        for s in &v {
+            let mid = [(s.p0[0] + s.p1[0]) / 2.0, (s.p0[1] + s.p1[1]) / 2.0];
+            assert!((mid[0] - 1.0).abs() < 1e-5 && (mid[1] - 2.0).abs() < 1e-5);
+        }
+        // Triangle, diamond and star: a closed outline with 3, 4 and 10 sides that stays
+        // around the point and does not grow past the box of the dot of the same size.
+        for (style, sides) in [
+            (PointStyle::Triangle, 3),
+            (PointStyle::Diamond, 4),
+            (PointStyle::Star, 10),
+        ] {
+            let g = build(&styled("(1,2)", |s| s.point_style = Some(style)), Mode::D2);
+            let v = px(&g);
+            assert_eq!(v.len(), sides, "{style:?}");
+            for i in 0..sides {
+                assert_eq!(v[i].p1, v[(i + 1) % sides].p0, "{style:?} is closed");
+            }
+            let (mut cx, mut cy) = (0.0f32, 0.0f32);
+            for s in &v {
+                cx += s.p0[0];
+                cy += s.p0[1];
+                let (dx, dy) = ((s.p0[0] - 1.0) * 40.0, (s.p0[1] - 2.0) * 30.0);
+                assert!(dx.abs() < 14.0 && dy.abs() < 14.0, "{style:?} stays small: {dx} {dy}");
+            }
+            let (cx, cy) = (
+                (cx / sides as f32 - 1.0) * 40.0,
+                (cy / sides as f32 - 2.0) * 30.0,
+            );
+            assert!(cx.abs() < 1.0 && cy.abs() < 3.0, "{style:?} is centred: {cx} {cy}");
+        }
+        // The triangle points up, the diamond is symmetric left to right.
+        let v = px(&build(
+            &styled("(1,2)", |s| s.point_style = Some(PointStyle::Triangle)),
+            Mode::D2,
+        ));
+        let top = v.iter().map(|s| s.p0[1]).fold(f32::MIN, f32::max);
+        let apex = v.iter().find(|s| s.p0[1] == top).unwrap();
+        assert!((apex.p0[0] - 1.0).abs() < 1e-5, "apex above the point");
         // Point lists and table points use the style too; 3D falls back to dots.
         let g = build(
             &styled("[(1,2),(3,4)]", |s| s.point_style = Some(PointStyle::Cross)),
