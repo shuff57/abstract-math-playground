@@ -270,6 +270,13 @@ pub enum Command {
         col: usize,
         name: String,
     },
+    /// Sets column `col`'s formula over the other columns' names (`x_1^2+1`), or clears it with
+    /// `null` or blank text. A formula column's cells are computed and cannot be edited.
+    SetColumnFormula {
+        id: String,
+        col: usize,
+        formula: Option<String>,
+    },
     /// Legacy table-wide style, applied to every column: `points`, `line` or `hidden`.
     SetTableStyle {
         id: String,
@@ -1262,6 +1269,7 @@ impl App {
                     cfg.step = step;
                 }
                 self.mark_doc_changed();
+                self.emit_formula_tables();
             }
             Command::RemoveSlider { name } => {
                 let had_play = self.doc.slider_play.remove(&name).is_some();
@@ -1521,6 +1529,9 @@ impl App {
             Command::RemoveColumn { id, col } => self.edit_table(&id, |t| t.remove_column(col)),
             Command::RenameColumn { id, col, name } => {
                 self.edit_table(&id, |t| t.rename_column(col, &name))
+            }
+            Command::SetColumnFormula { id, col, formula } => {
+                self.edit_table(&id, |t| t.set_formula(col, formula.as_deref()))
             }
             Command::SetTableStyle { id, style } => match TableStyle::parse(&style) {
                 Some(st) => self.edit_table(&id, |t| {
@@ -1899,12 +1910,62 @@ impl App {
             .find(|i| i.id == id)
             .and_then(|i| i.table.as_ref())
         {
+            let mut columns = t.columns.clone();
+            if columns.iter().any(|c| c.formula.is_some()) {
+                // A formula column's cells are the computed values (the workspace shows them
+                // read-only); the formula text itself rides on the column.
+                let (parsed, _) = t.parse(&math_core::parse::ParseCtx::new());
+                let mut bind = math_core::list::Bindings::new().with_angle(match self.doc.view.angle {
+                    AngleMode::Rad => math_core::compile::Angle::Rad,
+                    AngleMode::Deg => math_core::compile::Angle::Deg,
+                });
+                for (name, s) in &self.doc.sliders {
+                    bind.set(name, math_core::list::Value::Num(s.value));
+                }
+                for (c, p) in columns.iter_mut().zip(&parsed) {
+                    if c.formula.is_none() {
+                        continue;
+                    }
+                    c.cells = p
+                        .cells
+                        .iter()
+                        .map(|cell| match cell {
+                            None => String::new(),
+                            Some(e) => match math_core::list::eval_value(e, &bind) {
+                                Ok(math_core::list::Value::Num(v)) => {
+                                    crate::scene::format_value(v)
+                                }
+                                _ => String::new(),
+                            },
+                        })
+                        .collect();
+                }
+            }
+            let (rows, style) = (t.rows(), t.summary_style().name().to_string());
             self.outbox.push(Event::Table {
                 id: id.to_string(),
-                columns: t.columns.clone(),
-                rows: t.rows(),
-                style: t.summary_style().name().to_string(),
+                columns,
+                rows,
+                style,
             });
+        }
+    }
+
+    /// Re-sends every table that has a formula column (its computed cells follow the sliders).
+    fn emit_formula_tables(&mut self) {
+        let ids: Vec<String> = self
+            .doc
+            .items
+            .iter()
+            .filter(|i| {
+                i.table
+                    .as_ref()
+                    .is_some_and(|t| t.columns.iter().any(|c| c.formula.is_some()))
+            })
+            .map(|i| i.id.clone())
+            .collect();
+        for id in ids {
+            self.emit_table(&id);
         }
     }
 
@@ -4697,6 +4758,49 @@ mod tests {
         ptr(&mut a, "down", 100.0, 500.0);
         ptr(&mut a, "move", 60.0, 500.0);
         assert!(a.rig.window() != w0);
+    }
+
+    #[test]
+    fn a_formula_column_is_computed_and_follows_sliders() {
+        let mut a = app();
+        cmd(&mut a, r#"{"t":"setSlider","name":"k","value":2,"min":0,"max":10}"#);
+        cmd(&mut a, r#"{"t":"addTable","id":"t"}"#);
+        for (r, v) in ["1", "2", "3"].iter().enumerate() {
+            cmd(&mut a, &format!(r#"{{"t":"setCell","id":"t","row":{r},"col":0,"value":"{v}"}}"#));
+        }
+        let ev = cmd(&mut a, r#"{"t":"setColumnFormula","id":"t","col":1,"formula":"k x_1^2"}"#);
+        assert!(!ev.iter().any(|e| e["t"] == "error"), "{ev:?}");
+        let table = |ev: &[serde_json::Value]| {
+            ev.iter().rev().find(|e| e["t"] == "table").cloned().expect("table event")
+        };
+        let t = table(&ev);
+        assert_eq!(t["columns"][1]["formula"], "k x_1^2");
+        let cells: Vec<String> = t["columns"][1]["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(&cells[..3], ["2", "8", "18"]);
+        // a slider move re-sends the table with the new values
+        let ev = cmd(&mut a, r#"{"t":"setSlider","name":"k","value":3}"#);
+        let cells: Vec<String> = table(&ev)["columns"][1]["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(&cells[..3], ["3", "12", "27"]);
+        // the cells are locked; clearing the formula unlocks them
+        let ev = cmd(&mut a, r#"{"t":"setCell","id":"t","row":0,"col":1,"value":"7"}"#);
+        assert!(ev.iter().any(|e| e["t"] == "error"), "{ev:?}");
+        let ev = cmd(&mut a, r#"{"t":"setColumnFormula","id":"t","col":1,"formula":null}"#);
+        assert!(!ev.iter().any(|e| e["t"] == "error"), "{ev:?}");
+        let ev = cmd(&mut a, r#"{"t":"setCell","id":"t","row":0,"col":1,"value":"7"}"#);
+        assert!(!ev.iter().any(|e| e["t"] == "error"), "{ev:?}");
+        // a bad formula is an error and changes nothing
+        let ev = cmd(&mut a, r#"{"t":"setColumnFormula","id":"t","col":1,"formula":"x_1+"}"#);
+        assert!(ev.iter().any(|e| e["t"] == "error"), "{ev:?}");
     }
 
     #[test]

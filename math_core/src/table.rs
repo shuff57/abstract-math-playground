@@ -180,12 +180,19 @@ pub struct Column {
     /// How the column is drawn (ignored for the first, x, column). Additive field.
     #[serde(default, skip_serializing_if = "ColumnStyle::is_default")]
     pub style: ColumnStyle,
+    // A formula over the other columns' names (`x_1^2+1`): row by row, the cell is the formula
+    // with each column name replaced by that row's cell of the column, blank when any is blank.
+    // The column's own cells are then ignored. Left out of the JSON schema (the workspace
+    // writes it; the compact schema has a size budget).
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula: Option<String>,
 }
 
 impl Column {
     /// A column with the default style.
     pub fn new(name: impl Into<String>, cells: Vec<String>) -> Column {
-        Column { name: name.into(), cells, style: ColumnStyle::default() }
+        Column { name: name.into(), cells, style: ColumnStyle::default(), formula: None }
     }
 }
 
@@ -251,6 +258,12 @@ impl Table {
     pub fn set_cell(&mut self, row: usize, col: usize, value: &str) -> Result<(), String> {
         if col >= self.columns.len() {
             return Err(format!("no column {col}"));
+        }
+        if self.columns[col].formula.is_some() {
+            return Err(format!(
+                "column {} is computed from a formula; clear the formula to edit its cells",
+                self.columns[col].name
+            ));
         }
         if row >= MAX_ROWS {
             return Err(format!("too many rows (max {MAX_ROWS})"));
@@ -404,6 +417,27 @@ impl Table {
     }
 
     /// Structural checks used by document validation.
+    /// Sets (or with `None` or blank text, clears) the formula of column `col`: at most
+    /// [`MAX_CELL_CHARS`] characters, parsing as an expression that does not use the column's own
+    /// name. Clearing keeps the column's old cells.
+    pub fn set_formula(&mut self, col: usize, formula: Option<&str>) -> Result<(), String> {
+        if col >= self.columns.len() {
+            return Err(format!("no column {col}"));
+        }
+        let f = formula.map(str::trim).filter(|f| !f.is_empty());
+        if let Some(f) = f {
+            if f.chars().count() > MAX_CELL_CHARS {
+                return Err(format!("formula longer than {MAX_CELL_CHARS} characters"));
+            }
+            let e = parse_with(f, &ParseCtx::new()).map_err(|e| format!("formula: {e}"))?;
+            if e.contains_var(&self.columns[col].name) {
+                return Err(format!("formula of {} cannot use {} itself", self.columns[col].name, self.columns[col].name));
+            }
+        }
+        self.columns[col].formula = f.map(str::to_string);
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.columns.len() > MAX_COLUMNS {
             return Err(format!("too many columns (max {MAX_COLUMNS})"));
@@ -423,38 +457,89 @@ impl Table {
                 return Err(format!("cell longer than {MAX_CELL_CHARS} characters"));
             }
             c.style.validate().map_err(|m| format!("column {:?}: {m}", c.name))?;
+            if c.formula.as_ref().is_some_and(|f| f.chars().count() > MAX_CELL_CHARS) {
+                return Err(format!("formula longer than {MAX_CELL_CHARS} characters"));
+            }
         }
         Ok(())
     }
 
     /// Parses every cell. Errors are `(column index, row, message)`; such cells become `None`.
+    /// A column with a [`Column::formula`] gets, per row, the formula with each other column's
+    /// name replaced by that row's cell (`None` when one of them is blank or bad). Formula
+    /// columns may use one another in any order; a cycle is reported once and blanks them.
     pub fn parse(&self, ctx: &ParseCtx) -> (Vec<ParsedColumn>, Vec<(usize, usize, String)>) {
         let mut errs = Vec::new();
-        let cols = self
+        let rows = self.rows();
+        let mut cols: Vec<ParsedColumn> = self
             .columns
             .iter()
             .enumerate()
             .map(|(ci, c)| ParsedColumn {
                 name: c.name.clone(),
-                cells: c
-                    .cells
-                    .iter()
-                    .enumerate()
-                    .map(|(ri, s)| {
-                        if s.trim().is_empty() {
-                            return None;
-                        }
-                        match parse_with(s, ctx) {
-                            Ok(e) => Some(e),
-                            Err(e) => {
-                                errs.push((ci, ri, e.to_string()));
-                                None
+                cells: if c.formula.is_some() {
+                    vec![None; rows]
+                } else {
+                    c.cells
+                        .iter()
+                        .enumerate()
+                        .map(|(ri, s)| {
+                            if s.trim().is_empty() {
+                                return None;
                             }
-                        }
-                    })
-                    .collect(),
+                            match parse_with(s, ctx) {
+                                Ok(e) => Some(e),
+                                Err(e) => {
+                                    errs.push((ci, ri, e.to_string()));
+                                    None
+                                }
+                            }
+                        })
+                        .collect()
+                },
             })
             .collect();
+        // Formula columns: parse each formula, then fill them in dependency order.
+        let mut pending: Vec<(usize, Expr)> = Vec::new();
+        for (ci, c) in self.columns.iter().enumerate() {
+            let Some(f) = &c.formula else { continue };
+            match parse_with(f, ctx) {
+                Ok(e) => pending.push((ci, e)),
+                Err(e) => errs.push((ci, 0, format!("formula: {e}"))),
+            }
+        }
+        while !pending.is_empty() {
+            let waiting: Vec<usize> = pending.iter().map(|(ci, _)| *ci).collect();
+            let ready = pending.iter().position(|(_, e)| {
+                !self.columns.iter().enumerate().any(|(k, c)| {
+                    waiting.contains(&k) && e.contains_var(&c.name)
+                })
+            });
+            let Some(at) = ready else {
+                for (ci, _) in &pending {
+                    errs.push((*ci, 0, "formula columns use each other in a cycle".into()));
+                }
+                break;
+            };
+            let (ci, e) = pending.remove(at);
+            let used: Vec<usize> = self
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(k, c)| *k != ci && e.contains_var(&c.name))
+                .map(|(k, _)| k)
+                .collect();
+            for row in 0..rows {
+                let mut cell = Some(e.clone());
+                for &k in &used {
+                    cell = match (cell, cols[k].cells.get(row).and_then(|c| c.as_ref())) {
+                        (Some(x), Some(with)) => Some(x.subst(&self.columns[k].name, with)),
+                        _ => None,
+                    };
+                }
+                cols[ci].cells[row] = cell;
+            }
+        }
         (cols, errs)
     }
 }
@@ -465,6 +550,74 @@ mod tests {
 
     fn t() -> Table {
         Table::new(&[], 2)
+    }
+
+    fn texts(cols: &[ParsedColumn], c: usize) -> Vec<Option<String>> {
+        cols[c].cells.iter().map(|e| e.as_ref().map(crate::print::to_text)).collect()
+    }
+
+    #[test]
+    fn a_formula_column_is_the_formula_applied_row_by_row() {
+        let mut t = Table::new(&[], 4);
+        for (r, v) in ["1", "2", "", "4"].iter().enumerate() {
+            t.set_cell(r, 0, v).unwrap();
+        }
+        t.set_formula(1, Some("x_1^2+1")).unwrap();
+        let (cols, errs) = t.parse(&ParseCtx::new());
+        assert!(errs.is_empty(), "{errs:?}");
+        // a blank x cell leaves the row blank; the others substitute the cell expression
+        assert_eq!(
+            texts(&cols, 1),
+            vec![Some("1^2 + 1".into()), Some("2^2 + 1".into()), None, Some("4^2 + 1".into())]
+        );
+        // the column's own cells are ignored while it has a formula, and kept when cleared
+        t.columns[1].cells[0] = "99".into();
+        assert_eq!(texts(&t.parse(&ParseCtx::new()).0, 1)[0], Some("1^2 + 1".into()));
+        t.set_formula(1, None).unwrap();
+        assert_eq!(texts(&t.parse(&ParseCtx::new()).0, 1)[0], Some("99".into()));
+    }
+
+    #[test]
+    fn formula_columns_chain_in_any_order_and_cycles_are_reported() {
+        let mut t = Table::new(&["x_1".into(), "y_1".into(), "y_2".into()], 2);
+        t.set_cell(0, 0, "2").unwrap();
+        t.set_cell(1, 0, "3").unwrap();
+        // y_1 is computed from y_2 (to its right) which is computed from x_1
+        t.set_formula(1, Some("y_2*10")).unwrap();
+        t.set_formula(2, Some("x_1+1")).unwrap();
+        let (cols, errs) = t.parse(&ParseCtx::new());
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cols[1].cells.iter().all(Option::is_some));
+        assert_eq!(
+            crate::list::eval_value(&cols[1].cells[1].clone().unwrap(), &Default::default()).unwrap(),
+            crate::list::Value::Num(40.0)
+        );
+        // a cycle is one error per column and blanks them
+        t.set_formula(2, Some("y_1+1")).unwrap();
+        let (cols, errs) = t.parse(&ParseCtx::new());
+        assert_eq!(errs.iter().filter(|e| e.2.contains("cycle")).count(), 2, "{errs:?}");
+        assert!(cols[1].cells.iter().chain(&cols[2].cells).all(Option::is_none));
+    }
+
+    #[test]
+    fn formulas_are_checked_and_lock_the_cells() {
+        let mut t = Table::new(&[], 2);
+        assert!(t.set_formula(1, Some("x_1+")).is_err());
+        assert!(t.set_formula(1, Some("y_1+1")).is_err(), "its own name");
+        assert!(t.set_formula(5, Some("x_1")).is_err());
+        assert!(t.set_formula(1, Some(&"1+".repeat(80))).is_err(), "too long");
+        assert!(t.columns[1].formula.is_none(), "errors change nothing");
+        t.set_formula(1, Some("  2x_1 ")).unwrap();
+        assert_eq!(t.columns[1].formula.as_deref(), Some("2x_1"));
+        assert!(t.set_cell(0, 1, "5").is_err());
+        assert!(t.set_cell(0, 0, "5").is_ok());
+        // blank text clears; the formula round-trips through JSON and is absent when unset
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains("\"formula\":\"2x_1\""), "{json}");
+        let back: Table = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, t);
+        t.set_formula(1, Some("  ")).unwrap();
+        assert!(!serde_json::to_string(&t).unwrap().contains("formula"));
     }
 
     #[test]

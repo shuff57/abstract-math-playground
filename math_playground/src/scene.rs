@@ -5416,6 +5416,27 @@ mod tests {
     }
 
     #[test]
+    fn a_formula_column_draws_and_defines_its_list() {
+        let mut d = table_doc(&[("x_1", &["1", "2", "", "4"]), ("y_1", &["", "", "", ""])], TableStyle::Points);
+        d.items[0].table.as_mut().unwrap().set_formula(1, Some("x_1^2")).unwrap();
+        // the list y_1 is defined from the computed cells: a value item can read it
+        d.items.push(Item::new("s", ItemKind::Equation, "total(y_1)"));
+        let g = build(&d, Mode::D2);
+        assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
+        let pts: Vec<[f64; 2]> = dots(&g, Mode::D2, [0.0; 3]).iter().map(|p| [p[0], p[1]]).collect();
+        for want in [[1.0, 1.0], [2.0, 4.0], [4.0, 16.0]] {
+            assert!(
+                pts.iter().any(|p| (p[0] - want[0]).abs() < 1e-9 && (p[1] - want[1]).abs() < 1e-9),
+                "{want:?} in {pts:?}"
+            );
+        }
+        // the blank row has no point (3 points, not 4)
+        assert_eq!(pts.len(), 3, "{pts:?}");
+        let info = g.infos.iter().find(|i| i.id == "s").and_then(|i| i.value);
+        assert_eq!(info, Some(21.0));
+    }
+
+    #[test]
     fn distance_midpoint_and_random_draw_like_other_list_values() {
         // distance is a number: a dot on the 1D line at 5; random(n, seed) is a list of dots.
         let g = build(&doc_with(&[("d", "distance((0,0),(3,4))")]), Mode::D1);

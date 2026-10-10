@@ -76,6 +76,7 @@ Tables (`id` is a table item):
 | `addColumn` | `id`, optional `name` | Name defaults to the next free header. |
 | `removeColumn` | `id`, `col` | |
 | `renameColumn` | `id`, `col`, `name` | |
+| `setColumnFormula` | `id`, `col`, `formula` | Makes column `col` computed from the other columns' names (`x_1^2+1`, any expression of them, sliders and definitions): row by row, the cell is the formula with each column name replaced by that row's cell, blank when one of them is blank. `null` or blank text clears it and the column's own cells come back. The cells of a formula column are locked (`setCell` gives an `error`); in the `table` event they carry the computed values and the column has `formula`. Formula columns may use one another in any order; a cycle is an error per column. A formula that does not parse, uses its own column, or is over 120 characters gives an `error` and changes nothing. The `table` events of tables with a formula column are re-sent when a slider changes. |
 | `setTableStyle` | `id`, `style` | `points`, `line` or `hidden`. |
 
 Actions and ticker:
