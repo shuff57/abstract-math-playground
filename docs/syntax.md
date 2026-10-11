@@ -166,6 +166,18 @@ Distributions (argument order from `compile.rs` and `stats.rs`):
 | `uniformpdf(x, a, b)`, `uniformcdf(a, b, lo, hi)` | uniform |
 | `tpdf(x, df)`, `tcdf(a, b, df)`, `invt(p, df)` | Student t |
 
+Distribution objects (Desmos spelling) are rewritten onto the flat functions above after definitions are inlined, so a name can hold one:
+
+| Object | Parameters |
+| --- | --- |
+| `normaldist(mu, sigma)` | also `normaldist()` (standard) and `normaldist(sigma)` (mean 0) |
+| `tdist(df)` | |
+| `binomialdist(n, p)` | |
+| `poissondist(lambda)` | |
+| `uniformdist(a, b)` | |
+
+Used with `pdf(D, x)`, `cdf(D, x)` (P(X <= x)), `cdf(D, a, b)` (P(a <= X <= b); inclusive for the discrete ones), `inversecdf(D, p)` (normal and t only), and `mean(D)`, `stdev(D)`, `var(D)`. `N = normaldist(0, 1)` then `y = pdf(N, x)` plots. A distribution on its own is not a number; using one with the wrong arity, or `pdf(5, x)`, is an error that names the problem.
+
 Invalid parameters (for example `sigma <= 0`) give NaN. Examples:
 
 ```

@@ -59,6 +59,12 @@ pub const BUILTIN_FUNCS: &[&str] = &[
     // distributions
     "normalpdf", "normalcdf", "invnorm", "binompdf", "binomcdf", "poissonpdf", "poissoncdf",
     "uniformpdf", "uniformcdf", "tpdf", "tcdf", "invt",
+    // distribution objects (`normaldist(mu, sigma)`, `tdist(df)`, `binomialdist(n, p)`,
+    // `poissondist(lambda)`, `uniformdist(a, b)`) and the functions that take one: `pdf(D, x)`,
+    // `cdf(D, x)`, `cdf(D, a, b)`, `inversecdf(D, p)`, `mean(D)`, `stdev(D)`, `var(D)`. The
+    // resolver rewrites these onto the flat functions above (see `resolve`).
+    "normaldist", "tdist", "binomialdist", "poissondist", "uniformdist", "pdf", "cdf",
+    "inversecdf",
     // calculus: `deriv(f, x)`, `deriv(f, x, at)`, `int(f, t, a, b)`, `sum(f, n, a, b)`,
     // `prod(f, n, a, b)` (see `calculus`)
     "deriv", "int", "sum", "prod",

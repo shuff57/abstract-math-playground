@@ -4656,6 +4656,39 @@ mod tests {
         assert!(checked > 40);
     }
 
+    /// The largest y among the curve's segments with x within 0.05 of `at`.
+    fn y_near(d: &Doc, at: f32) -> f32 {
+        let g = build(d, Mode::D2);
+        assert!(g.diagnostics.is_empty(), "{:?}", g.diagnostics);
+        g.segments[base_len(Mode::D2)..]
+            .iter()
+            .flat_map(|s| [s.p0, s.p1])
+            .filter(|p| (p[0] - at).abs() < 0.05)
+            .map(|p| p[1])
+            .fold(f32::NEG_INFINITY, f32::max)
+    }
+
+    #[test]
+    fn distribution_object_plots_through_its_name() {
+        // pdf of Normal(1, 2) peaks at 1 / (2 sqrt(2 pi)) at x = 1.
+        let d = doc_with(&[("n", "N=normaldist(1,2)"), ("c", "y=pdf(N,x)")]);
+        assert!((y_near(&d, 1.0) - 0.19947).abs() < 2e-3);
+        // cdf of t(4) at 0 is one half; the object can also be written inline.
+        let d = doc_with(&[("s", "y=cdf(tdist(4),x)")]);
+        assert!((y_near(&d, 0.0) - 0.5).abs() < 2e-2);
+    }
+
+    #[test]
+    fn distribution_misuse_reports_a_diagnostic() {
+        let d = doc_with(&[("a", "y=pdf(5,x)")]);
+        let g = build(&d, Mode::D2);
+        assert!(
+            g.diagnostics.iter().any(|(_, m)| m.contains("distribution")),
+            "{:?}",
+            g.diagnostics
+        );
+    }
+
     #[test]
     fn parabola_3d_extrudes_along_z() {
         let d = doc_with(&[("a", "y=x^2")]);

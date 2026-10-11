@@ -2,7 +2,7 @@
 //! can be compiled with only spatial variables free.
 
 use crate::analyze::Kind;
-use crate::ast::{binder_var, Expr};
+use crate::ast::{binder_var, BinOp, Expr};
 use crate::calculus;
 use crate::compile::Angle;
 use std::borrow::Cow;
@@ -15,6 +15,8 @@ pub enum ResolveError {
     Arity { name: String, expected: usize, got: usize },
     /// A `deriv`/`int`/`sum`/`prod` call that is malformed or cannot be differentiated.
     Calculus(String),
+    /// A distribution object used wrongly (`pdf(5, x)`, `inversecdf` of a discrete one).
+    Distribution(String),
 }
 
 impl std::fmt::Display for ResolveError {
@@ -25,7 +27,7 @@ impl std::fmt::Display for ResolveError {
             ResolveError::Arity { name, expected, got } => {
                 write!(f, "{name} takes {expected} argument(s), got {got}")
             }
-            ResolveError::Calculus(m) => write!(f, "{m}"),
+            ResolveError::Calculus(m) | ResolveError::Distribution(m) => write!(f, "{m}"),
         }
     }
 }
@@ -201,7 +203,10 @@ impl Defs {
                         }
                         b
                     }
-                    None => Expr::Call(name.clone(), args),
+                    None => match dist_call(name, &args)? {
+                        Some(e) => e,
+                        None => Expr::Call(name.clone(), args),
+                    },
                 }
             }
         })
@@ -232,6 +237,197 @@ impl Defs {
     fn go_all(&self, items: &[Expr], stack: &mut Vec<String>) -> Result<Vec<Expr>, ResolveError> {
         items.iter().map(|i| self.go(i, stack)).collect()
     }
+}
+
+const DISTS: [&str; 5] = ["normaldist", "tdist", "binomialdist", "poissondist", "uniformdist"];
+
+fn is_dist(e: &Expr) -> bool {
+    matches!(e, Expr::Call(n, _) if DISTS.contains(&n.as_str()))
+}
+
+fn dist_err(m: impl Into<String>) -> ResolveError {
+    ResolveError::Distribution(m.into())
+}
+
+/// Rewrites `pdf(D, x)`, `cdf(D, x)`, `cdf(D, a, b)`, `inversecdf(D, p)`, `mean(D)`, `stdev(D)`
+/// and `var(D)`, where `D` (after definitions are inlined) is a distribution constructor, onto
+/// the flat functions (`normalpdf`, `tcdf`, ...). `None` when `name(args)` is not such a call.
+fn dist_call(name: &str, args: &[Expr]) -> Result<Option<Expr>, ResolveError> {
+    let num = |v: f64| Expr::Num(v);
+    let call = |n: &str, a: Vec<Expr>| Expr::call(n, a);
+    let neg_inf = || Expr::Num(f64::NEG_INFINITY);
+    let moment = matches!(name, "mean" | "stdev" | "var") && args.len() == 1 && is_dist(&args[0]);
+    let op = matches!(name, "pdf" | "cdf" | "inversecdf");
+    if !moment && !op {
+        return Ok(None);
+    }
+    let Some(Expr::Call(dist, p)) = args.first().filter(|a| is_dist(a)) else {
+        return Err(dist_err(format!(
+            "{name} needs a distribution as its first argument, such as {name}(normaldist(0, 1), 1)"
+        )));
+    };
+    let want = |n: usize| -> Result<(), ResolveError> {
+        if p.len() == n {
+            Ok(())
+        } else {
+            Err(dist_err(format!("{dist} takes {n} argument(s), got {}", p.len())))
+        }
+    };
+    let rest = &args[1..];
+    let argc = |n: usize| -> Result<(), ResolveError> {
+        if rest.len() == n {
+            Ok(())
+        } else {
+            Err(dist_err(format!("{name} of a distribution takes {n} more argument(s), got {}", rest.len())))
+        }
+    };
+    // Normal accepts normaldist(), normaldist(sigma) and normaldist(mu, sigma).
+    let (mu, sigma) = match (dist.as_str(), p.len()) {
+        ("normaldist", 0) => (num(0.0), num(1.0)),
+        ("normaldist", 1) => (num(0.0), p[0].clone()),
+        ("normaldist", 2) => (p[0].clone(), p[1].clone()),
+        ("normaldist", n) => return Err(dist_err(format!("normaldist takes 0 to 2 arguments, got {n}"))),
+        _ => (num(0.0), num(1.0)),
+    };
+    let sq = |e: Expr| Expr::bin(BinOp::Pow, e, num(2.0));
+    let out = match (name, dist.as_str()) {
+        ("mean", "normaldist") => mu,
+        ("stdev", "normaldist") => sigma,
+        ("var", "normaldist") => sq(sigma),
+        ("mean", "tdist") => {
+            want(1)?;
+            num(0.0)
+        }
+        ("var", "tdist") => {
+            want(1)?;
+            // df / (df - 2) for df > 2 (infinite or undefined otherwise).
+            Expr::bin(BinOp::Div, p[0].clone(), Expr::bin(BinOp::Sub, p[0].clone(), num(2.0)))
+        }
+        ("stdev", "tdist") => {
+            want(1)?;
+            call("sqrt", vec![Expr::bin(BinOp::Div, p[0].clone(), Expr::bin(BinOp::Sub, p[0].clone(), num(2.0)))])
+        }
+        ("mean", "binomialdist") => {
+            want(2)?;
+            Expr::bin(BinOp::Mul, p[0].clone(), p[1].clone())
+        }
+        ("var", "binomialdist") | ("stdev", "binomialdist") => {
+            want(2)?;
+            let v = Expr::bin(
+                BinOp::Mul,
+                Expr::bin(BinOp::Mul, p[0].clone(), p[1].clone()),
+                Expr::bin(BinOp::Sub, num(1.0), p[1].clone()),
+            );
+            if name == "var" { v } else { call("sqrt", vec![v]) }
+        }
+        ("mean", "poissondist") | ("var", "poissondist") => {
+            want(1)?;
+            p[0].clone()
+        }
+        ("stdev", "poissondist") => {
+            want(1)?;
+            call("sqrt", vec![p[0].clone()])
+        }
+        ("mean", "uniformdist") => {
+            want(2)?;
+            Expr::bin(BinOp::Div, Expr::bin(BinOp::Add, p[0].clone(), p[1].clone()), num(2.0))
+        }
+        ("var", "uniformdist") | ("stdev", "uniformdist") => {
+            want(2)?;
+            let w = Expr::bin(BinOp::Sub, p[1].clone(), p[0].clone());
+            if name == "var" {
+                Expr::bin(BinOp::Div, sq(w), num(12.0))
+            } else {
+                Expr::bin(BinOp::Div, w, call("sqrt", vec![num(12.0)]))
+            }
+        }
+        ("pdf", "normaldist") => {
+            argc(1)?;
+            call("normalpdf", vec![rest[0].clone(), mu, sigma])
+        }
+        ("cdf", "normaldist") => match rest.len() {
+            1 => call("normalcdf", vec![neg_inf(), rest[0].clone(), mu, sigma]),
+            2 => call("normalcdf", vec![rest[0].clone(), rest[1].clone(), mu, sigma]),
+            n => return Err(dist_err(format!("cdf takes a value or a range, got {n} arguments"))),
+        },
+        ("inversecdf", "normaldist") => {
+            argc(1)?;
+            call("invnorm", vec![rest[0].clone(), mu, sigma])
+        }
+        ("pdf", "tdist") => {
+            want(1)?;
+            argc(1)?;
+            call("tpdf", vec![rest[0].clone(), p[0].clone()])
+        }
+        ("cdf", "tdist") => {
+            want(1)?;
+            match rest.len() {
+                1 => call("tcdf", vec![neg_inf(), rest[0].clone(), p[0].clone()]),
+                2 => call("tcdf", vec![rest[0].clone(), rest[1].clone(), p[0].clone()]),
+                n => return Err(dist_err(format!("cdf takes a value or a range, got {n} arguments"))),
+            }
+        }
+        ("inversecdf", "tdist") => {
+            want(1)?;
+            argc(1)?;
+            call("invt", vec![rest[0].clone(), p[0].clone()])
+        }
+        ("pdf", "binomialdist") => {
+            want(2)?;
+            argc(1)?;
+            call("binompdf", vec![p[0].clone(), p[1].clone(), rest[0].clone()])
+        }
+        ("cdf", "binomialdist") => {
+            want(2)?;
+            let at = |k: Expr| call("binomcdf", vec![p[0].clone(), p[1].clone(), k]);
+            match rest.len() {
+                1 => at(rest[0].clone()),
+                // P(a <= X <= b) = F(b) - F(a - 1) for integer support.
+                2 => Expr::bin(
+                    BinOp::Sub,
+                    at(rest[1].clone()),
+                    at(Expr::bin(BinOp::Sub, rest[0].clone(), num(1.0))),
+                ),
+                n => return Err(dist_err(format!("cdf takes a value or a range, got {n} arguments"))),
+            }
+        }
+        ("pdf", "poissondist") => {
+            want(1)?;
+            argc(1)?;
+            call("poissonpdf", vec![p[0].clone(), rest[0].clone()])
+        }
+        ("cdf", "poissondist") => {
+            want(1)?;
+            let at = |k: Expr| call("poissoncdf", vec![p[0].clone(), k]);
+            match rest.len() {
+                1 => at(rest[0].clone()),
+                2 => Expr::bin(
+                    BinOp::Sub,
+                    at(rest[1].clone()),
+                    at(Expr::bin(BinOp::Sub, rest[0].clone(), num(1.0))),
+                ),
+                n => return Err(dist_err(format!("cdf takes a value or a range, got {n} arguments"))),
+            }
+        }
+        ("pdf", "uniformdist") => {
+            want(2)?;
+            argc(1)?;
+            call("uniformpdf", vec![rest[0].clone(), p[0].clone(), p[1].clone()])
+        }
+        ("cdf", "uniformdist") => {
+            want(2)?;
+            match rest.len() {
+                1 => call("uniformcdf", vec![p[0].clone(), p[1].clone(), neg_inf(), rest[0].clone()]),
+                2 => call("uniformcdf", vec![p[0].clone(), p[1].clone(), rest[0].clone(), rest[1].clone()]),
+                n => return Err(dist_err(format!("cdf takes a value or a range, got {n} arguments"))),
+            }
+        }
+        ("inversecdf", d) => {
+            return Err(dist_err(format!("inversecdf is available for normaldist and tdist, not {d}")));
+        }
+        (n, d) => return Err(dist_err(format!("{n} is not defined for {d}"))),
+    };
+    Ok(Some(out))
 }
 
 #[cfg(test)]
@@ -311,6 +507,73 @@ mod tests {
             d.resolve(&parse_with("f(1)", &ParseCtx::new().with_function("f")).unwrap()),
             Err(ResolveError::Cycle(_))
         ));
+    }
+
+    fn num(d: &Defs, src: &str) -> f64 {
+        use crate::list::{eval_value, Bindings, Value};
+        let e = d.resolve(&parse(src).unwrap()).unwrap();
+        match eval_value(&e, &Bindings::new()).unwrap() {
+            Value::Num(v) => v,
+            other => panic!("{src}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distribution_objects_rewrite_onto_flat_functions() {
+        let d = Defs::new();
+        let near = |a: f64, b: f64| assert!((a - b).abs() < 1e-9, "{a} vs {b}");
+        near(num(&d, "pdf(normaldist(0,1),0)"), 0.3989422804014327);
+        near(num(&d, "pdf(normaldist(),0)"), 0.3989422804014327);
+        near(num(&d, "pdf(normaldist(2),0)"), 0.3989422804014327 / 2.0);
+        near(num(&d, "cdf(normaldist(0,1),1.96)"), 0.9750021048517795);
+        near(num(&d, "cdf(normaldist(0,1),-1,1)"), 0.6826894921370859);
+        near(num(&d, "inversecdf(normaldist(10,2),0.5)"), 10.0);
+        near(num(&d, "mean(normaldist(3,2))"), 3.0);
+        near(num(&d, "stdev(normaldist(3,2))"), 2.0);
+        near(num(&d, "var(normaldist(3,2))"), 4.0);
+        near(num(&d, "pdf(binomialdist(2,0.5),1)"), 0.5);
+        near(num(&d, "cdf(binomialdist(2,0.5),1)"), 0.75);
+        near(num(&d, "cdf(binomialdist(4,0.5),1,2)"), 0.25 + 0.375);
+        near(num(&d, "mean(binomialdist(10,0.3))"), 3.0);
+        near(num(&d, "stdev(binomialdist(10,0.5))"), 2.5f64.sqrt());
+        near(num(&d, "pdf(poissondist(2),0)"), (-2f64).exp());
+        near(num(&d, "cdf(poissondist(2),2)"), (-2f64).exp() * 5.0);
+        near(num(&d, "mean(poissondist(4))"), 4.0);
+        near(num(&d, "pdf(uniformdist(0,4),1)"), 0.25);
+        near(num(&d, "cdf(uniformdist(0,4),1)"), 0.25);
+        near(num(&d, "mean(uniformdist(0,4))"), 2.0);
+        near(num(&d, "pdf(tdist(5),0)"), crate::stats::tpdf(0.0, 5.0));
+        near(num(&d, "cdf(tdist(5),0)"), 0.5);
+        near(num(&d, "inversecdf(tdist(5),0.5)"), 0.0);
+        near(num(&d, "var(tdist(5))"), 5.0 / 3.0);
+    }
+
+    #[test]
+    fn a_named_distribution_resolves_through_definitions() {
+        let d = defs_from(&["N=normaldist(1,2)"]);
+        assert!(d.has_var("N"));
+        let near = |a: f64, b: f64| assert!((a - b).abs() < 1e-9, "{a} vs {b}");
+        near(num(&d, "pdf(N,1)"), 0.3989422804014327 / 2.0);
+        near(num(&d, "mean(N)"), 1.0);
+        // A list named like a distribution still works with `mean`.
+        let d = defs_from(&["L=[1,2,3]"]);
+        near(num(&d, "mean(L)"), 2.0);
+    }
+
+    #[test]
+    fn distribution_misuse_is_a_clear_error() {
+        let d = Defs::new();
+        for src in [
+            "pdf(5,1)",
+            "inversecdf(poissondist(2),0.5)",
+            "pdf(normaldist(0,1))",
+            "cdf(normaldist(0,1),1,2,3)",
+            "mean(binomialdist(10))",
+            "normaldist(1,2,3)+pdf(normaldist(1,2,3),0)",
+        ] {
+            let e = parse(src).unwrap();
+            assert!(matches!(d.resolve(&e), Err(ResolveError::Distribution(_))), "{src}");
+        }
     }
 
     #[test]
