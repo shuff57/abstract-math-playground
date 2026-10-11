@@ -970,6 +970,9 @@ mod tests {
         assert!(close(f("arctanh(x)", 0.5), 0.5493061443340549));
         assert!(close(f("sech(x)", 1.0), 1.0 / 1f64.cosh()));
         assert!(close(f("csch(x)", 1.0), 1.0 / 1f64.sinh()));
+        assert!(close(f("coth(x)", 1.0), 1.0 / 1f64.tanh()));
+        assert!(close(f("coth(x)", -2.0), 1.0 / (-2f64).tanh()));
+        assert!(close(f("coth(x)", 1000.0), 1.0));
         assert!(close(f("sech^2 x", 1.0), 1.0 / 1f64.cosh().powi(2)));
         assert!(close(f("arcsech(x)", 0.5), 1.3169578969248166));
         assert!(close(f("arccsch(x)", 2.0), 0.48121182505960347));
@@ -1149,7 +1152,7 @@ mod tests {
         "nCr(5,2)+x",
         "arcsinh(x)+arccosh(abs(x)+1)",
         "atanh(x/10)+erf(y)",
-        "sech(x)+csch(x+0.5)",
+        "sech(x)+csch(x+0.5)+coth(x+0.5)",
         "arcsec(abs(x)+1)+arccsc(abs(y)+1)+arccot(x)",
         "gcd(x+6,y+9)+lcm(x+6,y+9)",
     ];

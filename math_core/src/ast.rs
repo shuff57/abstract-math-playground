@@ -42,7 +42,7 @@ pub const BUILTIN_FUNCS: &[&str] = &[
     "ceil", "round", "sign", "sgn", "min", "max", "mod", "atan2",
     // inverse hyperbolic (`arc*` spellings are aliases), reciprocal hyperbolic and the inverse
     // reciprocal trig functions (the last group is desugared by the parser; see `parse`)
-    "asinh", "acosh", "atanh", "arcsinh", "arccosh", "arctanh", "sech", "csch", "arcsec",
+    "asinh", "acosh", "atanh", "arcsinh", "arccosh", "arctanh", "sech", "csch", "coth", "arcsec",
     "arccsc", "arccot", "arccoth", "arcsech", "arccsch",
     // `erf(x)`, `gcd(a, b)` and `lcm(a, b)` (`gcf`/`mcd` and `mcm` are aliases), `signum` = `sign`
     "erf", "gcd", "lcm", "gcf", "mcd", "mcm", "signum",

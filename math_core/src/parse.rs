@@ -872,6 +872,7 @@ fn make_call(name: String, mut args: Vec<Expr>) -> Expr {
     match name.as_str() {
         "sech" => recip(Expr::call("cosh", vec![x])),
         "csch" => recip(Expr::call("sinh", vec![x])),
+        "coth" => recip(Expr::call("tanh", vec![x])),
         "arcsec" => Expr::call("acos", vec![recip(x)]),
         "arccsc" => Expr::call("asin", vec![recip(x)]),
         "arccoth" => Expr::call("atanh", vec![recip(x)]),
